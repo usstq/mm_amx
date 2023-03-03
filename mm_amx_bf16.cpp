@@ -154,20 +154,17 @@ bool initXTILE() {
 }
 
 //===============================================================
-struct timer{
-    std::chrono::time_point<std::chrono::high_resolution_clock> start;
-    int times;
-    timer(int times) : times(times) {
-        start = std::chrono::high_resolution_clock::now();
+template<typename Callable>
+double timeit(int times, const Callable & c) {
+    auto start = std::chrono::high_resolution_clock::now();
+    for(int i = 0; i < times; i++) {
+        c();
     }
-    ~timer() {
-        auto finish = std::chrono::high_resolution_clock::now();
-        auto useconds = std::chrono::duration_cast<std::chrono::microseconds>(finish-start).count();
-        //std::cout << "total latency = " << milliseconds << "ms\n";
-        std::cout << "latency per iterattion  = " << useconds/times << " us\n";
-        //std::cout << "Throuput " << ((W*H*33*33)/16.0)*times/useconds * (1e6/1e9) << " x 16 GFMA/s\n";
-    }
-};
+    auto finish = std::chrono::high_resolution_clock::now();
+    auto avg_useconds = std::chrono::duration_cast<std::chrono::microseconds>(finish-start).count()/times;
+    std::cout << "latency per iterattion  = " << avg_useconds << " us\n";
+    return avg_useconds;
+}
 
 //===============================================================
 /*
@@ -513,7 +510,9 @@ int main(int argc, const char *argv[]) {
     // AMX
     initXTILE();
 
-    matmul_amx(A, B, C1);
+    timeit(1000, [&](){
+        matmul_amx(A, B, C1);
+    });
 
     if(C0 == C1) {
         std::cout << "Correct: C0=\n" << C0 << std::endl;
