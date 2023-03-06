@@ -175,8 +175,10 @@ int amx_unit_test_perf() {
     return 0;
 }
 
+//================================================================================
 // fc layer:  B is const and can be arranged into best sequential format
-//
+//------------------
+// register blocking:
 // A bfloat16_16x32
 // B bfloat16_32x16 (layout: 16x16x4)
 // C    float_16x16
@@ -186,7 +188,15 @@ int amx_unit_test_perf() {
 //         B0 B1
 //A0 : A0   C C
 //A1 : A1   C C
-
+//------------------
+// cache blocking:
+//                Bb:     Kx32
+//   Ab:  m0*32xK Cb:  m0*32x32
+//
+// (Ab + Bb) should fit in L2 cache
+//    (m0*32xK*elesz + Kx32*elesz) < L2
+//     m0 < L2/(32*K*elesz) - 1
+//
 struct FC_amx_bf16_v1 {
     tensor2D<float> buffC;
     static constexpr int tC00 = 0;
@@ -212,39 +222,23 @@ struct FC_amx_bf16_v1 {
     //  |   |   | 
     // 
     struct KpackedB {
-        bfloat16 *data;
+        std::shared_ptr<bfloat16> data;
         int K;
         int N;
         int Kblocks;
         int Nblocks;
-        KpackedB() {
-            data = nullptr;
-            K = N = 0;
-        }
-
         KpackedB(tensor2D<bfloat16> & matB) {
-            data = nullptr;
-            reset(matB.dims[0], matB.dims[1]);
-
-            for (int k = 0; k < K; k++)
-            for (int n = 0; n < N; n++)
-                (*this)(k, n) = matB(k, n);
-        }
-
-        void reset(int _K, int _N) {
-            K = _K;
-            N = _N;
+            K = matB.dims[0];
+            N = matB.dims[1];
             Kblocks = (K + 31)/32;
             Nblocks = (N + 31)/32;
             int total_size = Kblocks * Nblocks * 32 * 32 * sizeof(bfloat16);
-            if (data)
-                free(data);
-            data = reinterpret_cast<bfloat16*>(aligned_alloc(64, rndup(total_size, 64)));
-        }
-
-        ~KpackedB() {
-            if (data)
-                free(data);
+            data = std::shared_ptr<bfloat16>(
+                        reinterpret_cast<bfloat16*>(aligned_alloc(64, rndup(total_size, 64))),
+                        [](void * p){ free(p); });
+            for (int k = 0; k < K; k++)
+            for (int n = 0; n < N; n++)
+                (*this)(k, n) = matB(k, n);
         }
 
         bfloat16 & operator()(int k, int n) {
@@ -263,7 +257,7 @@ struct FC_amx_bf16_v1 {
             // (kr,nr) is coordinate in 32x16 submatrix
             // after repack it becomes offset in 16x16x2
             offset += (kr/2)*32 + 2*nr + (kr&1);
-            return data[offset];
+            return data.get()[offset];
         }
     };
 
@@ -276,15 +270,7 @@ struct FC_amx_bf16_v1 {
         int K = matA.dims[1];
         assert(K == matB.K);
         assert(N == matB.N);
-        // cache allocation:
-        //   Ab:  m0*32xK
-        //   Bb:     Kx32
-        //   Cb:  m0*32x32
-        //
-        // (Ab + Bb) should fit in L2 cache
-        //    (m0*32xK*elesz + Kx32*elesz) < L2
-        //     m0 < L2/(32*K*elesz) - 1
-        //
+
         int elesz = sizeof(uint16_t);
         int L2 = 2048*1024; // 2MB
         int m0 = L2/(32*K*elesz) - 1;
@@ -343,6 +329,7 @@ struct FC_amx_bf16_v1 {
         postProcess16x32(reinterpret_cast<int8_t*>(pC) + 16*stride, stride);
     }
 };
+
 
 void amx_unit_test_acc() {
     int M = 32*22;  // 896

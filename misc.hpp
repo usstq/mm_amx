@@ -78,8 +78,7 @@ void tshow() {
 template<typename T>
 struct tensor2D {
     int dims[2];
-    T * base;
-    T * data;
+    std::shared_ptr<T> data;
     int stride;
     tensor2D(int d0, int d1) {
         dims[0] = d0;
@@ -87,36 +86,43 @@ struct tensor2D {
 
         // align begin address to cache line is vital, so tile load can
         // use all bandwidth (L1D/L2 only deliver data in unit of 64-byte aligned cache-line)
-        data = reinterpret_cast<T*>(aligned_alloc(64, rndup(d0*d1*sizeof(T), 64)));
+        data = std::shared_ptr<T>(
+                    reinterpret_cast<T*>(aligned_alloc(64, rndup(d0*d1*sizeof(T), 64))),
+                    [](void * p) { free(p); });
         stride = d1 * sizeof(T);
         if (stride % 64) {
             std::cout << "Warnning: stride " << stride << " is not aligned to cache line\n";
         }
         fill_rnd();
     }
-    ~tensor2D() {
-        free(data);
+
+    T & operator[](int i) {
+        return data.get()[i];
+    }
+
+    const T & operator[](int i) const {
+        return data.get()[i];
+    }
+
+    //https://stackoverflow.com/questions/1936399/c-array-operator-with-multiple-arguments
+    T & operator()(int i0, int i1) {
+        return (*this)[i0 * dims[1] + i1];
+    }
+
+    const T & operator()(int i0, int i1) const {
+        return (*this)[i0 * dims[1] + i1];
     }
 
     void fill_rnd() {
         for(int i = 0; i<dims[0]*dims[1]; i++) {
             // lower mantissa can help to avoid small errors in accuracy comparison
-            data[i] = (rand() & 1) - 0.5;
+            (*this)[i] = (rand() & 1) - 0.5;
         }
-    }
-
-    //https://stackoverflow.com/questions/1936399/c-array-operator-with-multiple-arguments
-    T & operator()(int i0, int i1) {
-        return data[i0 * dims[1] + i1];
-    }
-    const T & operator()(int i0, int i1) const {
-        return data[i0 * dims[1] + i1];
     }
 
     void operator=(const T & v) {
-        for(int k = 0; k<dims[0]*dims[1]; k++) {
-            data[k] = v;
-        }
+        for(int k = 0; k<dims[0]*dims[1]; k++)
+            (*this)[k] = v;
     }
 
     bool operator==(const tensor2D<T> & rhs) {
