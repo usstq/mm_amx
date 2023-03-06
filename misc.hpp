@@ -30,6 +30,7 @@
 #else
 #include <x86intrin.h>
 #endif
+#include <stdlib.h>
 
 //=============================================================
 // BF16-amx Peak (Gops)
@@ -39,12 +40,40 @@ const double AMXBf16OpsPerTDP = (16*16*32)*2;
 const double AMXBf16TDPThrouput = 16;
 const double AMXBf16OpsPerCycleCore = AMXBf16OpsPerTDP/AMXBf16TDPThrouput;
 const double AMXBf16FreqGHz = 2.05;
-const double AMXBf16Freq2GHz = 2.32;
+const double AMXBf16Freq2GHz = 3;//2.32;
 const double AMXBf16PeakGopsPerCore = AMXBf16OpsPerCycleCore * AMXBf16FreqGHz;
 const double AMXBf16PeakGops2PerCore = AMXBf16OpsPerCycleCore * AMXBf16Freq2GHz;
 
 //===============================================================
 using ov::bfloat16;
+
+#define rndup(x, n) (((x + n - 1)/n)*n)
+
+template<typename T>
+void show(const T * data, int rows, int cols) {
+    std::ostream& out = std::cout;
+    out << "==============\n";
+    for(int i0=0; i0 < rows; i0++) {
+        out << "[" << i0 << "," << 0 << "]: ";
+        for(int i1=0; i1<cols; i1++)
+            out << data[i0 * cols + i1] << ",";
+        out << std::endl;
+    }
+}
+
+template<typename T, int tile>
+void tshow() {
+    if (std::is_same<bfloat16,T>::value) {
+        bfloat16 data[16*32];
+        _tile_stored(tile, data, 64);
+        show(data, 16, 32);
+    }
+    if (std::is_same<float,T>::value) {
+        float data[16*16];
+        _tile_stored(tile, data, 64);
+        show(data, 16, 16);
+    }
+}
 
 template<typename T>
 struct tensor2D {
@@ -58,28 +87,24 @@ struct tensor2D {
 
         // align begin address to cache line is vital, so tile load can
         // use all bandwidth (L1D/L2 only deliver data in unit of 64-byte aligned cache-line)
-        base = new T[d0*d1 + 64/sizeof(T)]();
-        // align to cache line by jump few T in begin
-        auto to_prev_align = (reinterpret_cast<uintptr_t>(base) % 64);
-        if (to_prev_align > 0) {
-            auto to_next_align = 64 - to_prev_align;
-            data = base + to_next_align/sizeof(T);
-        } else {
-            data = base;
-        }
-
-        for(int i = 0; i<d0*d1; i++) {
-            // lower mantissa can help to avoid small errors in accuracy comparison
-            data[i] = (rand() % 4)/4.0 - 0.5;
-        }
+        data = reinterpret_cast<T*>(aligned_alloc(64, rndup(d0*d1*sizeof(T), 64)));
         stride = d1 * sizeof(T);
         if (stride % 64) {
             std::cout << "Warnning: stride " << stride << " is not aligned to cache line\n";
         }
+        fill_rnd();
     }
     ~tensor2D() {
-        delete []base;
+        free(data);
     }
+
+    void fill_rnd() {
+        for(int i = 0; i<dims[0]*dims[1]; i++) {
+            // lower mantissa can help to avoid small errors in accuracy comparison
+            data[i] = (rand() & 1) - 0.5;
+        }
+    }
+
     //https://stackoverflow.com/questions/1936399/c-array-operator-with-multiple-arguments
     T & operator()(int i0, int i1) {
         return data[i0 * dims[1] + i1];
@@ -256,14 +281,14 @@ double timeit(int expect_times_milliseconds, const Callable & c, double opsPerCa
     }
 
     // profiling
-    auto start = __rdtsc();
+    auto start = std::chrono::high_resolution_clock::now();
     for(int i = 0; i < times; i++) {
         c();
     }
-    auto finish = __rdtsc();
+    auto finish = std::chrono::high_resolution_clock::now();
 
-    auto total_latency = tsc2second(finish-start);
-    auto avg_latency = total_latency/times;
+    std::chrono::duration<double> total_latency = finish-start;
+    auto avg_latency = total_latency.count()/times;
     std::cout << "Average latency : " << avg_latency*1e6 << " us x " << times;
     if (opsPerCall > 0 && peakOpsPerSecond > 0) {
         std::cout << "  HW Usage : " << static_cast<int>(100*(opsPerCall/avg_latency)/(peakOpsPerSecond)) << "% ("
@@ -319,26 +344,61 @@ struct tileconfig_t {
             cols[i] = 0;
             rows[i] = 0;
         }
+        load();
     }
-
+    ~tileconfig_t() {
+        _tile_release();
+    }
     void load() {
+        std::cout << " tile load config ... " << std::flush;
         _tile_loadconfig(this);
+        std::cout << *this << std::flush << std::endl;
     }
     void store() {
         _tile_storeconfig(this);
     }
     friend std::ostream& operator<<(std::ostream& out, const tileconfig_t& cfg) {
-        out << "tile config" << std::endl;
-        out << "    palette_id :" << static_cast<int>(cfg.palette_id) << std::endl;
-        out << "    startRow   :" << static_cast<int>(cfg.startRow) << std::endl;
-        for (int i = 0;i < 16;i++) {
+        out << " palette_id=" << static_cast<int>(cfg.palette_id);
+        out << " startRow=" << static_cast<int>(cfg.startRow);
+        out << " row x colsb=(";
+        for (int i = 0; i < 16;i++) {
             if (cfg.rows[i] == 0 && cfg.cols[i] == 0)
                 continue;
-            out << "    tile" << i << " : " << static_cast<int>(cfg.rows[i]) << " x " << static_cast<int>(cfg.cols[i]) << std::endl;
+            if (i > 0) out << ",";
+            out << static_cast<int>(cfg.rows[i]) << "x" << static_cast<int>(cfg.cols[i]);
         }
+        out << ")";
         return out;
     }
 } __attribute__ ((__packed__));
+
+
+struct TileBF16 {
+    union {
+        bfloat16 raw[16][32];        // for A matrix
+        bfloat16 kpacked[16][16][2]; // for B matrix
+    } data;
+
+    // src in KxN=32x16, stride0/1 in element unit
+    void kpackB(bfloat16 * src, int stride0, int stride1 = 1) {
+        for (int k = 0; k < 16; k++) {
+            for (int n = 0; n < 16; n++) {
+                data.kpacked[k][n][0] = src[(2*k + 0)*stride0 + n*stride1];
+                data.kpacked[k][n][1] = src[(2*k + 1)*stride0 + n*stride1];
+            }
+        }
+    }
+
+    template<typename T>
+    void operator=(const T & v) {
+        for (int k = 0; k < 16; k++) {
+            for (int n = 0; n < 16; n++) {
+                data.kpacked[k][n][0] = v;
+                data.kpacked[k][n][1] = v;
+            }
+        }
+    }
+};
 
 /*
 void _tile_loadd (__tile dst, const void * base, int stride)
