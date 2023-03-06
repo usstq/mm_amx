@@ -198,7 +198,6 @@ int amx_unit_test_perf() {
 //     m0 < L2/(32*K*elesz) - 1
 //
 struct FC_amx_bf16_v1 {
-    tensor2D<float> buffC;
     static constexpr int tC00 = 0;
     static constexpr int tC01 = 1;
     static constexpr int tC10 = 2;
@@ -208,8 +207,33 @@ struct FC_amx_bf16_v1 {
     static constexpr int tB0 = 6;
     static constexpr int tB1 = 7;
 
-    FC_amx_bf16_v1() : buffC(16, 2*16) {
+    FC_amx_bf16_v1() {
     }
+
+    // post process kernels, tC00 ~ tC11
+    struct PP2bf16 {
+        tensor2D<float> buffC;
+        PP2bf16() : buffC(16, 2*16) {}
+        void postProcess16x32(int8_t * pdst, int stride) {
+            float * psrc = &buffC(0,0);
+            for(int i = 0; i < 16; i ++) {
+                auto b = _mm512_loadu_epi16(psrc);
+                auto a = _mm512_loadu_epi16(psrc + 16);
+                auto c = _mm512_cvtne2ps_pbh(a, b);
+                _mm512_storeu_epi16(pdst, c);   // 32 bf16
+                pdst += stride;
+                psrc += 32;
+            }
+        }
+        void operator()(bfloat16 * pC, int stride) {
+            _tile_stored(tC00, &buffC(0,0), buffC.stride);
+            _tile_stored(tC01, &buffC(0,16), buffC.stride);
+            postProcess16x32(reinterpret_cast<int8_t*>(pC), stride);
+            _tile_stored(tC10, &buffC(0,0), buffC.stride);
+            _tile_stored(tC11, &buffC(0,16), buffC.stride);
+            postProcess16x32(reinterpret_cast<int8_t*>(pC) + 16*stride, stride);
+        }
+    };
 
     // KpackedB is B matrix in block of 32x32 arranged in column-major
     // each 32x32 block is composed of 2 horizontal neighboring tiles
@@ -262,9 +286,11 @@ struct FC_amx_bf16_v1 {
     };
 
     // matB has been pre k-packed
+    template<typename PP>
     void operator()(tensor2D<bfloat16> & matA,
                     KpackedB & matB,
-                    tensor2D<bfloat16> & matC) {
+                    tensor2D<bfloat16> & matC,
+                    PP ppkernel) {
         int M = matC.dims[0];
         int N = matC.dims[1];
         int K = matA.dims[1];
@@ -301,32 +327,11 @@ struct FC_amx_bf16_v1 {
                         _tile_dpbf16ps(tC11, tA1, tB1);
                     }
                     auto pC = &matC(curm, n);
-                    postProcess(pC, matC.stride);
+                    // post process accumulator tiles
+                    (ppkernel)(pC, matC.stride);
                 }
             }
         }
-    }
-
-    // post process two C tiles in 16 x 32
-    void postProcess16x32(int8_t * pdst, int stride) {
-        float * psrc = &buffC(0,0);
-        for(int i = 0; i < 16; i ++) {
-            auto b = _mm512_loadu_epi16(psrc);
-            auto a = _mm512_loadu_epi16(psrc + 16);
-            auto c = _mm512_cvtne2ps_pbh(a, b);
-            _mm512_storeu_epi16(pdst, c);   // 32 bf16
-            pdst += stride;
-            psrc += 32;
-        }
-    }
-
-    void postProcess(bfloat16 * pC, int stride) {
-        _tile_stored(tC00, &buffC(0,0), buffC.stride);
-        _tile_stored(tC01, &buffC(0,16), buffC.stride);
-        postProcess16x32(reinterpret_cast<int8_t*>(pC), stride);
-        _tile_stored(tC10, &buffC(0,0), buffC.stride);
-        _tile_stored(tC11, &buffC(0,16), buffC.stride);
-        postProcess16x32(reinterpret_cast<int8_t*>(pC) + 16*stride, stride);
     }
 };
 
@@ -342,9 +347,10 @@ void amx_unit_test_acc() {
     tensor2D<bfloat16> C0(M, N);
     FC_amx_bf16_v1 fc;
     FC_amx_bf16_v1::KpackedB Bkpacked(B);
+    FC_amx_bf16_v1::PP2bf16 pp;
 
     tileconfig_t tfg(1, 0, 8, 16, 64);
-    fc(A, Bkpacked, C);
+    fc(A, Bkpacked, C, pp);
 
     C0=0;
     matmul(A, B, C0);
@@ -369,10 +375,11 @@ void amx_unit_test_perf2() {
     tensor2D<bfloat16> C0(M, N);
     FC_amx_bf16_v1 fc;
     FC_amx_bf16_v1::KpackedB Bkpacked(B);
+    FC_amx_bf16_v1::PP2bf16 pp;
 
     tileconfig_t tfg(1, 0, 8, 16, 64);
     timeit(-1000, [&](){
-        fc(A, Bkpacked, C);
+        fc(A, Bkpacked, C, pp);
     },
     double(M * N) * K * 2,
     AMXBf16PeakGops2PerCore * 1e9);
