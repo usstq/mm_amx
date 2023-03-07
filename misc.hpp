@@ -75,6 +75,18 @@ void tshow() {
     }
 }
 
+void vshow_bf16(__m512i v) {
+    bfloat16 values[32];
+    _mm512_storeu_epi16(values, v);
+    show(values, 1, 32);
+}
+
+void vshow(__m512 v) {
+    float values[16];
+    _mm512_storeu_ps(values, v);
+    show(values, 1, 16);
+}
+
 template<typename T>
 struct tensor2D {
     int dims[2];
@@ -89,6 +101,16 @@ struct tensor2D {
     tensor2D(int d0, int d1) {
         resize(d0, d1);
         fill_rnd();
+    }
+
+    tensor2D<T> Tr() {
+        tensor2D<T> ret(dims[1], dims[0]);
+        for(int c0=0; c0 < dims[0]; ++c0) {
+            for(int c1=0; c1 < dims[1]; ++c1) {
+                ret(c1, c0) = (*this)(c0, c1);
+            }
+        }
+        return ret;
     }
 
     void resize(int d0, int d1) {
@@ -139,6 +161,17 @@ struct tensor2D {
             (*this)[k] = v;
     }
 
+    void operator=(const tensor2D<T> & t2) {
+        assert(dims[0]*dims[1] == t2.dims[0] * t2.dims[1]);
+        for(int c0 = 0; c0 < dims[0]; c0++)
+        for(int c1 = 0; c1 < dims[1]; c1++) {
+            int k = c0*dims[1] + c1;
+            auto c2 = k / t2.dims[1];
+            auto c3 = k % t2.dims[1];
+            (*this)(c0, c1) = t2(c2, c3);
+        }
+    }
+
     bool operator==(const tensor2D<T> & rhs) {
         bool ok = true;
         if (dims[0] != rhs.dims[0] || dims[1] != rhs.dims[1])
@@ -165,7 +198,7 @@ struct tensor2D {
             if (i1 < obj.dims[1]) out << "...";
             out << std::endl;
         };
-        for(i0=0; i0 < obj.dims[0] && i0 < 4; i0++) {
+        for(i0=0; i0 < obj.dims[0] && i0 < 32; i0++) {
             showline(i0);
         }
         if (i0 < obj.dims[0]) {

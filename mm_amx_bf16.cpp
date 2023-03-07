@@ -177,6 +177,32 @@ int amx_unit_test_perf() {
     return 0;
 }
 
+struct BlockIterator {
+
+    // - total rows M & cols N
+    // - block size m & n
+    // - blocking scheme in m/n/m/n order, from inner to outer
+    // for example:
+    //      Blocking(320, 160, 32, 32, {32*4, 160, 320})
+    // will first go vertically for 4 32x32 blocks, and then horizontally for 160 elements, then vertially 320
+    //
+    int M;
+    int N;
+    int mb;
+    int nb;
+    BlockIterator(int _M, int _N, int _mb, int _nb,
+             const std::vector<int> & blocks) : M(_M), N(_N), mb(_mb), nb(_nb) {
+        //
+    }
+
+    //Prefix increment
+    BlockIterator& operator++() {
+        return *this;
+    }
+};
+
+namespace executor_amx_bf16
+{
 //================================================================================
 // fc layer:  B is const and can be arranged into best sequential format
 //------------------
@@ -199,7 +225,7 @@ int amx_unit_test_perf() {
 //    (m0*32xK*elesz + Kx32*elesz) < L2
 //     m0 < L2/(32*K*elesz) - 1
 //
-struct FC_amx_bf16_v1 {
+struct FC {
     static constexpr int tC00 = 0;
     static constexpr int tC01 = 1;
     static constexpr int tC10 = 2;
@@ -212,8 +238,7 @@ struct FC_amx_bf16_v1 {
     // for processing tails
     tensor2D<bfloat16> Atails;
 
-    FC_amx_bf16_v1() {
-    }
+    FC() {}
 
     // post process kernels, tC00 ~ tC11
     struct PP2bf16 {
@@ -388,14 +413,174 @@ struct FC_amx_bf16_v1 {
     }
 };
 
+
+//https://stackoverflow.com/questions/29519222/how-to-transpose-a-16x16-matrix-using-simd-instructions
+// vector multiply with matrix:
+//  mAvB:  A(M, K) * B(K, 1) => C(M, 1)
+//  vAmB:  A(1, K) * B(K, N) => C(1, N)
+//
+// in mAvB form, block of A (16x32) is transposed in register
+// in unit of 2 packed bf16, and then vdpbf16ps was used
+// to multiply with broadcasted B (2x1) and accumulate into C (16x1)
+// 
+// B is pre-broadcasted in unit of 2
+// 
+struct GemAvB {
+    tensor2D<bfloat16> Bpadded;
+    GemAvB() {
+    }
+
+    void operator()(tensor2D<bfloat16> & matA,
+                    bfloat16 * vecB,
+                    bfloat16 * vecC) {
+        int M = matA.dims[0];
+        int K = matA.dims[1];
+
+        if (K % 32) {
+            if (K > Bpadded.dims[1])
+                Bpadded.resize(1, rndup(K, 32));
+            auto newB = &Bpadded(0, 0);
+            memset(newB, 0, Bpadded.stride);
+            memcpy(newB, vecB, K * sizeof(bfloat16));
+            vecB = newB;
+        }
+
+        auto nstride = matA.stride/sizeof(bfloat16);
+        for(int m = 0; m < M; m += 16) {
+            auto * pA = &matA(m, 0);
+            auto * pBi32 = reinterpret_cast<int32_t*>(vecB);
+            __m512 regC0 = _mm512_setzero();
+            __m512 regC1 = _mm512_setzero();
+            for(int k = 0; k < K; k += 32, pA += 32, pBi32 += 16) {
+                // handle Ab: 16x32
+                // transposed in register as 16x16x2
+                //   r0: (a0,a1)(b0,b1)....
+                //   r1: (a2,a3)(b2,b3)....
+                //      ...
+                //   rf: (a30,a31),(b30,b31)....
+                // 
+                __m512i t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, ta, tb, tc, td, te, tf;
+                __m512i r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, ra, rb, rc, rd, re, rf;
+                r0 = _mm512_loadu_epi32(pA + 0*nstride);
+                r1 = _mm512_loadu_epi32(pA + 1*nstride);
+                r2 = _mm512_loadu_epi32(pA + 2*nstride);
+                r3 = _mm512_loadu_epi32(pA + 3*nstride);
+                r4 = _mm512_loadu_epi32(pA + 4*nstride);
+                r5 = _mm512_loadu_epi32(pA + 5*nstride);
+                r6 = _mm512_loadu_epi32(pA + 6*nstride);
+                r7 = _mm512_loadu_epi32(pA + 7*nstride);
+                r8 = _mm512_loadu_epi32(pA + 8*nstride);
+                r9 = _mm512_loadu_epi32(pA + 9*nstride);
+                ra = _mm512_loadu_epi32(pA + 10*nstride);
+                rb = _mm512_loadu_epi32(pA + 11*nstride);
+                rc = _mm512_loadu_epi32(pA + 12*nstride);
+                rd = _mm512_loadu_epi32(pA + 13*nstride);
+                re = _mm512_loadu_epi32(pA + 14*nstride);
+                rf = _mm512_loadu_epi32(pA + 15*nstride);
+
+                t0 = _mm512_unpacklo_epi32(r0,r1); //   0  16   1  17   4  20   5  21   8  24   9  25  12  28  13  29 
+                t1 = _mm512_unpackhi_epi32(r0,r1); //   2  18   3  19   6  22   7  23  10  26  11  27  14  30  15  31
+                t2 = _mm512_unpacklo_epi32(r2,r3); //  32  48  33  49 ...
+                t3 = _mm512_unpackhi_epi32(r2,r3); //  34  50  35  51 ...
+                t4 = _mm512_unpacklo_epi32(r4,r5); //  64  80  65  81 ...  
+                t5 = _mm512_unpackhi_epi32(r4,r5); //  66  82  67  83 ...
+                t6 = _mm512_unpacklo_epi32(r6,r7); //  96 112  97 113 ...
+                t7 = _mm512_unpackhi_epi32(r6,r7); //  98 114  99 115 ...
+                t8 = _mm512_unpacklo_epi32(r8,r9); // 128 ...
+                t9 = _mm512_unpackhi_epi32(r8,r9); // 130 ...
+                ta = _mm512_unpacklo_epi32(ra,rb); // 160 ...
+                tb = _mm512_unpackhi_epi32(ra,rb); // 162 ...
+                tc = _mm512_unpacklo_epi32(rc,rd); // 196 ...
+                td = _mm512_unpackhi_epi32(rc,rd); // 198 ...
+                te = _mm512_unpacklo_epi32(re,rf); // 228 ...
+                tf = _mm512_unpackhi_epi32(re,rf); // 230 ...
+
+                r0 = _mm512_unpacklo_epi64(t0,t2); //   0  16  32  48 ...
+                r1 = _mm512_unpackhi_epi64(t0,t2); //   1  17  33  49 ...
+                r2 = _mm512_unpacklo_epi64(t1,t3); //   2  18  34  49 ...
+                r3 = _mm512_unpackhi_epi64(t1,t3); //   3  19  35  51 ...
+                r4 = _mm512_unpacklo_epi64(t4,t6); //  64  80  96 112 ...  
+                r5 = _mm512_unpackhi_epi64(t4,t6); //  65  81  97 114 ...
+                r6 = _mm512_unpacklo_epi64(t5,t7); //  66  82  98 113 ...
+                r7 = _mm512_unpackhi_epi64(t5,t7); //  67  83  99 115 ...
+                r8 = _mm512_unpacklo_epi64(t8,ta); // 128 144 160 176 ...  
+                r9 = _mm512_unpackhi_epi64(t8,ta); // 129 145 161 178 ...
+                ra = _mm512_unpacklo_epi64(t9,tb); // 130 146 162 177 ... 
+                rb = _mm512_unpackhi_epi64(t9,tb); // 131 147 163 179 ...
+                rc = _mm512_unpacklo_epi64(tc,te); // 192 208 228 240 ... 
+                rd = _mm512_unpackhi_epi64(tc,te); // 193 209 229 241 ...
+                re = _mm512_unpacklo_epi64(td,tf); // 194 210 230 242 ...
+                rf = _mm512_unpackhi_epi64(td,tf); // 195 211 231 243 ...
+
+                t0 = _mm512_shuffle_i32x4(r0, r4, 0x88); //   0  16  32  48   8  24  40  56  64  80  96  112 ...
+                t1 = _mm512_shuffle_i32x4(r1, r5, 0x88); //   1  17  33  49 ...
+                t2 = _mm512_shuffle_i32x4(r2, r6, 0x88); //   2  18  34  50 ...
+                t3 = _mm512_shuffle_i32x4(r3, r7, 0x88); //   3  19  35  51 ...
+                t4 = _mm512_shuffle_i32x4(r0, r4, 0xdd); //   4  20  36  52 ...
+                t5 = _mm512_shuffle_i32x4(r1, r5, 0xdd); //   5  21  37  53 ...
+                t6 = _mm512_shuffle_i32x4(r2, r6, 0xdd); //   6  22  38  54 ...
+                t7 = _mm512_shuffle_i32x4(r3, r7, 0xdd); //   7  23  39  55 ...
+                t8 = _mm512_shuffle_i32x4(r8, rc, 0x88); // 128 144 160 176 ...
+                t9 = _mm512_shuffle_i32x4(r9, rd, 0x88); // 129 145 161 177 ...
+                ta = _mm512_shuffle_i32x4(ra, re, 0x88); // 130 146 162 178 ...
+                tb = _mm512_shuffle_i32x4(rb, rf, 0x88); // 131 147 163 179 ...
+                tc = _mm512_shuffle_i32x4(r8, rc, 0xdd); // 132 148 164 180 ...
+                td = _mm512_shuffle_i32x4(r9, rd, 0xdd); // 133 149 165 181 ...
+                te = _mm512_shuffle_i32x4(ra, re, 0xdd); // 134 150 166 182 ...
+                tf = _mm512_shuffle_i32x4(rb, rf, 0xdd); // 135 151 167 183 ...
+
+                r0 = _mm512_shuffle_i32x4(t0, t8, 0x88); //   0  16  32  48  64  80  96 112 ... 240
+                r1 = _mm512_shuffle_i32x4(t1, t9, 0x88); //   1  17  33  49  66  81  97 113 ... 241
+                r2 = _mm512_shuffle_i32x4(t2, ta, 0x88); //   2  18  34  50  67  82  98 114 ... 242
+                r3 = _mm512_shuffle_i32x4(t3, tb, 0x88); //   3  19  35  51  68  83  99 115 ... 243
+                r4 = _mm512_shuffle_i32x4(t4, tc, 0x88); //   4 ...
+                r5 = _mm512_shuffle_i32x4(t5, td, 0x88); //   5 ...
+                r6 = _mm512_shuffle_i32x4(t6, te, 0x88); //   6 ...
+                r7 = _mm512_shuffle_i32x4(t7, tf, 0x88); //   7 ...
+                r8 = _mm512_shuffle_i32x4(t0, t8, 0xdd); //   8 ...
+                r9 = _mm512_shuffle_i32x4(t1, t9, 0xdd); //   9 ...
+                ra = _mm512_shuffle_i32x4(t2, ta, 0xdd); //  10 ...
+                rb = _mm512_shuffle_i32x4(t3, tb, 0xdd); //  11 ...
+                rc = _mm512_shuffle_i32x4(t4, tc, 0xdd); //  12 ...
+                rd = _mm512_shuffle_i32x4(t5, td, 0xdd); //  13 ...
+                re = _mm512_shuffle_i32x4(t6, te, 0xdd); //  14 ...
+                rf = _mm512_shuffle_i32x4(t7, tf, 0xdd); //  15  31  47  63  79  96 111 127 ... 255
+
+                // vdpbf16ps
+                regC0 = _mm512_dpbf16_ps(regC0, r0, _mm512_set1_epi32(pBi32[0]));
+                regC1 = _mm512_dpbf16_ps(regC1, r1, _mm512_set1_epi32(pBi32[1]));
+                regC0 = _mm512_dpbf16_ps(regC0, r2, _mm512_set1_epi32(pBi32[2]));
+                regC1 = _mm512_dpbf16_ps(regC1, r3, _mm512_set1_epi32(pBi32[3]));
+                regC0 = _mm512_dpbf16_ps(regC0, r4, _mm512_set1_epi32(pBi32[4]));
+                regC1 = _mm512_dpbf16_ps(regC1, r5, _mm512_set1_epi32(pBi32[5]));
+                regC0 = _mm512_dpbf16_ps(regC0, r6, _mm512_set1_epi32(pBi32[6]));
+                regC1 = _mm512_dpbf16_ps(regC1, r7, _mm512_set1_epi32(pBi32[7]));
+                regC0 = _mm512_dpbf16_ps(regC0, r8, _mm512_set1_epi32(pBi32[8]));
+                regC1 = _mm512_dpbf16_ps(regC1, r9, _mm512_set1_epi32(pBi32[9]));
+                regC0 = _mm512_dpbf16_ps(regC0, ra, _mm512_set1_epi32(pBi32[10]));
+                regC1 = _mm512_dpbf16_ps(regC1, rb, _mm512_set1_epi32(pBi32[11]));
+                regC0 = _mm512_dpbf16_ps(regC0, rc, _mm512_set1_epi32(pBi32[12]));
+                regC1 = _mm512_dpbf16_ps(regC1, rd, _mm512_set1_epi32(pBi32[13]));
+                regC0 = _mm512_dpbf16_ps(regC0, re, _mm512_set1_epi32(pBi32[14]));
+                regC1 = _mm512_dpbf16_ps(regC1, rf, _mm512_set1_epi32(pBi32[15]));
+            }
+            regC0 = _mm512_add_ps(regC0, regC1);
+            auto regOut = _mm512_cvtne2ps_pbh(regC0, regC0); // only 16 bfloat16 results in lower 256bits 
+            _mm256_storeu_si256(reinterpret_cast<__m256i_u *>(vecC + m), _mm512_extracti64x4_epi64(regOut, 0));
+        }
+    }
+};
+
+}
+
 void amx_unit_test_acc(int M, int K, int N) {
     tensor2D<bfloat16> A(M, K);
     tensor2D<bfloat16> B(K, N);
     tensor2D<bfloat16> C(M, N);
     tensor2D<bfloat16> C0(M, N);
-    FC_amx_bf16_v1 fc;
-    FC_amx_bf16_v1::KpackedB Bkpacked(B);
-    FC_amx_bf16_v1::PP2bf16 pp;
+    executor_amx_bf16::FC fc;
+    executor_amx_bf16::FC::KpackedB Bkpacked(B);
+    executor_amx_bf16::FC::PP2bf16 pp;
 
     tileconfig_t tfg(1, 0, 8, 16, 64);
     fc(A, Bkpacked, C, pp);
@@ -418,9 +603,9 @@ void amx_unit_test_perf2(int M, int K, int N, int times = -1000) {
     tensor2D<bfloat16> B(K, N);
     tensor2D<bfloat16> C(M, N);
     tensor2D<bfloat16> C0(M, N);
-    FC_amx_bf16_v1 fc;
-    FC_amx_bf16_v1::KpackedB Bkpacked(B);
-    FC_amx_bf16_v1::PP2bf16 pp;
+    executor_amx_bf16::FC fc;
+    executor_amx_bf16::FC::KpackedB Bkpacked(B);
+    executor_amx_bf16::FC::PP2bf16 pp;
 
     tileconfig_t tfg(1, 0, 8, 16, 64);
     std::cout << "[" << M << "," << K << "," << N << "] ";
@@ -431,9 +616,44 @@ void amx_unit_test_perf2(int M, int K, int N, int times = -1000) {
     AMXBf16PeakGops2PerCore * 1e9);
 }
 
+
+void amx_unit_test_gemAvB(int M, int K, int times = -1000) {
+    int N = 1;
+    tensor2D<bfloat16> A(M, K);
+    tensor2D<bfloat16> B(1, K);
+    tensor2D<bfloat16> B0(K, 1);
+    tensor2D<bfloat16> C0(M, 1);
+    tensor2D<bfloat16> C(1, M);
+    executor_amx_bf16::GemAvB gemAvB;
+
+    // same B, different layout
+    std::cout << "[" << M << "," << K << "," << N << "] ";
+    B0 = B;
+    C0 = 0;
+    matmul(A, B0, C0);
+    auto C0Tr = C0.Tr();
+    gemAvB(A, &B(0,0), &C(0,0));
+    if (C0Tr == C) {
+        std::cout << "Match!\n";
+    } else {
+        std::cout << C0Tr << std::endl;
+        std::cout << C << std::endl;
+        std::cout << "Mismatch!\n";
+        return;
+    }
+
+    std::cout << "[" << M << "," << K << "," << N << "] ";
+    timeit(times, [&](){
+        gemAvB(A, &B(0,0), &C(0,0));
+    },
+    double(M * N) * K * 2,
+    256 * 3e9);
+}
+
 int main(int argc, const char *argv[]) {
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
 
+    amx_unit_test_gemAvB(901, 80); return 0;
     //amx_unit_test_perf();
     amx_unit_test_acc(32*22, 10*32, 256);
     amx_unit_test_acc(32*22 + 1, 10*32, 256 + 1);
