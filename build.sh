@@ -7,6 +7,6 @@ cat _asm.s | c++filt > asm.s &&
 echo asm.s is generated &&
 icx ./mm_amx_bf16.cpp -O2 -lpthread -march=native -lstdc++ -o $target &&
 echo $target is generated &&
-icx ./mm_amx_bf16.cpp -O0 -g -lpthread -march=native -lstdc++ -o dbg$target &&
-echo dbg$target is generated &&
+icx ./mm_amx_bf16.cpp -O0 -g -lpthread -march=native -lstdc++ -o debug.out &&
+echo debug.out is generated &&
 ./$target

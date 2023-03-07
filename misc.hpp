@@ -80,20 +80,34 @@ struct tensor2D {
     int dims[2];
     std::shared_ptr<T> data;
     int stride;
+    int padded_dim1;
+    tensor2D() {
+        dims[0] = 0;
+        dims[1] = 0;
+    }
+
     tensor2D(int d0, int d1) {
+        resize(d0, d1);
+        fill_rnd();
+    }
+
+    void resize(int d0, int d1) {
         dims[0] = d0;
         dims[1] = d1;
+        stride = d1 * sizeof(T);
+        if (stride % 64) {
+            auto stride_fix = rndup(stride, 64);
+            std::cout << "\tWarnning: stride " << stride << " is not aligned to cache line, will increase to " << stride_fix
+                      << " (" << stride_fix/64 << " cache lines)\n";
+            stride = stride_fix;
+        }
+        padded_dim1 = stride / sizeof(T);
 
         // align begin address to cache line is vital, so tile load can
         // use all bandwidth (L1D/L2 only deliver data in unit of 64-byte aligned cache-line)
         data = std::shared_ptr<T>(
-                    reinterpret_cast<T*>(aligned_alloc(64, rndup(d0*d1*sizeof(T), 64))),
+                    reinterpret_cast<T*>(aligned_alloc(64, dims[0] * stride)),
                     [](void * p) { free(p); });
-        stride = d1 * sizeof(T);
-        if (stride % 64) {
-            std::cout << "Warnning: stride " << stride << " is not aligned to cache line\n";
-        }
-        fill_rnd();
     }
 
     T & operator[](int i) {
@@ -106,22 +120,22 @@ struct tensor2D {
 
     //https://stackoverflow.com/questions/1936399/c-array-operator-with-multiple-arguments
     T & operator()(int i0, int i1) {
-        return (*this)[i0 * dims[1] + i1];
+        return (*this)[i0 * padded_dim1 + i1];
     }
 
     const T & operator()(int i0, int i1) const {
-        return (*this)[i0 * dims[1] + i1];
+        return (*this)[i0 * padded_dim1 + i1];
     }
 
     void fill_rnd() {
-        for(int i = 0; i<dims[0]*dims[1]; i++) {
+        for(int i = 0; i<dims[0]*padded_dim1; i++) {
             // lower mantissa can help to avoid small errors in accuracy comparison
             (*this)[i] = (rand() & 1) - 0.5;
         }
     }
 
     void operator=(const T & v) {
-        for(int k = 0; k<dims[0]*dims[1]; k++)
+        for(int k = 0; k<dims[0]*padded_dim1; k++)
             (*this)[k] = v;
     }
 
@@ -356,7 +370,7 @@ struct tileconfig_t {
         _tile_release();
     }
     void load() {
-        std::cout << " tile load config ... " << std::flush;
+        std::cout << "\ttile load config ... " << std::flush;
         _tile_loadconfig(this);
         std::cout << *this << std::flush << std::endl;
     }

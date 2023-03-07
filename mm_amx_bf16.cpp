@@ -7,7 +7,9 @@
 #include <iostream>
 #include <fstream>
 #include <cassert>
+#include <cstring>
 #include <thread>
+
 //#include "thread_pool.hpp"
 #include "bf16.hpp"
 
@@ -207,6 +209,9 @@ struct FC_amx_bf16_v1 {
     static constexpr int tB0 = 6;
     static constexpr int tB1 = 7;
 
+    // for processing tails
+    tensor2D<bfloat16> Atails;
+
     FC_amx_bf16_v1() {
     }
 
@@ -214,26 +219,42 @@ struct FC_amx_bf16_v1 {
     struct PP2bf16 {
         tensor2D<float> buffC;
         PP2bf16() : buffC(16, 2*16) {}
-        void postProcess16x32(int8_t * pdst, int stride) {
+        void postProcess16x32(int8_t * pdst, int stride, int valid_m, int valid_n) {
             float * psrc = &buffC(0,0);
-            for(int i = 0; i < 16; i ++) {
-                auto b = _mm512_loadu_epi16(psrc);
-                auto a = _mm512_loadu_epi16(psrc + 16);
-                auto c = _mm512_cvtne2ps_pbh(a, b);
-                _mm512_storeu_epi16(pdst, c);   // 32 bf16
-                pdst += stride;
-                psrc += 32;
+            if (valid_m >= 16 && valid_n >= 32) {
+                for(int i = 0; i < 16; i ++) {
+                    auto b = _mm512_loadu_epi16(psrc);
+                    auto a = _mm512_loadu_epi16(psrc + 16);
+                    auto c = _mm512_cvtne2ps_pbh(a, b);
+                    _mm512_storeu_epi16(pdst, c);   // 32 bf16
+                    pdst += stride;
+                    psrc += 32;
+                }
+            } else {
+                __mmask32 k = _cvtu32_mask32(0xFFFFFFFF >> (32-valid_n));
+                for(int i = 0; i < valid_m; i ++) {
+                    auto b = _mm512_loadu_epi16(psrc);
+                    auto a = _mm512_loadu_epi16(psrc + 16);
+                    auto c = _mm512_cvtne2ps_pbh(a, b);
+                    _mm512_mask_storeu_epi16(pdst, k, c);   // 32 bf16
+                    pdst += stride;
+                    psrc += 32;
+                }
             }
         }
-        void operator()(bfloat16 * pC, int stride) {
+        void operator()(bfloat16 * pC, int stride, int valid_m, int valid_n) {
             _tile_stored(tC00, &buffC(0,0), buffC.stride);
             _tile_stored(tC01, &buffC(0,16), buffC.stride);
-            postProcess16x32(reinterpret_cast<int8_t*>(pC), stride);
-            _tile_stored(tC10, &buffC(0,0), buffC.stride);
-            _tile_stored(tC11, &buffC(0,16), buffC.stride);
-            postProcess16x32(reinterpret_cast<int8_t*>(pC) + 16*stride, stride);
+            postProcess16x32(reinterpret_cast<int8_t*>(pC), stride, valid_m, valid_n);
+
+            if (valid_m > 16) {
+                _tile_stored(tC10, &buffC(0,0), buffC.stride);
+                _tile_stored(tC11, &buffC(0,16), buffC.stride);
+                postProcess16x32(reinterpret_cast<int8_t*>(pC) + 16*stride, stride, valid_m-16, valid_n);
+            }
         }
     };
+
 
     // KpackedB is B matrix in block of 32x32 arranged in column-major
     // each 32x32 block is composed of 2 horizontal neighboring tiles
@@ -260,9 +281,14 @@ struct FC_amx_bf16_v1 {
             data = std::shared_ptr<bfloat16>(
                         reinterpret_cast<bfloat16*>(aligned_alloc(64, rndup(total_size, 64))),
                         [](void * p){ free(p); });
-            for (int k = 0; k < K; k++)
-            for (int n = 0; n < N; n++)
-                (*this)(k, n) = matB(k, n);
+            
+            for (int k = 0; k < Kblocks*32; k++)
+            for (int n = 0; n < Nblocks*32; n++) {
+                if (k < K && n < N)
+                    (*this)(k, n) = matB(k, n);
+                else
+                    (*this)(k, n) = 0; // padding zero
+            }
         }
 
         bfloat16 & operator()(int k, int n) {
@@ -299,48 +325,70 @@ struct FC_amx_bf16_v1 {
 
         int elesz = sizeof(uint16_t);
         int L2 = 2048*1024; // 2MB
-        int m0 = L2/(32*K*elesz) - 1;
-        assert(m0 > 0);
-        for (int m = 0; m < M; m += m0*32) { // loop m:
+        int slice_size = 32*K*elesz;
+        int mc = L2/slice_size - 1;
+        assert(mc > 0);
+
+        int mtails = M % 32;
+    
+        if (mtails > 0) {
+            if (K > Atails.dims[1])
+                Atails.resize(32, rndup(K, 32));
+            // copy tails into Atails (in unit of 32x32)
+            for (int m = 0; m < mtails; m++) {
+                memcpy(&Atails(m, 0), &matA(M - mtails + m, 0), matA.stride);
+                if (Atails.stride > matA.stride) {
+                    memset(reinterpret_cast<int8_t*>(&Atails(m, 0)) + matA.stride,
+                           0,
+                           Atails.stride - matA.stride);
+                }
+            }
+        }
+
+        for (int m0 = 0; m0 < M; m0 += mc*32) { // loop m:
+            int m1 = std::min(m0 + mc*32, M);
             for(int n = 0; n < N; n+=32) {   // loop n: reuse Ab in L2
                 // (m0*32xK) * (Kx32) => m0*32x32
-                for (int mi = 0; mi < m0; mi++) { // loop mi: reuse Bb in L2
-                    auto curm = m + mi*32;
-                    if (curm >= M)
-                        break;
-                    // load bias or zero
+                int valid_n = std::min(N - n, 32);
+                for (int m = m0; m < m1; m+=32) { // loop mi: reuse Bb in L2
+                    int valid_m = std::min(M - m, 32);
+                    auto * pA0 = &matA(m, 0);
+                    auto * pA1 = &matA(m + 16, 0);
+                    auto strideA = matA.stride;
+                    auto * pB = &matB(0, n);
+                    if (valid_m < 32) {
+                        // use Atails buffer to prevent memory read segmentfault
+                        pA0 = &Atails(0, 0);
+                        pA1 = &Atails(16, 0);
+                        strideA = Atails.stride;
+                    }
                     _tile_zero(tC00);
                     _tile_zero(tC01);
                     _tile_zero(tC10);
                     _tile_zero(tC11);
-                    auto * pA0 = &matA(curm, 0);
-                    auto * pA1 = &matA(curm + 16, 0);
-                    auto * pB = &matB(0, n);
                     for (int k = 0; k < K; k += 32) {
-                        _tile_loadd(tA0, pA0 + k, matA.stride);
+                        _tile_loadd(tA0, pA0 + k, strideA);
                         _tile_loadd(tB0, pB, 64); pB += (16*32);
                         _tile_dpbf16ps(tC00, tA0, tB0);
-                        _tile_loadd(tA1, pA1 + k, matA.stride);
+                        _tile_loadd(tA1, pA1 + k, strideA);
                         _tile_dpbf16ps(tC10, tA1, tB0);
                         _tile_loadd(tB1, pB, 64); pB += (16*32);
                         _tile_dpbf16ps(tC01, tA0, tB1);
                         _tile_dpbf16ps(tC11, tA1, tB1);
                     }
-                    auto pC = &matC(curm, n);
-                    // post process accumulator tiles
-                    (ppkernel)(pC, matC.stride);
+                    // post processing the accumulator tiles
+                    //  - add bias
+                    //  - do activations
+                    //  - convert into bfloat16
+                    //  - store into C matrix
+                    (ppkernel)(&matC(m, n), matC.stride, valid_m, valid_n);
                 }
             }
         }
     }
 };
 
-
-void amx_unit_test_acc() {
-    int M = 32*22;  // 896
-    int K = 80*32;  // 2560
-    int N = 1024;
-
+void amx_unit_test_acc(int M, int K, int N) {
     tensor2D<bfloat16> A(M, K);
     tensor2D<bfloat16> B(K, N);
     tensor2D<bfloat16> C(M, N);
@@ -354,9 +402,10 @@ void amx_unit_test_acc() {
 
     C0=0;
     matmul(A, B, C0);
+    std::cout << "[" << M << "," << K << "," << N << "] ";
     if (C0 == C) {
         std::cout << "Match!\n";
-        std::cout << C << std::endl;
+        //std::cout << C << std::endl;
     } else {
         std::cout << "Mismatch!\n";
         std::cout << C0 << std::endl;
@@ -364,11 +413,7 @@ void amx_unit_test_acc() {
     }
 }
 
-void amx_unit_test_perf2() {
-    int M = 32*28;  // 896
-    int K = 80*32;  // 2560
-    int N = 10240;
-
+void amx_unit_test_perf2(int M, int K, int N) {
     tensor2D<bfloat16> A(M, K);
     tensor2D<bfloat16> B(K, N);
     tensor2D<bfloat16> C(M, N);
@@ -378,6 +423,7 @@ void amx_unit_test_perf2() {
     FC_amx_bf16_v1::PP2bf16 pp;
 
     tileconfig_t tfg(1, 0, 8, 16, 64);
+    std::cout << "[" << M << "," << K << "," << N << "] ";
     timeit(-1000, [&](){
         fc(A, Bkpacked, C, pp);
     },
@@ -389,8 +435,20 @@ int main(int argc, const char *argv[]) {
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
 
     //amx_unit_test_perf();
-    amx_unit_test_acc();
-    amx_unit_test_perf2();
+    amx_unit_test_acc(32*22, 10*32, 256);
+    amx_unit_test_acc(32*22 + 1, 10*32, 256 + 1);
+    amx_unit_test_acc(32*22 + 16, 10*32, 256 + 17);
+    amx_unit_test_acc(32*22 + 31, 10*32, 256 + 15);
+    amx_unit_test_acc(32*22 + 31, 10*32 + 1, 256 + 15);
+    amx_unit_test_acc(32*22 + 31, 10*32 + 17, 256 + 15);
+
+    amx_unit_test_perf2(32*28, 32*80, 10240);
+    amx_unit_test_perf2(32*28 + 1, 32*80, 10240);
+    amx_unit_test_perf2(32*28, 32*80 + 1, 10240);
+    amx_unit_test_perf2(32*28, 32*80, 10240 + 1);
+    amx_unit_test_perf2(32*28 + 1, 32*80 + 1, 10240 + 1);
+    amx_unit_test_perf2(32*28 + 32, 32*80 + 32, 10240 + 32);
+
     return 0;
 
     int M = 256;
