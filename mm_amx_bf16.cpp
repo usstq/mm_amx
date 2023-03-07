@@ -330,7 +330,7 @@ struct FC_amx_bf16_v1 {
         assert(mc > 0);
 
         int mtails = M % 32;
-    
+
         if (mtails > 0) {
             if (K > Atails.dims[1])
                 Atails.resize(32, rndup(K, 32));
@@ -413,7 +413,7 @@ void amx_unit_test_acc(int M, int K, int N) {
     }
 }
 
-void amx_unit_test_perf2(int M, int K, int N) {
+void amx_unit_test_perf2(int M, int K, int N, int times = -1000) {
     tensor2D<bfloat16> A(M, K);
     tensor2D<bfloat16> B(K, N);
     tensor2D<bfloat16> C(M, N);
@@ -424,7 +424,7 @@ void amx_unit_test_perf2(int M, int K, int N) {
 
     tileconfig_t tfg(1, 0, 8, 16, 64);
     std::cout << "[" << M << "," << K << "," << N << "] ";
-    timeit(-1000, [&](){
+    timeit(times, [&](){
         fc(A, Bkpacked, C, pp);
     },
     double(M * N) * K * 2,
@@ -449,38 +449,7 @@ int main(int argc, const char *argv[]) {
     amx_unit_test_perf2(32*28 + 1, 32*80 + 1, 10240 + 1);
     amx_unit_test_perf2(32*28 + 32, 32*80 + 32, 10240 + 32);
 
-    return 0;
-
-    int M = 256;
-    int K = 256;
-    int N = 256;
-    tensor2D<bfloat16> A(M, K);
-    tensor2D<bfloat16> B(K, N);
-    tensor2D<bfloat16> C0(M, N);
-    tensor2D<bfloat16> C1(M, N);
-
-    C0 = 0.0f;
-    C1 = 0.0f;
-    matmul(A, B, C0);
-    //matmul(A, B, C1);
-
-
-    // warm-up
-    matmul_amx(A, B, C1);
-
-    auto avg_latency = timeit(5, [&](){
-        matmul_amx(A, B, C1);
-    });
-    std::cout << "average latency  : " << avg_latency*1e6 << " us" << std::endl;
-    std::cout << "AMXBf16 PeakGops : " << AMXBf16PeakGopsPerCore << std::endl;
-    std::cout << "Actual Gops      : " << M*N*K*2.0/avg_latency/(1e9) << std::endl;
-    std::cout << "  AMX Usage      : " << (M*N*K*2.0/avg_latency)/(1e9*AMXBf16PeakGopsPerCore) << std::endl;
-
-    if(C0 == C1) {
-        std::cout << "Correct: C0=\n" << C0 << std::endl;
-    } else {
-        std::cout << " Wrong C0!=C1" << std::endl;
-    }
+    amx_unit_test_perf2(896, 256, 1024, 10000);
 
     return 0;
 }
