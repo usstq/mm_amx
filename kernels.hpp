@@ -17,7 +17,8 @@ struct BlockIterator {
     };
 
     int idx[16];  // index at each level of blocks
-    std::vector<blkloop> bloops;
+    const blkloop *bloops;
+    int num_bloops;
 
     int M;
     int N;
@@ -28,20 +29,15 @@ struct BlockIterator {
     bool reach_end;
 
     BlockIterator() = default;
-    BlockIterator(const std::vector<blkloop> & _bloops){
-        init(_bloops);
-    }
 
-    void init(const std::vector<blkloop> & _bloops) {
+    void reset(const blkloop * _bloops, int _num_bloops, int _M, int _N) {
+        assert(_num_bloops <= 16);
         bloops = _bloops;
-        assert(bloops.size() <= 16);
-    }
-
-    void reset(int _M, int _N) {
+        num_bloops = _num_bloops;
         M = _M;
         N = _N;
         // reset coordinates to sequence index
-        for(int i = 0; i < bloops.size(); i++)
+        for(int i = 0; i < num_bloops; i++)
             idx[i] = 0;
         seq = 0;
         m = 0;
@@ -53,7 +49,7 @@ struct BlockIterator {
         if (reach_end)
             return false;
         int carry_on = 1;
-        for(int i = 0; i < bloops.size(); i++) {
+        for(int i = 0; i < num_bloops; i++) {
             const auto & bl = bloops[i];
             if (idx[i] == (bl.cnt - 1)) {
                 // carry-on on block boundary, no contribution to m/n
@@ -87,160 +83,335 @@ struct BlockIterator {
     }
 };
 
-//================================================================================
-// fc layer:  B is const and can be arranged into best sequential format
-//------------------
-// register blocking:
-// A bfloat16_16x32
-// B bfloat16_32x16 (layout: 16x16x4)
-// C    float_16x16
+
+// KpackedB is B matrix in block of 32x32 arranged in column-major
+// each 32x32 block is composed of 2 horizontal neighboring tiles
+// of 32x16(further repacked as 16x16x2)
+// 
+//  +---+---+-----
+//  |B0 |B1 |
+//  |   |   |
+//  +---+---+
+//  |   |   | 
+// 
+// need to support:
+//   - optimized single core performance
+//   - support transpose
+//   - blocking scheme
 //
-//         B0 B1
-//         ...
-//         B0 B1
-//A0 : A0   C C
-//A1 : A1   C C
-//------------------
-// cache blocking:
-//                Bb:     Kx32
-//   Ab:  m0*32xK Cb:  m0*32x32
-//
-// (Ab + Bb) should fit in L2 cache
-//    (m0*32xK*elesz + Kx32*elesz) < L2
-//     m0 < L2/(32*K*elesz) - 1
-//
-struct FC {
-    static constexpr int tC00 = 0;
-    static constexpr int tC01 = 1;
-    static constexpr int tC10 = 2;
-    static constexpr int tC11 = 3;
-    static constexpr int tA0 = 4;
-    static constexpr int tA1 = 5;
-    static constexpr int tB0 = 6;
-    static constexpr int tB1 = 7;
+struct KpackedB {
+    std::shared_ptr<bfloat16> data;
+    int64_t capacity;
+    int K;
+    int N;
+    int Kblocks;
+    int Nblocks;
+    KpackedB() {
+        capacity = 0;
+        K = N = 0;
+        Kblocks = Nblocks = 0;
+    }
 
-    // for processing tails
-    tensor2D<bfloat16> Atails;
-
-    BlockIterator bloop;
-
-    FC() {}
-
-    // post process kernels, tC00 ~ tC11
-    struct PP2bf16 {
-        tensor2D<float> buffC;
-        PP2bf16() : buffC(16, 2*16) {}
-        void postProcess16x32(int8_t * pdst, int stride, int valid_m, int valid_n) {
-            float * psrc = &buffC(0,0);
-            if (valid_m >= 16 && valid_n >= 32) {
-                for(int i = 0; i < 16; i ++) {
-                    auto b = _mm512_loadu_epi16(psrc);
-                    auto a = _mm512_loadu_epi16(psrc + 16);
-                    auto c = _mm512_cvtne2ps_pbh(a, b);
-                    _mm512_storeu_epi16(pdst, c);   // 32 bf16
-                    pdst += stride;
-                    psrc += 32;
-                }
-            } else {
-                __mmask32 k = _cvtu32_mask32(0xFFFFFFFF >> (32-valid_n));
-                for(int i = 0; i < valid_m; i ++) {
-                    auto b = _mm512_loadu_epi16(psrc);
-                    auto a = _mm512_loadu_epi16(psrc + 16);
-                    auto c = _mm512_cvtne2ps_pbh(a, b);
-                    _mm512_mask_storeu_epi16(pdst, k, c);   // 32 bf16
-                    pdst += stride;
-                    psrc += 32;
-                }
-            }
+    bfloat16 & operator()(int k, int n) {
+        int kb = k/32;
+        int nb = n/32;
+        int block_offset = (nb*Kblocks + kb)*(32*32);
+        int kr = k % 32;
+        int nr = n % 32;
+        int offset = block_offset;
+        
+        if (nr >= 16) {
+            //B1
+            offset += 32*16;
+            nr -= 16;
         }
-        void operator()(bfloat16 * pC, int stride, int valid_m, int valid_n) {
-            _tile_stored(tC00, &buffC(0,0), buffC.stride);
-            _tile_stored(tC01, &buffC(0,16), buffC.stride);
-            postProcess16x32(reinterpret_cast<int8_t*>(pC), stride, valid_m, valid_n);
+        // (kr,nr) is coordinate in 32x16 submatrix
+        // after repack it becomes offset in 16x16x2
+        offset += (kr/2)*32 + 2*nr + (kr&1);
+        return data.get()[offset];
+    }
 
-            if (valid_m > 16) {
-                _tile_stored(tC10, &buffC(0,0), buffC.stride);
-                _tile_stored(tC11, &buffC(0,16), buffC.stride);
-                postProcess16x32(reinterpret_cast<int8_t*>(pC) + 16*stride, stride, valid_m-16, valid_n);
-            }
-        }
-    };
-
-    // KpackedB is B matrix in block of 32x32 arranged in column-major
-    // each 32x32 block is composed of 2 horizontal neighboring tiles
-    // of 32x16(further repacked as 16x16x2)
-    // 
-    //  +---+---+-----
-    //  |B0 |B1 |
-    //  |   |   |
-    //  +---+---+
-    //  |   |   | 
-    // 
-    struct KpackedB {
-        std::shared_ptr<bfloat16> data;
-        int K;
-        int N;
-        int Kblocks;
-        int Nblocks;
-        KpackedB(tensor2D<bfloat16> & matB) {
-            K = matB.dims[0];
-            N = matB.dims[1];
-            Kblocks = (K + 31)/32;
-            Nblocks = (N + 31)/32;
-            int total_size = Kblocks * Nblocks * 32 * 32 * sizeof(bfloat16);
+    void resize(int _K, int _N) {
+        K = _K;
+        N = _N;
+        Kblocks = rndup(K, 32)/32;
+        Nblocks = rndup(N, 32)/32;
+        int64_t need_capacity = Kblocks * Nblocks * 32 * 32 * sizeof(bfloat16);
+        need_capacity = rndup(need_capacity, 64);
+        if (capacity < need_capacity) {
+            capacity = need_capacity;
             data = std::shared_ptr<bfloat16>(
-                        reinterpret_cast<bfloat16*>(aligned_alloc(64, rndup(total_size, 64))),
+                        reinterpret_cast<bfloat16*>(aligned_alloc(64, capacity)),
                         [](void * p){ free(p); });
-            
-            for (int k = 0; k < Kblocks*32; k++)
-            for (int n = 0; n < Nblocks*32; n++) {
-                if (k < K && n < N)
-                    (*this)(k, n) = matB(k, n);
-                else
-                    (*this)(k, n) = 0; // padding zero
+        }
+    }
+
+    void operator=(const float & v) {
+        for(int k = 0; k<capacity/sizeof(bfloat16); k++)
+            data.get()[k] = v;
+    }
+};
+
+constexpr int tC00 = 0;
+constexpr int tC01 = 1;
+constexpr int tC10 = 2;
+constexpr int tC11 = 3;
+constexpr int tA0 = 4;
+constexpr int tA1 = 5;
+constexpr int tB0 = 6;
+constexpr int tB1 = 7;
+
+namespace functional {
+
+    void transpose_m512i_16x16(__m512i &r0, __m512i &r1, __m512i &r2, __m512i &r3,
+                               __m512i &r4, __m512i &r5, __m512i &r6, __m512i &r7,
+                               __m512i &r8, __m512i &r9, __m512i &ra, __m512i &rb,
+                               __m512i &rc, __m512i &rd, __m512i &re, __m512i &rf) {
+        __m512i t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, ta, tb, tc, td, te, tf;
+
+        t0 = _mm512_unpacklo_epi32(r0,r1); //   0  16   1  17   4  20   5  21   8  24   9  25  12  28  13  29 
+        t1 = _mm512_unpackhi_epi32(r0,r1); //   2  18   3  19   6  22   7  23  10  26  11  27  14  30  15  31
+        t2 = _mm512_unpacklo_epi32(r2,r3); //  32  48  33  49 ...
+        t3 = _mm512_unpackhi_epi32(r2,r3); //  34  50  35  51 ...
+        t4 = _mm512_unpacklo_epi32(r4,r5); //  64  80  65  81 ...  
+        t5 = _mm512_unpackhi_epi32(r4,r5); //  66  82  67  83 ...
+        t6 = _mm512_unpacklo_epi32(r6,r7); //  96 112  97 113 ...
+        t7 = _mm512_unpackhi_epi32(r6,r7); //  98 114  99 115 ...
+        t8 = _mm512_unpacklo_epi32(r8,r9); // 128 ...
+        t9 = _mm512_unpackhi_epi32(r8,r9); // 130 ...
+        ta = _mm512_unpacklo_epi32(ra,rb); // 160 ...
+        tb = _mm512_unpackhi_epi32(ra,rb); // 162 ...
+        tc = _mm512_unpacklo_epi32(rc,rd); // 196 ...
+        td = _mm512_unpackhi_epi32(rc,rd); // 198 ...
+        te = _mm512_unpacklo_epi32(re,rf); // 228 ...
+        tf = _mm512_unpackhi_epi32(re,rf); // 230 ...
+
+        r0 = _mm512_unpacklo_epi64(t0,t2); //   0  16  32  48 ...
+        r1 = _mm512_unpackhi_epi64(t0,t2); //   1  17  33  49 ...
+        r2 = _mm512_unpacklo_epi64(t1,t3); //   2  18  34  49 ...
+        r3 = _mm512_unpackhi_epi64(t1,t3); //   3  19  35  51 ...
+        r4 = _mm512_unpacklo_epi64(t4,t6); //  64  80  96 112 ...  
+        r5 = _mm512_unpackhi_epi64(t4,t6); //  65  81  97 114 ...
+        r6 = _mm512_unpacklo_epi64(t5,t7); //  66  82  98 113 ...
+        r7 = _mm512_unpackhi_epi64(t5,t7); //  67  83  99 115 ...
+        r8 = _mm512_unpacklo_epi64(t8,ta); // 128 144 160 176 ...  
+        r9 = _mm512_unpackhi_epi64(t8,ta); // 129 145 161 178 ...
+        ra = _mm512_unpacklo_epi64(t9,tb); // 130 146 162 177 ... 
+        rb = _mm512_unpackhi_epi64(t9,tb); // 131 147 163 179 ...
+        rc = _mm512_unpacklo_epi64(tc,te); // 192 208 228 240 ... 
+        rd = _mm512_unpackhi_epi64(tc,te); // 193 209 229 241 ...
+        re = _mm512_unpacklo_epi64(td,tf); // 194 210 230 242 ...
+        rf = _mm512_unpackhi_epi64(td,tf); // 195 211 231 243 ...
+
+        t0 = _mm512_shuffle_i32x4(r0, r4, 0x88); //   0  16  32  48   8  24  40  56  64  80  96  112 ...
+        t1 = _mm512_shuffle_i32x4(r1, r5, 0x88); //   1  17  33  49 ...
+        t2 = _mm512_shuffle_i32x4(r2, r6, 0x88); //   2  18  34  50 ...
+        t3 = _mm512_shuffle_i32x4(r3, r7, 0x88); //   3  19  35  51 ...
+        t4 = _mm512_shuffle_i32x4(r0, r4, 0xdd); //   4  20  36  52 ...
+        t5 = _mm512_shuffle_i32x4(r1, r5, 0xdd); //   5  21  37  53 ...
+        t6 = _mm512_shuffle_i32x4(r2, r6, 0xdd); //   6  22  38  54 ...
+        t7 = _mm512_shuffle_i32x4(r3, r7, 0xdd); //   7  23  39  55 ...
+        t8 = _mm512_shuffle_i32x4(r8, rc, 0x88); // 128 144 160 176 ...
+        t9 = _mm512_shuffle_i32x4(r9, rd, 0x88); // 129 145 161 177 ...
+        ta = _mm512_shuffle_i32x4(ra, re, 0x88); // 130 146 162 178 ...
+        tb = _mm512_shuffle_i32x4(rb, rf, 0x88); // 131 147 163 179 ...
+        tc = _mm512_shuffle_i32x4(r8, rc, 0xdd); // 132 148 164 180 ...
+        td = _mm512_shuffle_i32x4(r9, rd, 0xdd); // 133 149 165 181 ...
+        te = _mm512_shuffle_i32x4(ra, re, 0xdd); // 134 150 166 182 ...
+        tf = _mm512_shuffle_i32x4(rb, rf, 0xdd); // 135 151 167 183 ...
+
+        r0 = _mm512_shuffle_i32x4(t0, t8, 0x88); //   0  16  32  48  64  80  96 112 ... 240
+        r1 = _mm512_shuffle_i32x4(t1, t9, 0x88); //   1  17  33  49  66  81  97 113 ... 241
+        r2 = _mm512_shuffle_i32x4(t2, ta, 0x88); //   2  18  34  50  67  82  98 114 ... 242
+        r3 = _mm512_shuffle_i32x4(t3, tb, 0x88); //   3  19  35  51  68  83  99 115 ... 243
+        r4 = _mm512_shuffle_i32x4(t4, tc, 0x88); //   4 ...
+        r5 = _mm512_shuffle_i32x4(t5, td, 0x88); //   5 ...
+        r6 = _mm512_shuffle_i32x4(t6, te, 0x88); //   6 ...
+        r7 = _mm512_shuffle_i32x4(t7, tf, 0x88); //   7 ...
+        r8 = _mm512_shuffle_i32x4(t0, t8, 0xdd); //   8 ...
+        r9 = _mm512_shuffle_i32x4(t1, t9, 0xdd); //   9 ...
+        ra = _mm512_shuffle_i32x4(t2, ta, 0xdd); //  10 ...
+        rb = _mm512_shuffle_i32x4(t3, tb, 0xdd); //  11 ...
+        rc = _mm512_shuffle_i32x4(t4, tc, 0xdd); //  12 ...
+        rd = _mm512_shuffle_i32x4(t5, td, 0xdd); //  13 ...
+        re = _mm512_shuffle_i32x4(t6, te, 0xdd); //  14 ...
+        rf = _mm512_shuffle_i32x4(t7, tf, 0xdd); //  15  31  47  63  79  96 111 127 ... 255
+    }
+
+    void transpose_epi32_16x16(void * _dst, const void * src, int stride) {
+        auto * dst = reinterpret_cast<uint32_t*>(_dst);
+        __m512i r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, ra, rb, rc, rd, re, rf;
+        auto * pA = reinterpret_cast<const uint8_t*>(src);
+        r0 = _mm512_loadu_epi32(pA);
+        r1 = _mm512_loadu_epi32(pA + stride);
+        r2 = _mm512_loadu_epi32(pA + 2*stride);
+        r3 = _mm512_loadu_epi32(pA + 3*stride);
+        r4 = _mm512_loadu_epi32(pA + 4*stride);
+        r5 = _mm512_loadu_epi32(pA + 5*stride);
+        r6 = _mm512_loadu_epi32(pA + 6*stride);
+        r7 = _mm512_loadu_epi32(pA + 7*stride);
+        r8 = _mm512_loadu_epi32(pA + 8*stride);
+        r9 = _mm512_loadu_epi32(pA + 9*stride);
+        ra = _mm512_loadu_epi32(pA + 10*stride);
+        rb = _mm512_loadu_epi32(pA + 11*stride);
+        rc = _mm512_loadu_epi32(pA + 12*stride);
+        rd = _mm512_loadu_epi32(pA + 13*stride);
+        re = _mm512_loadu_epi32(pA + 14*stride);
+        rf = _mm512_loadu_epi32(pA + 15*stride);
+
+        transpose_m512i_16x16(r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, ra, rb, rc, rd, re, rf);
+
+        _mm512_storeu_epi32(dst, r0);
+        _mm512_storeu_epi32(dst + 16, r1);
+        _mm512_storeu_epi32(dst + 2*16, r2);
+        _mm512_storeu_epi32(dst + 3*16, r3);
+        _mm512_storeu_epi32(dst + 4*16, r4);
+        _mm512_storeu_epi32(dst + 5*16, r5);
+        _mm512_storeu_epi32(dst + 6*16, r6);
+        _mm512_storeu_epi32(dst + 7*16, r7);
+        _mm512_storeu_epi32(dst + 8*16, r8);
+        _mm512_storeu_epi32(dst + 9*16, r9);
+        _mm512_storeu_epi32(dst + 10*16, ra);
+        _mm512_storeu_epi32(dst + 11*16, rb);
+        _mm512_storeu_epi32(dst + 12*16, rc);
+        _mm512_storeu_epi32(dst + 13*16, rd);
+        _mm512_storeu_epi32(dst + 14*16, re);
+        _mm512_storeu_epi32(dst + 15*16, rf);
+    }
+
+    // 16xN, N<=16
+    void transpose_epi32_16xN(void * _dst, const void * src, int stride, int valid_n) {
+        auto * dst = reinterpret_cast<uint32_t*>(_dst);
+        __m512i r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, ra, rb, rc, rd, re, rf;
+        auto * pA = reinterpret_cast<const uint8_t*>(src);
+        __mmask16 k = _cvtu32_mask32(0xFFFFFFFF >> (32-valid_n));
+        r0 = _mm512_maskz_loadu_epi16 (k, pA);
+        r1 = _mm512_maskz_loadu_epi16 (k, pA + stride);
+        r2 = _mm512_maskz_loadu_epi16 (k, pA + 2*stride);
+        r3 = _mm512_maskz_loadu_epi16 (k, pA + 3*stride);
+        r4 = _mm512_maskz_loadu_epi16 (k, pA + 4*stride);
+        r5 = _mm512_maskz_loadu_epi16 (k, pA + 5*stride);
+        r6 = _mm512_maskz_loadu_epi16 (k, pA + 6*stride);
+        r7 = _mm512_maskz_loadu_epi16 (k, pA + 7*stride);
+        r8 = _mm512_maskz_loadu_epi16 (k, pA + 8*stride);
+        r9 = _mm512_maskz_loadu_epi16 (k, pA + 9*stride);
+        ra = _mm512_maskz_loadu_epi16 (k, pA + 10*stride);
+        rb = _mm512_maskz_loadu_epi16 (k, pA + 11*stride);
+        rc = _mm512_maskz_loadu_epi16 (k, pA + 12*stride);
+        rd = _mm512_maskz_loadu_epi16 (k, pA + 13*stride);
+        re = _mm512_maskz_loadu_epi16 (k, pA + 14*stride);
+        rf = _mm512_maskz_loadu_epi16 (k, pA + 15*stride);
+        transpose_m512i_16x16(r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, ra, rb, rc, rd, re, rf);
+        _mm512_storeu_epi32(dst, r0);
+        _mm512_storeu_epi32(dst + 16, r1);
+        _mm512_storeu_epi32(dst + 2*16, r2);
+        _mm512_storeu_epi32(dst + 3*16, r3);
+        _mm512_storeu_epi32(dst + 4*16, r4);
+        _mm512_storeu_epi32(dst + 5*16, r5);
+        _mm512_storeu_epi32(dst + 6*16, r6);
+        _mm512_storeu_epi32(dst + 7*16, r7);
+        _mm512_storeu_epi32(dst + 8*16, r8);
+        _mm512_storeu_epi32(dst + 9*16, r9);
+        _mm512_storeu_epi32(dst + 10*16, ra);
+        _mm512_storeu_epi32(dst + 11*16, rb);
+        _mm512_storeu_epi32(dst + 12*16, rc);
+        _mm512_storeu_epi32(dst + 13*16, rd);
+        _mm512_storeu_epi32(dst + 14*16, re);
+        _mm512_storeu_epi32(dst + 15*16, rf);
+    }
+
+    void kpack_tile_B0B1(void * _dst0, void * _dst1, const void * _src, int stride, int src_rows) {
+        // in 64unit
+        //
+        //  [a1 a2 a3 a4 | a5 a6 a7 a8]
+        //  [b1 b2 b3 b4 | b5 b6 b7 b8]
+        // _mm512_permutexvar_epi64
+        //  [a1 a5 a2 a6 a3 a7 a4 a8]
+        //  [b1 b5 b2 b6 b3 b7 b4 b8]
+        // _mm512_unpacklo_epi16 works in 128 lanes, & means interleave
+        //  [a1&b1 a2&b2 a3&b3 a4&b4]
+        // _mm512_unpackhi_epi16 
+        //  [a5&b5 a6&b6 a7&b7 a8&b8]
+        //
+        //
+        static const uint64_t idx[8] = {0,4,1,5,2,6,3,7};
+        auto midx = _mm512_loadu_epi64(idx);
+        const auto * src = reinterpret_cast<const int8_t *>(_src);
+        auto * dst0 = reinterpret_cast<int8_t *>(_dst0);
+        auto * dst1 = reinterpret_cast<int8_t *>(_dst1);
+        __m512i a,b,rowB0, rowB1;
+        if (src_rows == 32) {
+            for (int row = 0; row < 16; row++) {
+                a = _mm512_loadu_epi16(src);
+                b = _mm512_loadu_epi16(src + stride);
+                a = _mm512_permutexvar_epi64(midx, a);
+                b = _mm512_permutexvar_epi64(midx, b);
+                rowB0 = _mm512_unpacklo_epi16(a, b);
+                rowB1 = _mm512_unpackhi_epi16(a, b);
+                _mm512_storeu_epi16(dst0, rowB0);
+                _mm512_storeu_epi16(dst1, rowB1);
+                src += 2*stride;
+                dst0 += 64;
+                dst1 += 64;
+            }
+        } else {
+            int row = 0;
+            for (; row < (src_rows/2); row++) {
+                a = _mm512_loadu_epi16(src);
+                b = _mm512_loadu_epi16(src + stride);
+                a = _mm512_permutexvar_epi64(midx, a);
+                b = _mm512_permutexvar_epi64(midx, b);
+                rowB0 = _mm512_unpacklo_epi16(a, b);
+                rowB1 = _mm512_unpackhi_epi16(a, b);
+                _mm512_storeu_epi16(dst0, rowB0);
+                _mm512_storeu_epi16(dst1, rowB1);
+                src += 2*stride;
+                dst0 += 64;
+                dst1 += 64;
+            }
+            // the rest rows contains zeros
+            if (src_rows & 1) {
+                a = _mm512_loadu_epi16(src);
+                b = _mm512_setzero_si512();
+
+                a = _mm512_permutexvar_epi64(midx, a);
+                b = _mm512_permutexvar_epi64(midx, b);
+                auto rowB0 = _mm512_unpacklo_epi16(a, b);
+                auto rowB1 = _mm512_unpackhi_epi16(a, b);
+                _mm512_storeu_epi16(dst0, rowB0);
+                _mm512_storeu_epi16(dst1, rowB1);
+                src += 2*stride;
+                dst0 += 64;
+                dst1 += 64;
+                row ++;
+            }
+            rowB0 = _mm512_setzero_si512();
+            rowB1 = _mm512_setzero_si512();
+            for(; row < 16; row++) {
+                _mm512_storeu_epi16(dst0, rowB0);
+                _mm512_storeu_epi16(dst1, rowB1);
+                src += 2*stride;
+                dst0 += 64;
+                dst1 += 64;
             }
         }
-
-        bfloat16 & operator()(int k, int n) {
-            int kb = k/32;
-            int nb = n/32;
-            int block_offset = (nb*Kblocks + kb)*(32*32);
-            int kr = k % 32;
-            int nr = n % 32;
-            int offset = block_offset;
-            
-            if (nr >= 16) {
-                //B1
-                offset += 32*16;
-                nr -= 16;
-            }
-            // (kr,nr) is coordinate in 32x16 submatrix
-            // after repack it becomes offset in 16x16x2
-            offset += (kr/2)*32 + 2*nr + (kr&1);
-            return data.get()[offset];
-        }
-    };
-
-    // matB has been pre k-packed
+    }
+    // 1x4 2x2
     template<typename PP>
-    void operator()(tensor2D<bfloat16> & matA,
+    void matmul2x2(tensor2D<bfloat16> & matA,
                     KpackedB & matB,
                     tensor2D<bfloat16> & matC,
+                    tensor2D<bfloat16> & scratch,
+                    BlockIterator & blk_it,
                     PP ppkernel) {
+        tensor2D<bfloat16> & Atails = scratch;
         int M = matC.dims[0];
         int N = matC.dims[1];
         int K = matA.dims[1];
         assert(K == matB.K);
         assert(N == matB.N);
 
-        int elesz = sizeof(uint16_t);
-        int L2 = 2048*1024; // 2MB
-        int slice_size = 32*K*elesz;
-        int mc = L2/slice_size - 1;
-        assert(mc > 0);
-
         int mtails = M % 32;
-
         if (mtails > 0) {
             Atails.resize(32, rndup(K, 32));
             // copy tails into Atails (in unit of 32x32)
@@ -248,52 +419,196 @@ struct FC {
                 memcpy(&Atails(m, 0), &matA(M - mtails + m, 0), matA.stride);
                 if (Atails.stride > matA.stride) {
                     memset(reinterpret_cast<int8_t*>(&Atails(m, 0)) + matA.stride,
-                           0,
-                           Atails.stride - matA.stride);
+                            0,
+                            Atails.stride - matA.stride);
                 }
             }
         }
 
-        for (int m0 = 0; m0 < M; m0 += mc*32) { // loop m:
-            int m1 = std::min(m0 + mc*32, M);
-            for(int n = 0; n < N; n+=32) {   // loop n: reuse Ab in L2
-                // (m0*32xK) * (Kx32) => m0*32x32
-                int valid_n = std::min(N - n, 32);
-                for (int m = m0; m < m1; m+=32) { // loop mi: reuse Bb in L2
-                    int valid_m = std::min(M - m, 32);
-                    auto * pA0 = &matA(m, 0);
-                    auto * pA1 = &matA(m + 16, 0);
-                    auto strideA = matA.stride;
-                    auto * pB = &matB(0, n);
-                    if (valid_m < 32) {
-                        // use Atails buffer to prevent memory read segmentfault
-                        pA0 = &Atails(0, 0);
-                        pA1 = &Atails(16, 0);
-                        strideA = Atails.stride;
+        do
+        {
+            int m = blk_it.m;
+            int n = blk_it.n;
+            int valid_m = std::min(M - m, 32);
+            int valid_n = std::min(N - n, 32);
+            auto * pA0 = &matA(m, 0);
+            auto * pA1 = &matA(m + 16, 0);
+            auto strideA = matA.stride;
+            auto * pB = &matB(0, n);
+            if (valid_m < 32) {
+                // use Atails buffer to prevent memory read segmentfault
+                pA0 = &Atails(0, 0);
+                pA1 = &Atails(16, 0);
+                strideA = Atails.stride;
+            }
+            _tile_zero(tC00);
+            _tile_zero(tC01);
+            _tile_zero(tC10);
+            _tile_zero(tC11);
+            for (int k = 0; k < K; k += 32) {
+                _tile_loadd(tA0, pA0 + k, strideA);
+                _tile_loadd(tB0, pB, 64); pB += (16*32);
+                _tile_dpbf16ps(tC00, tA0, tB0);
+                _tile_loadd(tA1, pA1 + k, strideA);
+                _tile_dpbf16ps(tC10, tA1, tB0);
+                _tile_loadd(tB1, pB, 64); pB += (16*32);
+                _tile_dpbf16ps(tC01, tA0, tB1);
+                _tile_dpbf16ps(tC11, tA1, tB1);
+            }
+            // post processing the accumulator tiles
+            //  - add bias
+            //  - do activations
+            //  - convert into bfloat16
+            //  - store into C matrix
+            (ppkernel)(&matC(m, n), matC.stride, valid_m, valid_n);
+        } while(blk_it.next());
+    }
+    
+    // prepare B matrix for C matrix 2x2 blocking (B matrix
+    // will be accessed in 1x2)
+    // given 2x2 blocking scheme, Kx32 blocks are always
+    // accessed sequentially:
+    // transpose/repack each 32xK bfloat16 submatrix
+    // into Kx32 slices (each number is a 16x32 bf16-block):
+    //   0 2 4 6 ... ...
+    //   1 3 5 7 ... ...
+    // 
+    void prepareB(KpackedB & B, tensor2D<bfloat16> & matB, bool transpose = false) {
+        int K = matB.dims[transpose?1:0];
+        int N = matB.dims[transpose?0:1];
+        B.resize(K, N);
+        if (1) {
+            if (transpose) {
+                assert(N == matB.dims[0]);
+                assert(K == matB.dims[1]);
+                for(int n = 0; n < N; n+=32) {
+                    auto * dst = &B(0, n);
+                    auto * src0 = &matB(n, 0);
+                    auto * src1 = &matB(n + 16, 0);
+                    int k;
+                    for(k = 0; k + 32 <= K; k+=32, src0+=32, src1+=32) {
+                        // B0 (16x32) => transpose+repack as 32x16 => 16x16x2
+                        functional::transpose_epi32_16x16(dst, src0, matB.stride);
+                        dst += (16*32);
+                        // B1
+                        functional::transpose_epi32_16x16(dst, src1, matB.stride);
+                        dst += (16*32);
                     }
-                    _tile_zero(tC00);
-                    _tile_zero(tC01);
-                    _tile_zero(tC10);
-                    _tile_zero(tC11);
-                    for (int k = 0; k < K; k += 32) {
-                        _tile_loadd(tA0, pA0 + k, strideA);
-                        _tile_loadd(tB0, pB, 64); pB += (16*32);
-                        _tile_dpbf16ps(tC00, tA0, tB0);
-                        _tile_loadd(tA1, pA1 + k, strideA);
-                        _tile_dpbf16ps(tC10, tA1, tB0);
-                        _tile_loadd(tB1, pB, 64); pB += (16*32);
-                        _tile_dpbf16ps(tC01, tA0, tB1);
-                        _tile_dpbf16ps(tC11, tA1, tB1);
+                    if (k < K) {
+                        functional::transpose_epi32_16xN(dst, src0, matB.stride, K-k);
+                        dst += (16*32);
+                        functional::transpose_epi32_16xN(dst, src1, matB.stride, K-k);
+                        dst += (16*32);
                     }
-                    // post processing the accumulator tiles
-                    //  - add bias
-                    //  - do activations
-                    //  - convert into bfloat16
-                    //  - store into C matrix
-                    (ppkernel)(&matC(m, n), matC.stride, valid_m, valid_n);
+                }
+            } else {
+                assert(K == matB.dims[0]);
+                assert(N == matB.dims[1]);
+                // pack only then layout sequentially
+                for(int n = 0; n < N; n+=32) {
+                    auto * dst = &B(0, n);
+                    for(int k = 0; k < K; k+=32) {
+                        // B0 B1 32x(16+16) => repack as two 16x16x2
+                        int src_rows = std::min(K - k, 32);
+                        functional::kpack_tile_B0B1(dst, dst + (16*32), &matB(k, n), matB.stride, src_rows);
+                        dst += (16*32)*2;
+                    }
                 }
             }
+        } else {
+            for (int k = 0; k < B.Kblocks*32; k++)
+                for (int n = 0; n < B.Nblocks*32; n++) {
+                if (k < K && n < N)
+                    B(k, n) = transpose ? matB(n, k) : matB(k, n);
+                else
+                    B(k, n) = 0; // padding zero
+            }
         }
+    }
+};
+
+// post process kernels, tC00 ~ tC11
+struct PP2bf16 {
+    tensor2D<float> buffC;
+    PP2bf16() : buffC(16, 2*16) {}
+    void postProcess16x32(int8_t * pdst, int stride, int valid_m, int valid_n) {
+        float * psrc = &buffC(0,0);
+        if (valid_m >= 16 && valid_n >= 32) {
+            for(int i = 0; i < 16; i ++) {
+                auto b = _mm512_loadu_epi16(psrc);
+                auto a = _mm512_loadu_epi16(psrc + 16);
+                auto c = _mm512_cvtne2ps_pbh(a, b);
+                _mm512_storeu_epi16(pdst, c);   // 32 bf16
+                pdst += stride;
+                psrc += 32;
+            }
+        } else {
+            __mmask32 k = _cvtu32_mask32(0xFFFFFFFF >> (32-valid_n));
+            for(int i = 0; i < valid_m; i ++) {
+                auto b = _mm512_loadu_epi16(psrc);
+                auto a = _mm512_loadu_epi16(psrc + 16);
+                auto c = _mm512_cvtne2ps_pbh(a, b);
+                _mm512_mask_storeu_epi16(pdst, k, c);   // 32 bf16
+                pdst += stride;
+                psrc += 32;
+            }
+        }
+    }
+    void operator()(bfloat16 * pC, int stride, int valid_m, int valid_n) {
+        _tile_stored(tC00, &buffC(0,0), buffC.stride);
+        _tile_stored(tC01, &buffC(0,16), buffC.stride);
+        postProcess16x32(reinterpret_cast<int8_t*>(pC), stride, valid_m, valid_n);
+
+        if (valid_m > 16) {
+            _tile_stored(tC10, &buffC(0,0), buffC.stride);
+            _tile_stored(tC11, &buffC(0,16), buffC.stride);
+            postProcess16x32(reinterpret_cast<int8_t*>(pC) + 16*stride, stride, valid_m-16, valid_n);
+        }
+    }
+};
+
+// single core matmul
+// both A & B is variable
+struct Matmul {
+    tensor2D<bfloat16> scratch;
+    BlockIterator bloop;
+
+    Matmul() {}
+
+    void prepareB(KpackedB & B, tensor2D<bfloat16> & matB, bool transpose = false) {
+        functional::prepareB(B, matB, transpose);
+    }
+
+    KpackedB prepareB(tensor2D<bfloat16> & matB, bool transpose = false) {
+        KpackedB B;
+        functional::prepareB(B, matB, transpose);
+        return B;
+    }
+
+    // matB has been pre k-packed
+    template<typename PP>
+    void operator()(tensor2D<bfloat16> & matA,
+                    KpackedB & B,
+                    tensor2D<bfloat16> & matC,
+                    PP ppkernel) {
+        int M = matC.dims[0];
+        int N = matC.dims[1];
+        int K = matA.dims[1];
+
+        // determine blocking scheme
+        int elesz = sizeof(uint16_t);
+        int L2 = 2048*1024; // 2MB
+        int slice_size = 32*K*elesz;
+        int mc = L2/slice_size - 1;
+        assert(mc > 0);
+
+        auto dmax = std::numeric_limits<int>::max();
+        BlockIterator::blkloop bloops[] = {
+            {mc,32,0}, {dmax,0,32}, {dmax,mc*32,0}
+        };
+        bloop.reset(bloops, 3, M, N);
+
+        functional::matmul2x2(matA, B, matC, scratch, bloop, ppkernel);
     }
 };
 
@@ -329,9 +644,8 @@ struct GemAvB {
             vecB = newB;
         }
 
-        auto nstride = matA.stride/sizeof(bfloat16);
         for(int m = 0; m < M; m += 16) {
-            auto * pA = &matA(m, 0);
+            auto * pA = reinterpret_cast<uint8_t*>(&matA(m, 0));
             auto * pBi32 = reinterpret_cast<int32_t*>(vecB);
             __m512 regC0 = _mm512_setzero();
             __m512 regC1 = _mm512_setzero();
@@ -343,92 +657,27 @@ struct GemAvB {
                 //      ...
                 //   rf: (a30,a31),(b30,b31)....
                 // 
-                __m512i t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, ta, tb, tc, td, te, tf;
+                //__m512i t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, ta, tb, tc, td, te, tf;
                 __m512i r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, ra, rb, rc, rd, re, rf;
-                r0 = _mm512_loadu_epi32(pA + 0*nstride);
-                r1 = _mm512_loadu_epi32(pA + 1*nstride);
-                r2 = _mm512_loadu_epi32(pA + 2*nstride);
-                r3 = _mm512_loadu_epi32(pA + 3*nstride);
-                r4 = _mm512_loadu_epi32(pA + 4*nstride);
-                r5 = _mm512_loadu_epi32(pA + 5*nstride);
-                r6 = _mm512_loadu_epi32(pA + 6*nstride);
-                r7 = _mm512_loadu_epi32(pA + 7*nstride);
-                r8 = _mm512_loadu_epi32(pA + 8*nstride);
-                r9 = _mm512_loadu_epi32(pA + 9*nstride);
-                ra = _mm512_loadu_epi32(pA + 10*nstride);
-                rb = _mm512_loadu_epi32(pA + 11*nstride);
-                rc = _mm512_loadu_epi32(pA + 12*nstride);
-                rd = _mm512_loadu_epi32(pA + 13*nstride);
-                re = _mm512_loadu_epi32(pA + 14*nstride);
-                rf = _mm512_loadu_epi32(pA + 15*nstride);
-
-                t0 = _mm512_unpacklo_epi32(r0,r1); //   0  16   1  17   4  20   5  21   8  24   9  25  12  28  13  29 
-                t1 = _mm512_unpackhi_epi32(r0,r1); //   2  18   3  19   6  22   7  23  10  26  11  27  14  30  15  31
-                t2 = _mm512_unpacklo_epi32(r2,r3); //  32  48  33  49 ...
-                t3 = _mm512_unpackhi_epi32(r2,r3); //  34  50  35  51 ...
-                t4 = _mm512_unpacklo_epi32(r4,r5); //  64  80  65  81 ...  
-                t5 = _mm512_unpackhi_epi32(r4,r5); //  66  82  67  83 ...
-                t6 = _mm512_unpacklo_epi32(r6,r7); //  96 112  97 113 ...
-                t7 = _mm512_unpackhi_epi32(r6,r7); //  98 114  99 115 ...
-                t8 = _mm512_unpacklo_epi32(r8,r9); // 128 ...
-                t9 = _mm512_unpackhi_epi32(r8,r9); // 130 ...
-                ta = _mm512_unpacklo_epi32(ra,rb); // 160 ...
-                tb = _mm512_unpackhi_epi32(ra,rb); // 162 ...
-                tc = _mm512_unpacklo_epi32(rc,rd); // 196 ...
-                td = _mm512_unpackhi_epi32(rc,rd); // 198 ...
-                te = _mm512_unpacklo_epi32(re,rf); // 228 ...
-                tf = _mm512_unpackhi_epi32(re,rf); // 230 ...
-
-                r0 = _mm512_unpacklo_epi64(t0,t2); //   0  16  32  48 ...
-                r1 = _mm512_unpackhi_epi64(t0,t2); //   1  17  33  49 ...
-                r2 = _mm512_unpacklo_epi64(t1,t3); //   2  18  34  49 ...
-                r3 = _mm512_unpackhi_epi64(t1,t3); //   3  19  35  51 ...
-                r4 = _mm512_unpacklo_epi64(t4,t6); //  64  80  96 112 ...  
-                r5 = _mm512_unpackhi_epi64(t4,t6); //  65  81  97 114 ...
-                r6 = _mm512_unpacklo_epi64(t5,t7); //  66  82  98 113 ...
-                r7 = _mm512_unpackhi_epi64(t5,t7); //  67  83  99 115 ...
-                r8 = _mm512_unpacklo_epi64(t8,ta); // 128 144 160 176 ...  
-                r9 = _mm512_unpackhi_epi64(t8,ta); // 129 145 161 178 ...
-                ra = _mm512_unpacklo_epi64(t9,tb); // 130 146 162 177 ... 
-                rb = _mm512_unpackhi_epi64(t9,tb); // 131 147 163 179 ...
-                rc = _mm512_unpacklo_epi64(tc,te); // 192 208 228 240 ... 
-                rd = _mm512_unpackhi_epi64(tc,te); // 193 209 229 241 ...
-                re = _mm512_unpacklo_epi64(td,tf); // 194 210 230 242 ...
-                rf = _mm512_unpackhi_epi64(td,tf); // 195 211 231 243 ...
-
-                t0 = _mm512_shuffle_i32x4(r0, r4, 0x88); //   0  16  32  48   8  24  40  56  64  80  96  112 ...
-                t1 = _mm512_shuffle_i32x4(r1, r5, 0x88); //   1  17  33  49 ...
-                t2 = _mm512_shuffle_i32x4(r2, r6, 0x88); //   2  18  34  50 ...
-                t3 = _mm512_shuffle_i32x4(r3, r7, 0x88); //   3  19  35  51 ...
-                t4 = _mm512_shuffle_i32x4(r0, r4, 0xdd); //   4  20  36  52 ...
-                t5 = _mm512_shuffle_i32x4(r1, r5, 0xdd); //   5  21  37  53 ...
-                t6 = _mm512_shuffle_i32x4(r2, r6, 0xdd); //   6  22  38  54 ...
-                t7 = _mm512_shuffle_i32x4(r3, r7, 0xdd); //   7  23  39  55 ...
-                t8 = _mm512_shuffle_i32x4(r8, rc, 0x88); // 128 144 160 176 ...
-                t9 = _mm512_shuffle_i32x4(r9, rd, 0x88); // 129 145 161 177 ...
-                ta = _mm512_shuffle_i32x4(ra, re, 0x88); // 130 146 162 178 ...
-                tb = _mm512_shuffle_i32x4(rb, rf, 0x88); // 131 147 163 179 ...
-                tc = _mm512_shuffle_i32x4(r8, rc, 0xdd); // 132 148 164 180 ...
-                td = _mm512_shuffle_i32x4(r9, rd, 0xdd); // 133 149 165 181 ...
-                te = _mm512_shuffle_i32x4(ra, re, 0xdd); // 134 150 166 182 ...
-                tf = _mm512_shuffle_i32x4(rb, rf, 0xdd); // 135 151 167 183 ...
-
-                r0 = _mm512_shuffle_i32x4(t0, t8, 0x88); //   0  16  32  48  64  80  96 112 ... 240
-                r1 = _mm512_shuffle_i32x4(t1, t9, 0x88); //   1  17  33  49  66  81  97 113 ... 241
-                r2 = _mm512_shuffle_i32x4(t2, ta, 0x88); //   2  18  34  50  67  82  98 114 ... 242
-                r3 = _mm512_shuffle_i32x4(t3, tb, 0x88); //   3  19  35  51  68  83  99 115 ... 243
-                r4 = _mm512_shuffle_i32x4(t4, tc, 0x88); //   4 ...
-                r5 = _mm512_shuffle_i32x4(t5, td, 0x88); //   5 ...
-                r6 = _mm512_shuffle_i32x4(t6, te, 0x88); //   6 ...
-                r7 = _mm512_shuffle_i32x4(t7, tf, 0x88); //   7 ...
-                r8 = _mm512_shuffle_i32x4(t0, t8, 0xdd); //   8 ...
-                r9 = _mm512_shuffle_i32x4(t1, t9, 0xdd); //   9 ...
-                ra = _mm512_shuffle_i32x4(t2, ta, 0xdd); //  10 ...
-                rb = _mm512_shuffle_i32x4(t3, tb, 0xdd); //  11 ...
-                rc = _mm512_shuffle_i32x4(t4, tc, 0xdd); //  12 ...
-                rd = _mm512_shuffle_i32x4(t5, td, 0xdd); //  13 ...
-                re = _mm512_shuffle_i32x4(t6, te, 0xdd); //  14 ...
-                rf = _mm512_shuffle_i32x4(t7, tf, 0xdd); //  15  31  47  63  79  96 111 127 ... 255
+                auto stride = matA.stride;
+                r0 = _mm512_loadu_epi32(pA);
+                r1 = _mm512_loadu_epi32(pA + stride);
+                r2 = _mm512_loadu_epi32(pA + 2*stride);
+                r3 = _mm512_loadu_epi32(pA + 3*stride);
+                r4 = _mm512_loadu_epi32(pA + 4*stride);
+                r5 = _mm512_loadu_epi32(pA + 5*stride);
+                r6 = _mm512_loadu_epi32(pA + 6*stride);
+                r7 = _mm512_loadu_epi32(pA + 7*stride);
+                r8 = _mm512_loadu_epi32(pA + 8*stride);
+                r9 = _mm512_loadu_epi32(pA + 9*stride);
+                ra = _mm512_loadu_epi32(pA + 10*stride);
+                rb = _mm512_loadu_epi32(pA + 11*stride);
+                rc = _mm512_loadu_epi32(pA + 12*stride);
+                rd = _mm512_loadu_epi32(pA + 13*stride);
+                re = _mm512_loadu_epi32(pA + 14*stride);
+                rf = _mm512_loadu_epi32(pA + 15*stride);
+                
+                functional::transpose_m512i_16x16(r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, ra, rb, rc, rd, re, rf);
 
                 // vdpbf16ps
                 regC0 = _mm512_dpbf16_ps(regC0, r0, _mm512_set1_epi32(pBi32[0]));
@@ -458,38 +707,6 @@ struct GemAvB {
 
 
 #if 0
-// cache blocking 
-struct Blocking {
-    // reg_m x reg_n can be 1x4 or 2x2(it can be reduced to 1x2/2x1/1x1 at tails)
-    int reg_m;  // register blocking scheme, how many tiles in M dimension
-    int reg_n;  // register blocking scheme, how many tiles in N dimension
-
-    struct block_loop {
-        int axis;    // 0 means vertially along M dimension, 1 means horizontally along N dimension
-        int step;   // in unit of basic output element (number of float or bfloat16)
-    };
-    std::vector<block_loop> bloops;
-    // blocking is described in bottom-up order (inner blocking first)
-    // upper level bsizes must be interger multiple of lower level. for example
-    //   L0 [32x32] : 2x2 tile-register blocking
-    //   L1 [0,320] : do 10 L0-blocks vertically
-    //   L2 [1,max] : do ? L1-blocks horizontally until all actual columns is done
-    //   L3 [0,max] : do ? L2-blocks vertially until all actual rows are done
-    //
-    // there is no actuall M,N numbers in blocking scheme, so block-scheme is
-    // shape-agnostic and it can be hard coded once, executor can apply it to
-    // all input shapes.
-    //
-    // when target C matrix has MxN smaller than L1 blocks, it's handled by executor
-    // like this: when executor doing 10 L0-blocks vertially, it stops early when
-    // it met M, and it uses tails logic to do last L0-block (by copy Atail)
-    //
-
-    // all L0 blocks can be sequentially indexed
-    int total_blocks (int M, int N) {
-        //
-    }
-};
 
 // Matmul support B [KxN] matrix in few forms:
 //    1. already transposed in KxN, only re-pack is needed

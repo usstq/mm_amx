@@ -185,9 +185,9 @@ void amx_FC_acc(int M, int K, int N) {
     tensor2D<bfloat16> B(K, N);
     tensor2D<bfloat16> C(M, N);
     tensor2D<bfloat16> C0(M, N);
-    executor_amx_bf16::FC fc;
-    executor_amx_bf16::FC::KpackedB Bkpacked(B);
-    executor_amx_bf16::FC::PP2bf16 pp;
+    executor_amx_bf16::Matmul fc;
+    executor_amx_bf16::PP2bf16 pp;
+    auto Bkpacked = fc.prepareB(B);
 
     tileconfig_t tfg(1, 0, 8, 16, 64);
     fc(A, Bkpacked, C, pp);
@@ -210,19 +210,52 @@ void amx_FC_perf(int M, int K, int N, int times = -1000) {
     tensor2D<bfloat16> B(K, N);
     tensor2D<bfloat16> C(M, N);
     tensor2D<bfloat16> C0(M, N);
-    executor_amx_bf16::FC fc;
-    executor_amx_bf16::FC::KpackedB Bkpacked(B);
-    executor_amx_bf16::FC::PP2bf16 pp;
+    executor_amx_bf16::Matmul mm;
+    executor_amx_bf16::PP2bf16 pp;
+    auto preparedB = mm.prepareB(B);
 
     tileconfig_t tfg(1, 0, 8, 16, 64);
     std::cout << __func__ << " [" << M << "," << K << "," << N << "] ";
     timer(times, [&](){
-        fc(A, Bkpacked, C, pp);
+        mm(A, preparedB, C, pp);
     },
     double(M * N) * K * 2,
     AMXBf16PeakGops2PerCore * 1e9);
 }
 
+void amx_Matmul_perf(int M, int K, int N, bool transB, int times = -1000) {
+    tensor2D<bfloat16> A(M, K);
+    tensor2D<bfloat16> B(K, N);
+    tensor2D<bfloat16> BT = B.Tr();
+    tensor2D<bfloat16> C(M, N);
+    tensor2D<bfloat16> C0(M, N);
+    executor_amx_bf16::Matmul mm;
+    executor_amx_bf16::PP2bf16 pp;
+
+
+    tileconfig_t tfg(1, 0, 8, 16, 64);
+    std::cout << __func__ << " [" << M << "," << K << "," << N << "] ";
+
+    C0=0;
+    matmul(A, B, C0);
+    auto preparedB = mm.prepareB(transB ? BT : B, transB);
+    mm(A, preparedB, C, pp);
+    if (C0 == C) {
+        std::cout << ANSIcolor("1;32") << "Match!\n" << ANSIcolor();
+        //std::cout << C << std::endl;
+    } else {
+        std::cout << ANSIcolor("1;31") << "Mismatch!\n" << ANSIcolor();
+        std::cout << C0 << std::endl;
+        std::cout << C << std::endl;
+    }
+
+    timer(times, [&](){
+        mm.prepareB(preparedB, transB ? BT : B, transB);
+        mm(A, preparedB, C, pp);
+    },
+    double(M * N) * K * 2,
+    AMXBf16PeakGops2PerCore * 1e9);
+}
 
 void amx_unit_test_gemAvB(int M, int K, int times = -1000) {
     int N = 1;
@@ -257,26 +290,26 @@ void amx_unit_test_gemAvB(int M, int K, int times = -1000) {
     256 * 3e9);
 }
 
-
-
-
 void test_blk_loops() {
     int max = 9999;
-    executor_amx_bf16::BlockIterator loc({{10,32,0},{max,0,32},{max,320,0}});
-    //loc.reset(896,10240);
+    executor_amx_bf16::BlockIterator loc;
+    executor_amx_bf16::BlockIterator::blkloop bloops[] = {
+        {10,32,0},{max,0,32},{max,320,0}
+    };
+    //loc.reset(bloops, 896,10240);
     //do {
     //    std::cout << "[" << loc.seq << "]   " << loc.m << "," << loc.n
     //              << "  idx =  " << loc.idx[0] << "," << loc.idx[1] << "," << loc.idx[2] << std::endl;
     //}while(loc.next());
 
-    loc.reset(896, 10240);
+    loc.reset(bloops, 3, 896, 10240);
     do {
     }while(loc.next());
     std::cout << loc.seq << std::endl;
     
     std::cout << __func__;
     timer(-1000, [&](){
-        loc.reset(10240, 10240);
+        loc.reset(bloops, 3, 10240, 10240);
         do {
         }while(loc.next());
     });
@@ -286,6 +319,11 @@ int main(int argc, const char *argv[]) {
     timer.set_app(argv[0]);
 
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
+
+    amx_Matmul_perf(928, 96, 928, true);
+    amx_Matmul_perf(901, 80, 901, true);
+    amx_Matmul_perf(901, 901, 80, false); 
+
     test_blk_loops();
 
     amx_unit_test_gemAvB(901, 80);
