@@ -649,15 +649,14 @@ struct GemAvB {
             auto * pBi32 = reinterpret_cast<int32_t*>(vecB);
             __m512 regC0 = _mm512_setzero();
             __m512 regC1 = _mm512_setzero();
-            for(int k = 0; k < K; k += 32, pA += 32, pBi32 += 16) {
+            for(int k = 0; k < K; k += 32, pA += 64, pBi32 += 16) {
                 // handle Ab: 16x32
                 // transposed in register as 16x16x2
                 //   r0: (a0,a1)(b0,b1)....
                 //   r1: (a2,a3)(b2,b3)....
                 //      ...
                 //   rf: (a30,a31),(b30,b31)....
-                // 
-                //__m512i t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, ta, tb, tc, td, te, tf;
+                //
                 __m512i r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, ra, rb, rc, rd, re, rf;
                 auto stride = matA.stride;
                 r0 = _mm512_loadu_epi32(pA);
