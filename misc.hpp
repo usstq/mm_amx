@@ -1,3 +1,5 @@
+#pragma once
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -8,6 +10,7 @@
 #include <fstream>
 #include <cassert>
 #include <thread>
+#include <map>
 #include <limits>
 
 //#include "thread_pool.hpp"
@@ -87,18 +90,31 @@ void vshow(__m512 v) {
     show(values, 1, 16);
 }
 
+struct ANSIcolor {
+    const char * code;
+    ANSIcolor(const char * code = "0") : code(code){
+    }
+    friend std::ostream& operator<<(std::ostream& out, const ANSIcolor& obj) {
+        out << "\033[" << obj.code << "m";
+        return out;
+    }
+};
+
 template<typename T>
 struct tensor2D {
     int dims[2];
     std::shared_ptr<T> data;
+    int capacity;
     int stride;
     int padded_dim1;
     tensor2D() {
         dims[0] = 0;
         dims[1] = 0;
+        capacity = 0;
     }
 
     tensor2D(int d0, int d1) {
+        capacity = 0;
         resize(d0, d1);
         fill_rnd();
     }
@@ -119,17 +135,22 @@ struct tensor2D {
         stride = d1 * sizeof(T);
         if (stride % 64) {
             auto stride_fix = rndup(stride, 64);
-            std::cout << "\tWarnning: stride " << stride << " is not aligned to cache line, will increase to " << stride_fix
-                      << " (" << stride_fix/64 << " cache lines)\n";
+            std::cout << ANSIcolor("0;34") << "\tWarnning: stride " << stride << " is not aligned to cache line, will increase to " << stride_fix
+                      << " (" << stride_fix/64 << " cache lines)\n" << ANSIcolor();
             stride = stride_fix;
         }
         padded_dim1 = stride / sizeof(T);
 
-        // align begin address to cache line is vital, so tile load can
-        // use all bandwidth (L1D/L2 only deliver data in unit of 64-byte aligned cache-line)
-        data = std::shared_ptr<T>(
-                    reinterpret_cast<T*>(aligned_alloc(64, dims[0] * stride)),
-                    [](void * p) { free(p); });
+        // resize method never shrink capacity
+        auto need_capacity = dims[0] * stride;
+        if (capacity < need_capacity) {
+            capacity = need_capacity;
+            // align begin address to cache line is vital, so tile load can
+            // use all bandwidth (L1D/L2 only deliver data in unit of 64-byte aligned cache-line)
+            data = std::shared_ptr<T>(
+                        reinterpret_cast<T*>(aligned_alloc(64, capacity)),
+                        [](void * p) { free(p); });
+        }
     }
 
     T & operator[](int i) {
@@ -312,45 +333,64 @@ uint64_t second2tsc(double sec) {
     return sec * get_tsc_ticks_per_second();
 }
 
-template<typename Callable>
-double timeit(int expect_times_milliseconds, const Callable & c, double opsPerCall = 0, double peakOpsPerSecond = 0) {
-    // warmup
-    int times;
+// timeit will record best latency for each problem in a csv log file
+// and it will also show hint about whether it's improved or descreased
+// over changes
+struct timeit {
+    const char * app_version;
+    timeit() {
+    }
 
-    // cache warm-up
-    c();
-    c();
+    void set_app(const char * _app_version) {
+        app_version = _app_version;
+    }
+    std::map<std::string, double> records;
 
-    // determine times
-    if (expect_times_milliseconds > 0) {
-        times = expect_times_milliseconds;
-    } else {
-        double expect_duration = -expect_times_milliseconds * 0.001;
-        // estimate how many times required to reach the duration
-        auto start = __rdtsc();
+    template<typename Callable>
+    double operator()(
+                      int expect_times_milliseconds,
+                      const Callable & c,
+                      double opsPerCall = 0,
+                      double peakOpsPerSecond = 0,
+                      const char * prob = nullptr) {
+        int times;
+
+        // cache warm-up
         c();
-        auto oneshot = __rdtsc() - start;
-        times = second2tsc(expect_duration)/oneshot;
-    }
-
-    // profiling
-    auto start = std::chrono::high_resolution_clock::now();
-    for(int i = 0; i < times; i++) {
         c();
-    }
-    auto finish = std::chrono::high_resolution_clock::now();
 
-    std::chrono::duration<double> total_latency = finish-start;
-    auto avg_latency = total_latency.count()/times;
-    std::cout << "Average latency : " << avg_latency*1e6 << " us x " << times;
-    if (opsPerCall > 0 && peakOpsPerSecond > 0) {
-        std::cout << "  HW Usage : " << static_cast<int>(100*(opsPerCall/avg_latency)/(peakOpsPerSecond)) << "% ("
-                  << opsPerCall/avg_latency/(1e9) << " Gops /"
-                  << peakOpsPerSecond/1e9 << " Gops)";
+        // determine times
+        if (expect_times_milliseconds > 0) {
+            times = expect_times_milliseconds;
+        } else {
+            double expect_duration = -expect_times_milliseconds * 0.001;
+            // estimate how many times required to reach the duration
+            auto start = __rdtsc();
+            c();
+            auto oneshot = __rdtsc() - start;
+            times = second2tsc(expect_duration)/oneshot;
+        }
+
+        // profiling
+        auto start = std::chrono::high_resolution_clock::now();
+        for(int i = 0; i < times; i++) {
+            c();
+        }
+        auto finish = std::chrono::high_resolution_clock::now();
+
+        std::chrono::duration<double> total_latency = finish-start;
+        auto avg_latency = total_latency.count()/times;
+        std::cout << ANSIcolor("0;33") << "Average latency : " << avg_latency*1e6 << " us x " << times;
+        if (opsPerCall > 0 && peakOpsPerSecond > 0) {
+            std::cout << "  HW Usage : " << static_cast<int>(100*(opsPerCall/avg_latency)/(peakOpsPerSecond)) << "% ("
+                    << opsPerCall/avg_latency/(1e9) << " Gops /"
+                    << peakOpsPerSecond/1e9 << " Gops)";
+        }
+        std::cout << ANSIcolor() << std::endl;
+        return avg_latency;
     }
-    std::cout << std::endl;
-    return avg_latency;
-}
+};
+
 /*
 https://www.intel.com/content/www/us/en/develop/documentation/cpp-compiler-developer-guide-and-reference/top/compiler-reference/intrinsics/intrinsics-for-amx-instructions/intrinsics-for-amx-tile-instructions/tile-loadconfig.html
 
@@ -403,9 +443,9 @@ struct tileconfig_t {
         _tile_release();
     }
     void load() {
-        std::cout << "\ttile load config ... " << std::flush;
+        //std::cout << "\ttile load config ... " << std::flush;
         _tile_loadconfig(this);
-        std::cout << *this << std::flush << std::endl;
+        //std::cout << *this << std::flush << std::endl;
     }
     void store() {
         _tile_storeconfig(this);
