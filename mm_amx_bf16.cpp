@@ -185,12 +185,11 @@ void amx_FC_acc(int M, int K, int N) {
     tensor2D<bfloat16> B(K, N);
     tensor2D<bfloat16> C(M, N);
     tensor2D<bfloat16> C0(M, N);
-    executor_amx_bf16::Matmul fc;
+    executor_amx_bf16::Matmul fc(true);
     executor_amx_bf16::PP2bf16 pp;
-    auto Bkpacked = fc.prepareB(B);
 
     tileconfig_t tfg(1, 0, 8, 16, 64);
-    fc(A, Bkpacked, C, pp);
+    fc(A, B, C, pp);
 
     C0=0;
     matmul(A, B, C0);
@@ -210,14 +209,13 @@ void amx_FC_perf(int M, int K, int N, int times = -1000) {
     tensor2D<bfloat16> B(K, N);
     tensor2D<bfloat16> C(M, N);
     tensor2D<bfloat16> C0(M, N);
-    executor_amx_bf16::Matmul mm;
+    executor_amx_bf16::Matmul mm(true);
     executor_amx_bf16::PP2bf16 pp;
-    auto preparedB = mm.prepareB(B);
 
     tileconfig_t tfg(1, 0, 8, 16, 64);
     std::cout << __func__ << " [" << M << "," << K << "," << N << "] ";
     timer(times, [&](){
-        mm(A, preparedB, C, pp);
+        mm(A, B, C, pp);
     },
     double(M * N) * K * 2,
     AMXBf16PeakGops2PerCore * 1e9);
@@ -229,7 +227,7 @@ void amx_Matmul_perf(int M, int K, int N, bool transB, int times = -1000) {
     tensor2D<bfloat16> BT = B.Tr();
     tensor2D<bfloat16> C(M, N);
     tensor2D<bfloat16> C0(M, N);
-    executor_amx_bf16::Matmul mm;
+    executor_amx_bf16::Matmul mm(false, transB);
     executor_amx_bf16::PP2bf16 pp;
 
 
@@ -238,8 +236,7 @@ void amx_Matmul_perf(int M, int K, int N, bool transB, int times = -1000) {
 
     C0=0;
     matmul(A, B, C0);
-    auto preparedB = mm.prepareB(transB ? BT : B, transB);
-    mm(A, preparedB, C, pp);
+    mm(A, transB?BT:B, C, pp);
     if (C0 == C) {
         std::cout << ANSIcolor("1;32") << "Match!\n" << ANSIcolor();
         //std::cout << C << std::endl;
@@ -250,8 +247,7 @@ void amx_Matmul_perf(int M, int K, int N, bool transB, int times = -1000) {
     }
 
     timer(times, [&](){
-        mm.prepareB(preparedB, transB ? BT : B, transB);
-        mm(A, preparedB, C, pp);
+        mm(A, transB?BT:B, C, pp);
     },
     double(M * N) * K * 2,
     AMXBf16PeakGops2PerCore * 1e9);
@@ -319,6 +315,11 @@ int main(int argc, const char *argv[]) {
     timer.set_app(argv[0]);
 
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
+    amx_FC_perf(32*28, 32*80, 10240);
+    amx_FC_perf(32*28 + 1, 32*80, 10240);
+    amx_FC_perf(32*28 + 16, 32*80, 10240);
+    amx_FC_perf(32*28 + 17, 32*80, 10240);
+    amx_FC_perf(32*28 + 31, 32*80, 10240);
 
     amx_Matmul_perf(928, 96, 928, true);
     amx_Matmul_perf(901, 80, 901, true);

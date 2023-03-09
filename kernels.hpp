@@ -279,7 +279,7 @@ namespace functional {
         _mm512_storeu_epi32(dst + 15*16, rf);
     }
 
-    // 16xN, N<=16
+    // 16xN, N<=16, non-valid part is filled with zeros
     void transpose_epi32_16xN(void * _dst, const void * src, int stride, int valid_n) {
         auto * dst = reinterpret_cast<uint32_t*>(_dst);
         __m512i r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, ra, rb, rc, rd, re, rf;
@@ -396,7 +396,8 @@ namespace functional {
             }
         }
     }
-    // 1x4 2x2
+
+    // 2x2, dynamically degenerated to 1x2 for tails
     template<typename PP>
     void matmul2x2(tensor2D<bfloat16> & matA,
                     KpackedB & matB,
@@ -441,19 +442,32 @@ namespace functional {
                 pA1 = &Atails(16, 0);
                 strideA = Atails.stride;
             }
+
             _tile_zero(tC00);
             _tile_zero(tC01);
             _tile_zero(tC10);
             _tile_zero(tC11);
-            for (int k = 0; k < K; k += 32) {
-                _tile_loadd(tA0, pA0 + k, strideA);
-                _tile_loadd(tB0, pB, 64); pB += (16*32);
-                _tile_dpbf16ps(tC00, tA0, tB0);
-                _tile_loadd(tA1, pA1 + k, strideA);
-                _tile_dpbf16ps(tC10, tA1, tB0);
-                _tile_loadd(tB1, pB, 64); pB += (16*32);
-                _tile_dpbf16ps(tC01, tA0, tB1);
-                _tile_dpbf16ps(tC11, tA1, tB1);
+            if (valid_m <= 16) {
+                // 1x2 is enough
+                for (int k = 0; k < K; k += 32) {
+                    _tile_loadd(tA0, pA0 + k, strideA);
+                    _tile_loadd(tB0, pB, 64); pB += (16*32);
+                    _tile_dpbf16ps(tC00, tA0, tB0);
+                    _tile_loadd(tB1, pB, 64); pB += (16*32);
+                    _tile_dpbf16ps(tC01, tA0, tB1);
+                }
+            } else {
+                // 2x2
+                for (int k = 0; k < K; k += 32) {
+                    _tile_loadd(tA0, pA0 + k, strideA);
+                    _tile_loadd(tB0, pB, 64); pB += (16*32);
+                    _tile_dpbf16ps(tC00, tA0, tB0);
+                    _tile_loadd(tA1, pA1 + k, strideA);
+                    _tile_dpbf16ps(tC10, tA1, tB0);
+                    _tile_loadd(tB1, pB, 64); pB += (16*32);
+                    _tile_dpbf16ps(tC01, tA0, tB1);
+                    _tile_dpbf16ps(tC11, tA1, tB1);
+                }
             }
             // post processing the accumulator tiles
             //  - add bias
@@ -463,7 +477,7 @@ namespace functional {
             (ppkernel)(&matC(m, n), matC.stride, valid_m, valid_n);
         } while(blk_it.next());
     }
-    
+
     // prepare B matrix for C matrix 2x2 blocking (B matrix
     // will be accessed in 1x2)
     // given 2x2 blocking scheme, Kx32 blocks are always
@@ -567,28 +581,26 @@ struct PP2bf16 {
     }
 };
 
-// single core matmul
-// both A & B is variable
+// matmul (FC)
+//
+// constB constrols if it's FC or not 
+//
+// multi-thread caller can split the whole C matrix
+// into grid (better in unit with size of multiple of 32x32)
+// each grid is a considered as a independent matmul on
+// submatrix of A,B and C.
 struct Matmul {
+    KpackedB internalB;
     tensor2D<bfloat16> scratch;
     BlockIterator bloop;
+    bool constB;
+    bool transposeB;
 
-    Matmul() {}
+    Matmul(bool constB = false, bool transposeB = false) : constB(constB), transposeB(transposeB) {}
 
-    void prepareB(KpackedB & B, tensor2D<bfloat16> & matB, bool transpose = false) {
-        functional::prepareB(B, matB, transpose);
-    }
-
-    KpackedB prepareB(tensor2D<bfloat16> & matB, bool transpose = false) {
-        KpackedB B;
-        functional::prepareB(B, matB, transpose);
-        return B;
-    }
-
-    // matB has been pre k-packed
     template<typename PP>
     void operator()(tensor2D<bfloat16> & matA,
-                    KpackedB & B,
+                    tensor2D<bfloat16> & matB,
                     tensor2D<bfloat16> & matC,
                     PP ppkernel) {
         int M = matC.dims[0];
@@ -608,11 +620,140 @@ struct Matmul {
         };
         bloop.reset(bloops, 3, M, N);
 
-        functional::matmul2x2(matA, B, matC, scratch, bloop, ppkernel);
+        // for non-constB, internalB is updated every time
+        // for constB, internalB is updated once
+        if (!constB || (internalB.capacity == 0)) {
+            functional::prepareB(internalB, matB, transposeB);
+        }
+
+        functional::matmul2x2(matA, internalB, matC, scratch, bloop, ppkernel);
     }
 };
 
 
+#if 0
+// using only 1 tile in C matrix:
+//
+//      B0
+//      B1
+//      ...
+//      B5
+//   A0 C0
+//
+// when K < (32*6)=192, Kx16 B sub-matrix can repack dynamically once and
+// all hold in titles, then we can go vertially until A-sub matrix is fit
+// in L2 cache, then we go next
+// 
+template<typename PP, int K>
+void matmul1x1(tensor2D<bfloat16> & matA,
+                tensor2D<bfloat16> & matB,
+                tensor2D<bfloat16> & matC,
+                tensor2D<bfloat16> & scratch,
+                bool transB,
+                PP ppkernel) {
+    constexpr int tB0 = 0;
+    constexpr int tB1 = 1;
+    constexpr int tB2 = 2;
+    constexpr int tB3 = 3;
+    constexpr int tB4 = 4;
+    constexpr int tB5 = 5;
+    constexpr int tC = 6;
+    constexpr int tA = 7;
+    tensor2D<bfloat16> & Atails = scratch;
+    int M = matC.dims[0];
+    int N = matC.dims[1];
+    int _K = matA.dims[1];
+    assert(_K == matB.K);
+    assert(N == matB.N);
+    assert(_K == K);
+    assert (K < 32*6);
+
+    // determine blocking scheme
+    int elesz = sizeof(uint16_t);
+    int L2 = 2048*1024; // 2MB
+    int slice_size = 16*K*elesz;
+    int mc = L2/slice_size - 1;
+    assert(mc > 0);
+
+    auto dmax = std::numeric_limits<int>::max();
+    BlockIterator::blkloop bloops[] = {
+        {1,mc*16,0}, {dmax,0,16}, {dmax,mc*16,0}
+    };
+    bloop.reset(bloops, 3, M, N);
+
+    int mtails = M % 16;
+    if (mtails > 0) {
+        Atails.resize(16, rndup(K, 32));
+        // copy tails into Atails (in unit of 32x32)
+        for (int m = 0; m < mtails; m++) {
+            memcpy(&Atails(m, 0), &matA(M - mtails + m, 0), matA.stride);
+            if (Atails.stride > matA.stride) {
+                memset(reinterpret_cast<int8_t*>(&Atails(m, 0)) + matA.stride,
+                        0,
+                        Atails.stride - matA.stride);
+            }
+        }
+    }
+
+    do
+    {
+        // k loop is unrolled, so we handle mc*16 blocks
+        int m = blk_it.m;
+        int n = blk_it.n;
+
+        // load all B tiles
+        for (int k = 0; k < K; k += 32) {
+
+        }
+        int valid_m = std::min(M - m, 16);
+        int valid_n = std::min(N - n, 16);
+
+
+        auto * pA0 = &matA(m, 0);
+        auto strideA = matA.stride;
+        auto * pB = &matB(0, n);
+        if (valid_m < 16) {
+            // use Atails buffer to prevent memory read segmentfault
+            pA0 = &Atails(0, 0);
+            strideA = Atails.stride;
+        }
+        // load all B tiles
+
+        // k loop is unrolled, 
+        _tile_zero(tC);
+        _tile_loadd(tA, pA0 + 0, strideA);
+        _tile_dpbf16ps(tC, tA, tB0);
+
+        if (K > 32) {
+            _tile_loadd(tA, pA0 + 32, strideA);
+            _tile_dpbf16ps(tC, tA, tB1);
+        }
+        if (K > 32*2) {
+            _tile_loadd(tA, pA0 + 32*2, strideA);
+            _tile_dpbf16ps(tC, tA, tB2);
+        }
+        if (K > 32*3) {
+            _tile_loadd(tA, pA0 + 32*3, strideA);
+            _tile_dpbf16ps(tC, tA, tB3);
+        }
+        if (K > 32*4) {
+            _tile_loadd(tA, pA0 + 32*4, strideA);
+            _tile_dpbf16ps(tC, tA, tB4);
+        }
+        if (K > 32*5) {
+            _tile_loadd(tA, pA0 + 32*5, strideA);
+            _tile_dpbf16ps(tC, tA, tB5);
+        }
+
+        // post processing the accumulator tiles
+        //  - add bias
+        //  - do activations
+        //  - convert into bfloat16
+        //  - store into C matrix
+        (ppkernel)(&matC(m, n), matC.stride, valid_m, valid_n);
+    } while(blk_it.next());
+}
+#endif
 //https://stackoverflow.com/questions/29519222/how-to-transpose-a-16x16-matrix-using-simd-instructions
 // vector multiply with matrix:
 //  mAvB:  A(M, K) * B(K, 1) => C(M, 1)
