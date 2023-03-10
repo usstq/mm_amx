@@ -589,20 +589,20 @@ struct PP2bf16 {
 // into grid (better in unit with size of multiple of 32x32)
 // each grid is a considered as a independent matmul on
 // submatrix of A,B and C.
+template<typename PP>
 struct Matmul {
     KpackedB internalB;
     tensor2D<bfloat16> scratch;
     BlockIterator bloop;
     bool constB;
     bool transposeB;
+    PP ppkernel;
 
     Matmul(bool constB = false, bool transposeB = false) : constB(constB), transposeB(transposeB) {}
 
-    template<typename PP>
     void operator()(tensor2D<bfloat16> & matA,
                     tensor2D<bfloat16> & matB,
-                    tensor2D<bfloat16> & matC,
-                    PP ppkernel) {
+                    tensor2D<bfloat16> & matC) {
         int M = matC.dims[0];
         int N = matC.dims[1];
         int K = matA.dims[1];

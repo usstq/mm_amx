@@ -119,6 +119,15 @@ struct tensor2D {
         fill_rnd();
     }
 
+    tensor2D(int d0, int d1, T * ext, int _stride) {
+        capacity = 1;
+        data = std::shared_ptr<T>(ext, [](void *) {});
+        dims[0] = d0;
+        dims[1] = d1;
+        stride = _stride;
+        padded_dim1 = stride / sizeof(T);
+    }
+
     tensor2D<T> Tr() {
         tensor2D<T> ret(dims[1], dims[0]);
         for(int c0=0; c0 < dims[0]; ++c0) {
