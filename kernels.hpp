@@ -536,16 +536,15 @@ void jit_uni_eltwise_injector_f32<isa,
 };
 
 // 2x2 tiles post process kernels
-struct Tiles2x2PostProcess {
-    Tiles2x2PostProcess() {}
+namespace PostProcess {
 
-    // output converted into bf16
-    tensor2D<bfloat16> * pmatC;
-    void setDstBF16(tensor2D<bfloat16> & matC) {
-        pmatC = &matC;
-    }
-
-    void postProcess32x32(float * psrc, int8_t * pdst, int stride, int valid_m, int valid_n) {
+    // 4 tiles located at C matrix (m,n) of size (valid_m, valid_n)
+    //   tC00/tC01
+    //   tC10/tC11
+    void func_save2bf16(tensor2D<bfloat16> & matBF16, tensor2D<float> & buffC, int m, int n, int valid_m, int valid_n) {
+        auto * psrc = &buffC(0,0);
+        int8_t * pdst = reinterpret_cast<int8_t*>(&(matBF16(m, n)));
+        int stride = matBF16.stride;
         __mmask32 k = _cvtu32_mask32(0xFFFFFFFF >> (32-valid_n));
         while(valid_m >= 16) {
             for(int i = 0; i < 16; i ++) {
@@ -568,13 +567,14 @@ struct Tiles2x2PostProcess {
         }
     }
 
-    // 4 tiles located at C matrix (m,n) of size (valid_m, valid_n)
-    //   tC00/tC01
-    //   tC10/tC11
-    virtual void operator()(tensor2D<float> & buffC, int m, int n, int valid_m, int valid_n) {
-        auto * pC = reinterpret_cast<int8_t*>(&((*pmatC)(m, n)));
-        postProcess32x32(&buffC(0,0), pC, pmatC->stride, valid_m, valid_n);
-    }
+    // a helper callable for most frequenctly used pp kernels
+    struct save2bf16 {
+        tensor2D<bfloat16> & C;
+        save2bf16(tensor2D<bfloat16> & C) : C(C) {}
+        void operator()(tensor2D<float> & buffC, int m, int n, int valid_m, int valid_n) {
+            func_save2bf16(C, buffC, m, n, valid_m, valid_n);
+        }
+    };
 };
 
 // matmul (FC)
@@ -585,25 +585,27 @@ struct Tiles2x2PostProcess {
 // into grid (better in unit with size of multiple of 32x32)
 // each grid is a considered as a independent matmul on
 // submatrix of A,B and C.
-template<typename PP>
+
 struct Matmul {
     KpackedB internalB;
     tensor2D<bfloat16> scratch;
     BlockIterator blk_it;
     bool constB;
     bool transposeB;
-    PP ppkernel;
     // 2x2 C tiles buffer
     tensor2D<float> buffC;
 
     Matmul(bool constB = false, bool transposeB = false) : 
         constB(constB), transposeB(transposeB), buffC(32, 32) {}
 
+    
     // different ppkernel has difference runtime args
     // which is set by caller, since only caller knows
     // what setter methods to use for specific ppkernel
+    template<typename PP>
     void operator()(tensor2D<bfloat16> & matA,
-                    tensor2D<bfloat16> & matB) {
+                    tensor2D<bfloat16> & matB,
+                    PP ppkernel) {
         int M = matA.dims[0];
         int K = matA.dims[1];
         int N = matB.dims[transposeB ? 0 : 1];
