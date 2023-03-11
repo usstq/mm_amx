@@ -163,7 +163,7 @@ constexpr int tB1 = 7;
 
 namespace functional {
 
-    void transpose_m512i_16x16(__m512i &r0, __m512i &r1, __m512i &r2, __m512i &r3,
+    inline void transpose_m512i_16x16(__m512i &r0, __m512i &r1, __m512i &r2, __m512i &r3,
                                __m512i &r4, __m512i &r5, __m512i &r6, __m512i &r7,
                                __m512i &r8, __m512i &r9, __m512i &ra, __m512i &rb,
                                __m512i &rc, __m512i &rd, __m512i &re, __m512i &rf) {
@@ -238,7 +238,7 @@ namespace functional {
         rf = _mm512_shuffle_i32x4(t7, tf, 0xdd); //  15  31  47  63  79  96 111 127 ... 255
     }
 
-    void transpose_epi32_16x16(void * _dst, const void * src, int stride) {
+    inline void transpose_epi32_16x16(void * _dst, const void * src, int stride) {
         auto * dst = reinterpret_cast<uint32_t*>(_dst);
         __m512i r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, ra, rb, rc, rd, re, rf;
         auto * pA = reinterpret_cast<const uint8_t*>(src);
@@ -280,7 +280,7 @@ namespace functional {
     }
 
     // 16xN, N<=16, non-valid part is filled with zeros
-    void transpose_epi32_16xN(void * _dst, const void * src, int stride, int valid_n) {
+    inline void transpose_epi32_16xN(void * _dst, const void * src, int stride, int valid_n) {
         auto * dst = reinterpret_cast<uint32_t*>(_dst);
         __m512i r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, ra, rb, rc, rd, re, rf;
         auto * pA = reinterpret_cast<const uint8_t*>(src);
@@ -320,7 +320,7 @@ namespace functional {
         _mm512_storeu_epi32(dst + 15*16, rf);
     }
 
-    void gelu_erf_minmax_approx() {
+    inline void gelu_erf_minmax_approx() {
         /*
 ```c++
 // gelu_erf(x) polynomial for direct erf approximation (formula defined)
@@ -395,7 +395,7 @@ void jit_uni_eltwise_injector_f32<isa,
     }
     
 
-    void kpack_tile_B0B1(void * _dst0, void * _dst1, const void * _src, int stride, int src_rows) {
+    inline void kpack_tile_B0B1(void * _dst0, void * _dst1, const void * _src, int stride, int src_rows) {
         // in 64unit
         //
         //  [a1 a2 a3 a4 | a5 a6 a7 a8]
@@ -481,7 +481,7 @@ void jit_uni_eltwise_injector_f32<isa,
     //   0 2 4 6 ... ...
     //   1 3 5 7 ... ...
     // 
-    void prepareB(KpackedB & B, tensor2D<bfloat16> & matB, bool transpose = false) {
+    inline void prepareB(KpackedB & B, tensor2D<bfloat16> & matB, bool transpose = false) {
         int K = matB.dims[transpose?1:0];
         int N = matB.dims[transpose?0:1];
         B.resize(K, N);
@@ -536,21 +536,39 @@ void jit_uni_eltwise_injector_f32<isa,
 };
 
 // 2x2 tiles post process kernels
-namespace PostProcess {
 
-    // 4 tiles located at C matrix (m,n) of size (valid_m, valid_n)
-    //   tC00/tC01
-    //   tC10/tC11
-    void func_save2bf16(tensor2D<bfloat16> & matBF16, tensor2D<float> & buffC, int m, int n, int valid_m, int valid_n) {
+// 4 tiles located at C matrix (m,n) of size (valid_m, valid_n)
+//   tC00/tC01
+//   tC10/tC11
+// REGPP is register level post-process:
+//
+//   regpp(int n, __mm512 & low512, high512)
+//
+struct regpp_empty {
+    // n : index of the first output channel
+    // r : output[   n:n+16]
+    void operator()(int n, __m512& r) {
+    }
+};
+
+// a helper callable for most frequenctly used pp kernels
+template<typename REGPP> 
+struct PP2bf16 {
+    tensor2D<bfloat16> & C;
+    REGPP regpp;
+    PP2bf16(tensor2D<bfloat16> & C, REGPP regpp) : C(C), regpp(regpp) {}
+    void operator()(tensor2D<float> & buffC, int m, int n, int valid_m, int valid_n) {
         auto * psrc = &buffC(0,0);
-        int8_t * pdst = reinterpret_cast<int8_t*>(&(matBF16(m, n)));
-        int stride = matBF16.stride;
+        int8_t * pdst = reinterpret_cast<int8_t*>(&(C(m, n)));
+        int stride = C.stride;
         __mmask32 k = _cvtu32_mask32(0xFFFFFFFF >> (32-valid_n));
         while(valid_m >= 16) {
             for(int i = 0; i < 16; i ++) {
-                auto b = _mm512_loadu_epi16(psrc);
-                auto a = _mm512_loadu_epi16(psrc + 16);
-                auto c = _mm512_cvtne2ps_pbh(a, b);
+                auto r0 = _mm512_loadu_ps(psrc);
+                auto r1 = _mm512_loadu_ps(psrc + 16);
+                regpp(n, r0);
+                regpp(n + 16, r1);
+                auto c = _mm512_cvtne2ps_pbh(r1, r0);
                 _mm512_mask_storeu_epi16(pdst, k, c);   // 32 bf16
                 pdst += stride;
                 psrc += 32;
@@ -558,23 +576,54 @@ namespace PostProcess {
             valid_m -= 16;
         }
         for(int i = 0; i < valid_m; i ++) {
-            auto b = _mm512_loadu_epi16(psrc);
-            auto a = _mm512_loadu_epi16(psrc + 16);
-            auto c = _mm512_cvtne2ps_pbh(a, b);
+            auto r0 = _mm512_loadu_ps(psrc);
+            auto r1 = _mm512_loadu_ps(psrc + 16);
+            regpp(n, r0);
+            regpp(n + 16, r1);
+            auto c = _mm512_cvtne2ps_pbh(r1, r0);
             _mm512_mask_storeu_epi16(pdst, k, c);   // 32 bf16
             pdst += stride;
             psrc += 32;
         }
     }
+};
 
-    // a helper callable for most frequenctly used pp kernels
-    struct save2bf16 {
-        tensor2D<bfloat16> & C;
-        save2bf16(tensor2D<bfloat16> & C) : C(C) {}
-        void operator()(tensor2D<float> & buffC, int m, int n, int valid_m, int valid_n) {
-            func_save2bf16(C, buffC, m, n, valid_m, valid_n);
+template<typename REGPP> 
+struct PP2float {
+    tensor2D<float> & C;
+    REGPP regpp;
+    PP2float(tensor2D<float> & C, REGPP regpp) : C(C), regpp(regpp) {}
+    void operator()(tensor2D<float> & buffC, int m, int n, int valid_m, int valid_n) {
+        auto * psrc = &buffC(0,0);
+        int8_t * pdst = reinterpret_cast<int8_t*>(&(C(m, n)));
+        int stride = C.stride;
+        uint32_t mask = 0xFFFFFFFF >> (32-valid_n);
+        __mmask32 k0 = _cvtu32_mask32(mask & 0xFFFF);
+        __mmask32 k1 = _cvtu32_mask32(mask >> 16);
+        while(valid_m >= 16) {
+            for(int i = 0; i < 16; i ++) {
+                auto r0 = _mm512_loadu_ps(psrc);
+                auto r1 = _mm512_loadu_ps(psrc + 16);
+                regpp(n, r0);
+                regpp(n + 16, r1);
+                _mm512_mask_storeu_ps(pdst, k0, r0);
+                _mm512_mask_storeu_ps(pdst + 64, k1, r1);
+                pdst += stride;
+                psrc += 32;
+            }
+            valid_m -= 16;
         }
-    };
+        for(int i = 0; i < valid_m; i ++) {
+            auto r0 = _mm512_loadu_ps(psrc);
+            auto r1 = _mm512_loadu_ps(psrc + 16);
+            regpp(n, r0);
+            regpp(n + 16, r1);
+            _mm512_mask_storeu_ps(pdst, k0, r0);
+            _mm512_mask_storeu_ps(pdst + 64, k1, r1);
+            pdst += stride;
+            psrc += 32;
+        }
+    }
 };
 
 // matmul (FC)
@@ -598,7 +647,40 @@ struct Matmul {
     Matmul(bool constB = false, bool transposeB = false) : 
         constB(constB), transposeB(transposeB), buffC(32, 32) {}
 
-    
+    // REGPP kernel overload, simpler for caller
+    template<typename REGPP>
+    void operator()(tensor2D<bfloat16> & matA,
+                    tensor2D<bfloat16> & matB,
+                    tensor2D<bfloat16> & matC,
+                    REGPP regppkernel) {
+        PP2bf16<REGPP> ppkernel(matC, regppkernel);
+        (*this)(matA, matB, ppkernel);
+    }
+
+    template<typename REGPP>
+    void operator()(tensor2D<bfloat16> & matA,
+                    tensor2D<bfloat16> & matB,
+                    tensor2D<float> & matC,
+                    REGPP regppkernel) {
+        PP2float<REGPP> ppkernel(matC, regppkernel);
+        (*this)(matA, matB, ppkernel);
+    }
+
+    // empty PP
+    void operator()(tensor2D<bfloat16> & matA,
+                    tensor2D<bfloat16> & matB,
+                    tensor2D<bfloat16> & matC) {
+        PP2bf16<regpp_empty> ppkernel(matC, regpp_empty());
+        (*this)(matA, matB, ppkernel);
+    }
+
+    void operator()(tensor2D<bfloat16> & matA,
+                    tensor2D<bfloat16> & matB,
+                    tensor2D<float> & matC) {
+        PP2float<regpp_empty> ppkernel(matC, regpp_empty());
+        (*this)(matA, matB, ppkernel);
+    }
+
     // different ppkernel has difference runtime args
     // which is set by caller, since only caller knows
     // what setter methods to use for specific ppkernel
