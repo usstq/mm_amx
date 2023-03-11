@@ -186,10 +186,11 @@ void amx_FC_acc(int M, int K, int N) {
     tensor2D<bfloat16> B(K, N);
     tensor2D<bfloat16> C(M, N);
     tensor2D<bfloat16> C0(M, N);
-    executor_amx_bf16::Matmul<executor_amx_bf16::PP2bf16> fc(true);
+    executor_amx_bf16::Matmul<executor_amx_bf16::Tiles2x2PostProcess> fc(true);
 
     tileconfig_t tfg(1, 0, 8, 16, 64);
-    fc(A, B, C);
+    fc.ppkernel.setDstBF16(C);
+    fc(A, B);
 
     C0=0;
     matmul(A, B, C0);
@@ -209,12 +210,13 @@ void amx_FC_perf(int M, int K, int N, int times = -1000) {
     tensor2D<bfloat16> B(K, N);
     tensor2D<bfloat16> C(M, N);
     tensor2D<bfloat16> C0(M, N);
-    executor_amx_bf16::Matmul<executor_amx_bf16::PP2bf16> mm(true);
+    executor_amx_bf16::Matmul<executor_amx_bf16::Tiles2x2PostProcess> mm(true);
 
     tileconfig_t tfg(1, 0, 8, 16, 64);
     std::cout << __func__ << " [" << M << "," << K << "," << N << "] ";
     timer(times, [&](){
-        mm(A, B, C);
+        mm.ppkernel.setDstBF16(C);
+        mm(A, B);
     },
     double(M * N) * K * 2,
     AMXBf16PeakGops2PerCore * 1e9);
@@ -226,14 +228,15 @@ void amx_Matmul_perf(int M, int K, int N, bool transB, int times = -1000) {
     tensor2D<bfloat16> BT = B.Tr();
     tensor2D<bfloat16> C(M, N);
     tensor2D<bfloat16> C0(M, N);
-    executor_amx_bf16::Matmul<executor_amx_bf16::PP2bf16> mm(false, transB);
+    executor_amx_bf16::Matmul<executor_amx_bf16::Tiles2x2PostProcess> mm(false, transB);
 
     tileconfig_t tfg(1, 0, 8, 16, 64);
     std::cout << __func__ << " [" << M << "," << K << "," << N << "] ";
 
     C0=0;
     matmul(A, B, C0);
-    mm(A, transB?BT:B, C);
+    mm.ppkernel.setDstBF16(C);
+    mm(A, transB?BT:B);
     if (C0 == C) {
         std::cout << ANSIcolor("1;32") << "Match!\n" << ANSIcolor();
         //std::cout << C << std::endl;
@@ -244,7 +247,8 @@ void amx_Matmul_perf(int M, int K, int N, bool transB, int times = -1000) {
     }
 
     timer(times, [&](){
-        mm(A, transB?BT:B, C);
+        mm.ppkernel.setDstBF16(C);
+        mm(A, transB?BT:B);
     },
     double(M * N) * K * 2,
     AMXBf16PeakGops2PerCore * 1e9);
@@ -341,7 +345,8 @@ struct MatmulMT {
             tensor2D<bfloat16> subB(K, N1-N0, &matB(0, N0), matB.stride);
             tensor2D<bfloat16> subC(M, N1-N0, &matC(0, N0), matC.stride);
             // C[:, N0:N1] = A * B[:, N0:N1]
-            (*ops[tid].get())(matA, subB, subC);
+            (*ops[tid].get()).ppkernel.setDstBF16(subC);
+            (*ops[tid].get())(matA, subB);
         };
         thp.Paralell_NT(kernel);
     }
@@ -353,8 +358,8 @@ void amx_MatmulMT_perf(int M, int K, int N, bool transB, int times = -1000) {
     tensor2D<bfloat16> BT = B.Tr();
     tensor2D<bfloat16> C(M, N);
     tensor2D<bfloat16> C0(M, N);
-    executor_amx_bf16::Matmul<executor_amx_bf16::PP2bf16> mm(true, transB);
-    MatmulMT<executor_amx_bf16::PP2bf16>                  mmMT(true, transB);
+    executor_amx_bf16::Matmul<executor_amx_bf16::Tiles2x2PostProcess> mm(true, transB);
+    MatmulMT<executor_amx_bf16::Tiles2x2PostProcess>                  mmMT(true, transB);
 
     std::cout << __func__ << " [" << M << "," << K << "," << N << "] ";
 
@@ -362,7 +367,8 @@ void amx_MatmulMT_perf(int M, int K, int N, bool transB, int times = -1000) {
     //matmul(A, B, C0);
     {
         tileconfig_t tfg(1, 0, 8, 16, 64);
-        mm(A, transB?BT:B, C0);
+        mm.ppkernel.setDstBF16(C0);
+        mm(A, transB?BT:B);
         mmMT(A, transB?BT:B, C);
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(1000));
@@ -378,7 +384,8 @@ void amx_MatmulMT_perf(int M, int K, int N, bool transB, int times = -1000) {
 
     timer(times, [&](){
         tileconfig_t tfg(1, 0, 8, 16, 64);
-        mm(A, transB?BT:B, C);
+        mm.ppkernel.setDstBF16(C);
+        mm(A, transB?BT:B);
     },
     double(M * N) * K * 2,
     AMXBf16PeakGops2PerCore * 1e9);

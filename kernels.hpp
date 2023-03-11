@@ -320,6 +320,81 @@ namespace functional {
         _mm512_storeu_epi32(dst + 15*16, rf);
     }
 
+    void gelu_erf_minmax_approx() {
+        /*
+```c++
+// gelu_erf(x) polynomial for direct erf approximation (formula defined)
+static const table_t gelu_erf_minimax_polynomial {
+        {gelu_erf_minimax_pol, {0x3f4c4228, true}}, // p0 = 0x1.98845p-1
+        {gelu_erf_minimax_pol, {0xbe082bc7, true}}, // p1 = -0x1.10578ep-3
+        {gelu_erf_minimax_pol, {0x3ca3621f, true}}, // p2 = 0x1.46c43ep-6
+        {gelu_erf_minimax_pol, {0xbb1b7399, true}}, // p3 = -0x1.36e732p-9
+        {gelu_erf_minimax_pol, {0x3970b255, true}}, // p4 = 0x1.e164aap-13
+        {gelu_erf_minimax_pol, {0xb79b0914, true}}, // p5 = -0x1.361228p-16
+        {gelu_erf_minimax_pol, {0x35a776e9, true}}, // p6 = 0x1.4eedd2p-20
+        {gelu_erf_minimax_pol, {0xb3969b11, true}}, // p7 = -0x1.2d3622p-24
+        {gelu_erf_minimax_pol, {0x315d4a4f, true}}, // p8 = 0x1.ba949ep-29
+        {gelu_erf_minimax_pol, {0xaf013b2c, true}}, // p9 = -0x1.027658p-33
+        {gelu_erf_minimax_pol, {0x2c67ddb2, true}}, // p10 = 0x1.cfbb64p-39
+        {gelu_erf_minimax_pol, {0xa998c963, true}}, // p11 = -0x1.3192c6p-44
+        {gelu_erf_minimax_pol, {0x268a7927, true}}, // p12 = 0x1.14f24ep-50
+        {gelu_erf_minimax_pol, {0xa3198977, true}}, // p13 = -0x1.3312eep-57
+        {gelu_erf_minimax_pol, {0x1f1c83fd, true}}, // p14 = 0x1.3907fap-65
+};
+
+template <cpu_isa_t isa, typename Wmm>
+void jit_uni_eltwise_injector_f32<isa,
+        Wmm>::gelu_erf_minimax_approx_compute_vector_fwd(const Vmm &vmm_src) {
+    using namespace Xbyak::util;
+
+    // TODO: consider enabling for lower ISA
+    if (!is_superset(isa, avx512_core)) return;
+
+    // register mapping
+    Vmm vmm_pol = vmm_aux1, vmm_src_square = vmm_aux2, vmm_src_half = vmm_aux3,
+        vmm_src_positive = vmm_aux4;
+
+    
+
+    h->uni_vmulps(vmm_src_square, vmm_src, vmm_src);    //vmm_src_square = (x*x)
+    h->uni_vmovups(vmm_src_positive, vmm_src);          //vmm_src_positive = x
+    h->uni_vandps(vmm_src_positive, vmm_src_positive, table_val(positive_mask)); // vmm_src_positive = x & 0x7FFFFFFFF
+
+    h->uni_vmulps(vmm_src_half, vmm_src, table_val(half));                  // vmm_src_half = x * (1/2)
+
+    // compute P(x^2)
+    h->uni_vmovups(vmm_pol, table_val(gelu_erf_minimax_pol, 14));           // 
+    // TODO: consider reducing latency by spitting into parital sums, for
+    // example by using x^4 polynomial
+    for (int deg = 13; deg >= 0; --deg) {
+        h->uni_vfmadd213ps(
+                vmm_pol, vmm_src_square, table_val(gelu_erf_minimax_pol, deg));
+    }
+
+    // 1.0f + erf(x * inv_sqrt2) = 1.0f + x * P(x^2)
+    h->uni_vfmadd213ps(vmm_pol, vmm_src, table_val(one));
+    // move instead first blend_with_mask?
+    h->uni_vmulps(vmm_pol, vmm_pol, vmm_src_half);
+    // Now we blend the results
+    // [saturation_ubound; +inf] : we return x
+    // [-inf; neg_saturation_ubound] : we return 0.0f
+    h->uni_vmovups(vmm_mask, table_val(gelu_erf_minimax_neg_saturation_ubound));
+    compute_cmp_mask(vmm_mask, vmm_src, _cmp_ge_os);
+    blend_with_mask(vmm_src, table_val(zero));
+    // [neg_saturation_ubound; -linear_ubound] or
+    // [linear_ubound; saturation_lbound] : we return P(x)
+    h->uni_vmovups(vmm_mask, table_val(gelu_erf_minimax_saturation_lbound));
+    compute_cmp_mask(vmm_mask, vmm_src_positive, _cmp_gt_os);
+    blend_with_mask(vmm_src, vmm_pol);
+    // [-linear_ubound; linear_ubound] : we return 0.5f * x
+    h->uni_vmovups(vmm_mask, table_val(gelu_erf_minimax_linear_ubound));
+    compute_cmp_mask(vmm_mask, vmm_src_positive, _cmp_gt_os);
+    blend_with_mask(vmm_src, vmm_src_half);
+}
+    */
+    }
+    
+
     void kpack_tile_B0B1(void * _dst0, void * _dst1, const void * _src, int stride, int src_rows) {
         // in 64unit
         //
@@ -397,87 +472,6 @@ namespace functional {
         }
     }
 
-    // 2x2, dynamically degenerated to 1x2 for tails
-    template<typename PP>
-    void matmul2x2(tensor2D<bfloat16> & matA,
-                    KpackedB & matB,
-                    tensor2D<bfloat16> & matC,
-                    tensor2D<bfloat16> & scratch,
-                    BlockIterator & blk_it,
-                    PP ppkernel) {
-        tensor2D<bfloat16> & Atails = scratch;
-        int M = matC.dims[0];
-        int N = matC.dims[1];
-        int K = matA.dims[1];
-        assert(K == matB.K);
-        assert(N == matB.N);
-
-        int mtails = M % 32;
-        if (mtails > 0) {
-            Atails.resize(32, rndup(K, 32));
-            // copy tails into Atails (in unit of 32x32)
-            for (int m = 0; m < mtails; m++) {
-                memcpy(&Atails(m, 0), &matA(M - mtails + m, 0), matA.stride);
-                if (Atails.stride > matA.stride) {
-                    memset(reinterpret_cast<int8_t*>(&Atails(m, 0)) + matA.stride,
-                            0,
-                            Atails.stride - matA.stride);
-                }
-            }
-        }
-
-        do
-        {
-            int m = blk_it.m;
-            int n = blk_it.n;
-            int valid_m = std::min(M - m, 32);
-            int valid_n = std::min(N - n, 32);
-            auto * pA0 = &matA(m, 0);
-            auto * pA1 = &matA(m + 16, 0);
-            auto strideA = matA.stride;
-            auto * pB = &matB(0, n);
-            if (valid_m < 32) {
-                // use Atails buffer to prevent memory read segmentfault
-                pA0 = &Atails(0, 0);
-                pA1 = &Atails(16, 0);
-                strideA = Atails.stride;
-            }
-
-            _tile_zero(tC00);
-            _tile_zero(tC01);
-            _tile_zero(tC10);
-            _tile_zero(tC11);
-            if (valid_m <= 16) {
-                // 1x2 is enough
-                for (int k = 0; k < K; k += 32) {
-                    _tile_loadd(tA0, pA0 + k, strideA);
-                    _tile_loadd(tB0, pB, 64); pB += (16*32);
-                    _tile_dpbf16ps(tC00, tA0, tB0);
-                    _tile_loadd(tB1, pB, 64); pB += (16*32);
-                    _tile_dpbf16ps(tC01, tA0, tB1);
-                }
-            } else {
-                // 2x2
-                for (int k = 0; k < K; k += 32) {
-                    _tile_loadd(tA0, pA0 + k, strideA);
-                    _tile_loadd(tB0, pB, 64); pB += (16*32);
-                    _tile_dpbf16ps(tC00, tA0, tB0);
-                    _tile_loadd(tA1, pA1 + k, strideA);
-                    _tile_dpbf16ps(tC10, tA1, tB0);
-                    _tile_loadd(tB1, pB, 64); pB += (16*32);
-                    _tile_dpbf16ps(tC01, tA0, tB1);
-                    _tile_dpbf16ps(tC11, tA1, tB1);
-                }
-            }
-            // post processing the accumulator tiles
-            //  - add bias
-            //  - do activations
-            //  - convert into bfloat16
-            //  - store into C matrix
-            (ppkernel)(&matC(m, n), matC.stride, valid_m, valid_n);
-        } while(blk_it.next());
-    }
-
     // prepare B matrix for C matrix 2x2 blocking (B matrix
     // will be accessed in 1x2)
     // given 2x2 blocking scheme, Kx32 blocks are always
@@ -541,24 +535,20 @@ namespace functional {
     }
 };
 
-// post process kernels, tC00 ~ tC11
-struct PP2bf16 {
-    tensor2D<float> buffC;
-    PP2bf16() : buffC(16, 2*16) {}
-    void postProcess16x32(int8_t * pdst, int stride, int valid_m, int valid_n) {
-        float * psrc = &buffC(0,0);
-        if (valid_m >= 16 && valid_n >= 32) {
+// 2x2 tiles post process kernels
+struct Tiles2x2PostProcess {
+    Tiles2x2PostProcess() {}
+
+    // output converted into bf16
+    tensor2D<bfloat16> * pmatC;
+    void setDstBF16(tensor2D<bfloat16> & matC) {
+        pmatC = &matC;
+    }
+
+    void postProcess32x32(float * psrc, int8_t * pdst, int stride, int valid_m, int valid_n) {
+        __mmask32 k = _cvtu32_mask32(0xFFFFFFFF >> (32-valid_n));
+        while(valid_m >= 16) {
             for(int i = 0; i < 16; i ++) {
-                auto b = _mm512_loadu_epi16(psrc);
-                auto a = _mm512_loadu_epi16(psrc + 16);
-                auto c = _mm512_cvtne2ps_pbh(a, b);
-                _mm512_storeu_epi16(pdst, c);   // 32 bf16
-                pdst += stride;
-                psrc += 32;
-            }
-        } else {
-            __mmask32 k = _cvtu32_mask32(0xFFFFFFFF >> (32-valid_n));
-            for(int i = 0; i < valid_m; i ++) {
                 auto b = _mm512_loadu_epi16(psrc);
                 auto a = _mm512_loadu_epi16(psrc + 16);
                 auto c = _mm512_cvtne2ps_pbh(a, b);
@@ -566,18 +556,24 @@ struct PP2bf16 {
                 pdst += stride;
                 psrc += 32;
             }
+            valid_m -= 16;
+        }
+        for(int i = 0; i < valid_m; i ++) {
+            auto b = _mm512_loadu_epi16(psrc);
+            auto a = _mm512_loadu_epi16(psrc + 16);
+            auto c = _mm512_cvtne2ps_pbh(a, b);
+            _mm512_mask_storeu_epi16(pdst, k, c);   // 32 bf16
+            pdst += stride;
+            psrc += 32;
         }
     }
-    void operator()(bfloat16 * pC, int stride, int valid_m, int valid_n) {
-        _tile_stored(tC00, &buffC(0,0), buffC.stride);
-        _tile_stored(tC01, &buffC(0,16), buffC.stride);
-        postProcess16x32(reinterpret_cast<int8_t*>(pC), stride, valid_m, valid_n);
 
-        if (valid_m > 16) {
-            _tile_stored(tC10, &buffC(0,0), buffC.stride);
-            _tile_stored(tC11, &buffC(0,16), buffC.stride);
-            postProcess16x32(reinterpret_cast<int8_t*>(pC) + 16*stride, stride, valid_m-16, valid_n);
-        }
+    // 4 tiles located at C matrix (m,n) of size (valid_m, valid_n)
+    //   tC00/tC01
+    //   tC10/tC11
+    virtual void operator()(tensor2D<float> & buffC, int m, int n, int valid_m, int valid_n) {
+        auto * pC = reinterpret_cast<int8_t*>(&((*pmatC)(m, n)));
+        postProcess32x32(&buffC(0,0), pC, pmatC->stride, valid_m, valid_n);
     }
 };
 
@@ -593,19 +589,25 @@ template<typename PP>
 struct Matmul {
     KpackedB internalB;
     tensor2D<bfloat16> scratch;
-    BlockIterator bloop;
+    BlockIterator blk_it;
     bool constB;
     bool transposeB;
     PP ppkernel;
+    // 2x2 C tiles buffer
+    tensor2D<float> buffC;
 
-    Matmul(bool constB = false, bool transposeB = false) : constB(constB), transposeB(transposeB) {}
+    Matmul(bool constB = false, bool transposeB = false) : 
+        constB(constB), transposeB(transposeB), buffC(32, 32) {}
 
+    // different ppkernel has difference runtime args
+    // which is set by caller, since only caller knows
+    // what setter methods to use for specific ppkernel
     void operator()(tensor2D<bfloat16> & matA,
-                    tensor2D<bfloat16> & matB,
-                    tensor2D<bfloat16> & matC) {
-        int M = matC.dims[0];
-        int N = matC.dims[1];
+                    tensor2D<bfloat16> & matB) {
+        int M = matA.dims[0];
         int K = matA.dims[1];
+        int N = matB.dims[transposeB ? 0 : 1];
+        assert(K == matB.dims[transposeB ? 1 : 0]);
 
         // determine blocking scheme
         int elesz = sizeof(uint16_t);
@@ -618,7 +620,7 @@ struct Matmul {
         BlockIterator::blkloop bloops[] = {
             {mc,32,0}, {dmax,0,32}, {dmax,mc*32,0}
         };
-        bloop.reset(bloops, 3, M, N);
+        blk_it.reset(bloops, 3, M, N);
 
         // for non-constB, internalB is updated every time
         // for constB, internalB is updated once
@@ -626,7 +628,78 @@ struct Matmul {
             functional::prepareB(internalB, matB, transposeB);
         }
 
-        functional::matmul2x2(matA, internalB, matC, scratch, bloop, ppkernel);
+        // prepare tails buffer
+        tensor2D<bfloat16> & Atails = scratch;
+        int mtails = M % 32;
+        if (mtails > 0) {
+            Atails.resize(32, rndup(K, 32));
+            // copy tails into Atails (in unit of 32x32)
+            for (int m = 0; m < mtails; m++) {
+                memcpy(&Atails(m, 0), &matA(M - mtails + m, 0), matA.stride);
+                if (Atails.stride > matA.stride) {
+                    memset(reinterpret_cast<int8_t*>(&Atails(m, 0)) + matA.stride,
+                            0,
+                            Atails.stride - matA.stride);
+                }
+            }
+        }
+        // main loop
+        do
+        {
+            int m = blk_it.m;
+            int n = blk_it.n;
+            int valid_m = std::min(M - m, 32);
+            int valid_n = std::min(N - n, 32);
+            auto * pA0 = &matA(m, 0);
+            auto * pA1 = &matA(m + 16, 0);
+            auto strideA = matA.stride;
+            auto * pB = &internalB(0, n);
+            if (valid_m < 32) {
+                // use Atails buffer to prevent memory read segmentfault
+                pA0 = &Atails(0, 0);
+                pA1 = &Atails(16, 0);
+                strideA = Atails.stride;
+            }
+
+            _tile_zero(tC00);
+            _tile_zero(tC01);
+            _tile_zero(tC10);
+            _tile_zero(tC11);
+            if (valid_m <= 16) {
+                // 1x2 is enough
+                for (int k = 0; k < K; k += 32) {
+                    _tile_loadd(tA0, pA0 + k, strideA);
+                    _tile_loadd(tB0, pB, 64); pB += (16*32);
+                    _tile_dpbf16ps(tC00, tA0, tB0);
+                    _tile_loadd(tB1, pB, 64); pB += (16*32);
+                    _tile_dpbf16ps(tC01, tA0, tB1);
+                }
+                _tile_stored(tC00, &buffC(0,0), buffC.stride);
+                _tile_stored(tC01, &buffC(0,16), buffC.stride);
+            } else {
+                // 2x2
+                for (int k = 0; k < K; k += 32) {
+                    _tile_loadd(tA0, pA0 + k, strideA);
+                    _tile_loadd(tB0, pB, 64); pB += (16*32);
+                    _tile_dpbf16ps(tC00, tA0, tB0);
+                    _tile_loadd(tA1, pA1 + k, strideA);
+                    _tile_dpbf16ps(tC10, tA1, tB0);
+                    _tile_loadd(tB1, pB, 64); pB += (16*32);
+                    _tile_dpbf16ps(tC01, tA0, tB1);
+                    _tile_dpbf16ps(tC11, tA1, tB1);
+                }
+                _tile_stored(tC00, &buffC(0,0), buffC.stride);
+                _tile_stored(tC01, &buffC(0,16), buffC.stride);
+                _tile_stored(tC10, &buffC(16,0), buffC.stride);
+                _tile_stored(tC11, &buffC(16,16), buffC.stride);
+            }
+            // post processing the accumulator tiles
+            //  - add bias
+            //  - do activations
+            //  - convert into bfloat16
+            //  - store into C matrix
+            (ppkernel)(buffC, m, n, valid_m, valid_n);
+        } while(blk_it.next());
     }
 };
 
