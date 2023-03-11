@@ -320,80 +320,56 @@ namespace functional {
         _mm512_storeu_epi32(dst + 15*16, rf);
     }
 
-    inline void gelu_erf_minmax_approx() {
-        /*
-```c++
-// gelu_erf(x) polynomial for direct erf approximation (formula defined)
-static const table_t gelu_erf_minimax_polynomial {
-        {gelu_erf_minimax_pol, {0x3f4c4228, true}}, // p0 = 0x1.98845p-1
-        {gelu_erf_minimax_pol, {0xbe082bc7, true}}, // p1 = -0x1.10578ep-3
-        {gelu_erf_minimax_pol, {0x3ca3621f, true}}, // p2 = 0x1.46c43ep-6
-        {gelu_erf_minimax_pol, {0xbb1b7399, true}}, // p3 = -0x1.36e732p-9
-        {gelu_erf_minimax_pol, {0x3970b255, true}}, // p4 = 0x1.e164aap-13
-        {gelu_erf_minimax_pol, {0xb79b0914, true}}, // p5 = -0x1.361228p-16
-        {gelu_erf_minimax_pol, {0x35a776e9, true}}, // p6 = 0x1.4eedd2p-20
-        {gelu_erf_minimax_pol, {0xb3969b11, true}}, // p7 = -0x1.2d3622p-24
-        {gelu_erf_minimax_pol, {0x315d4a4f, true}}, // p8 = 0x1.ba949ep-29
-        {gelu_erf_minimax_pol, {0xaf013b2c, true}}, // p9 = -0x1.027658p-33
-        {gelu_erf_minimax_pol, {0x2c67ddb2, true}}, // p10 = 0x1.cfbb64p-39
-        {gelu_erf_minimax_pol, {0xa998c963, true}}, // p11 = -0x1.3192c6p-44
-        {gelu_erf_minimax_pol, {0x268a7927, true}}, // p12 = 0x1.14f24ep-50
-        {gelu_erf_minimax_pol, {0xa3198977, true}}, // p13 = -0x1.3312eep-57
-        {gelu_erf_minimax_pol, {0x1f1c83fd, true}}, // p14 = 0x1.3907fap-65
-};
+    // gelu_erf_minimax_approx_compute_vector_fwd in oneDNN
+    //   x*0.5*(1+erf(x/sqrt(2))) = x*0.5*(1 + x*Polynomial(x^2))
+    inline __m512 gelu_erf_minmax_approx(__m512 & x) {
+        auto x2 = _mm512_mul_ps(x, x); // x^2
+        
+        auto x_positive = _mm512_castsi512_ps(_mm512_and_epi32(_mm512_castps_si512(x), _mm512_set1_epi32(0x7FFFFFFF)));    // clear sign mask
+        auto x_half = _mm512_mul_ps(x, _mm512_set1_ps(0.5f));
 
-template <cpu_isa_t isa, typename Wmm>
-void jit_uni_eltwise_injector_f32<isa,
-        Wmm>::gelu_erf_minimax_approx_compute_vector_fwd(const Vmm &vmm_src) {
-    using namespace Xbyak::util;
+        auto poly = _mm512_castsi512_ps(_mm512_set1_epi32(0x1f1c83fd));
+        poly = _mm512_fmadd_ps(poly, x2, _mm512_castsi512_ps(_mm512_set1_epi32(0xa3198977))); // poly * x^2 + xxx
+        poly = _mm512_fmadd_ps(poly, x2, _mm512_castsi512_ps(_mm512_set1_epi32(0x268a7927)));
+        poly = _mm512_fmadd_ps(poly, x2, _mm512_castsi512_ps(_mm512_set1_epi32(0xa998c963)));
+        poly = _mm512_fmadd_ps(poly, x2, _mm512_castsi512_ps(_mm512_set1_epi32(0x2c67ddb2)));
+        poly = _mm512_fmadd_ps(poly, x2, _mm512_castsi512_ps(_mm512_set1_epi32(0xaf013b2c)));
+        poly = _mm512_fmadd_ps(poly, x2, _mm512_castsi512_ps(_mm512_set1_epi32(0x315d4a4f)));
+        poly = _mm512_fmadd_ps(poly, x2, _mm512_castsi512_ps(_mm512_set1_epi32(0xb3969b11)));
+        poly = _mm512_fmadd_ps(poly, x2, _mm512_castsi512_ps(_mm512_set1_epi32(0x35a776e9)));
+        poly = _mm512_fmadd_ps(poly, x2, _mm512_castsi512_ps(_mm512_set1_epi32(0xb79b0914)));
+        poly = _mm512_fmadd_ps(poly, x2, _mm512_castsi512_ps(_mm512_set1_epi32(0x3970b255)));
+        poly = _mm512_fmadd_ps(poly, x2, _mm512_castsi512_ps(_mm512_set1_epi32(0xbb1b7399)));
+        poly = _mm512_fmadd_ps(poly, x2, _mm512_castsi512_ps(_mm512_set1_epi32(0x3ca3621f)));
+        poly = _mm512_fmadd_ps(poly, x2, _mm512_castsi512_ps(_mm512_set1_epi32(0xbe082bc7)));
+        poly = _mm512_fmadd_ps(poly, x2, _mm512_castsi512_ps(_mm512_set1_epi32(0x3f4c4228)));
 
-    // TODO: consider enabling for lower ISA
-    if (!is_superset(isa, avx512_core)) return;
+        // 1.0f + erf(x * inv_sqrt2) = 1.0f + x * P(x^2)
+        poly = _mm512_fmadd_ps(poly, x, _mm512_set1_ps(1.0f));
+        // x*0.5*(1 + x*Polynomial(x^2))
+        poly = _mm512_mul_ps(poly, x_half);
 
-    // register mapping
-    Vmm vmm_pol = vmm_aux1, vmm_src_square = vmm_aux2, vmm_src_half = vmm_aux3,
-        vmm_src_positive = vmm_aux4;
+        // combine:
+        // zone_id
+        //  1 -inf; -saturation_lbound           : 0.0f
+        //  2 -saturation_lbound; -linear_ubound : x*0.5*(1 + x*Polynomial(x^2))
+        //  3 -linear_ubound, linear_ubound         : x*0.5
+        //  4 linear_ubound : saturation_lbound     : x*0.5*(1 + x*Polynomial(x^2))
+        //  5 saturation_lbound: +inf               : x
+        constexpr int neg_saturation_lbound = 0xc0a00000;
+        constexpr int linear_ubound = 0x33800000;
+        constexpr int saturation_lbound = 0x40a00000;
 
-    
+        auto mask_x_not_zone1 = _mm512_cmpnlt_ps_mask(x, _mm512_castsi512_ps(_mm512_set1_epi32(neg_saturation_lbound)));
+        x = _mm512_maskz_mov_ps(mask_x_not_zone1, x);
 
-    h->uni_vmulps(vmm_src_square, vmm_src, vmm_src);    //vmm_src_square = (x*x)
-    h->uni_vmovups(vmm_src_positive, vmm_src);          //vmm_src_positive = x
-    h->uni_vandps(vmm_src_positive, vmm_src_positive, table_val(positive_mask)); // vmm_src_positive = x & 0x7FFFFFFFF
+        auto mask_x_in_zone5 = _mm512_cmpnle_ps_mask(x_positive, _mm512_castsi512_ps(_mm512_set1_epi32(saturation_lbound)));
+        poly = _mm512_mask_mov_ps(poly, mask_x_in_zone5, x);
 
-    h->uni_vmulps(vmm_src_half, vmm_src, table_val(half));                  // vmm_src_half = x * (1/2)
-
-    // compute P(x^2)
-    h->uni_vmovups(vmm_pol, table_val(gelu_erf_minimax_pol, 14));           // 
-    // TODO: consider reducing latency by spitting into parital sums, for
-    // example by using x^4 polynomial
-    for (int deg = 13; deg >= 0; --deg) {
-        h->uni_vfmadd213ps(
-                vmm_pol, vmm_src_square, table_val(gelu_erf_minimax_pol, deg));
+        auto mask_x_in_zone3 = _mm512_cmple_ps_mask(x_positive, _mm512_castsi512_ps(_mm512_set1_epi32(linear_ubound)));
+        poly = _mm512_mask_mov_ps(poly, mask_x_in_zone3, x_half);
+        return poly;
     }
-
-    // 1.0f + erf(x * inv_sqrt2) = 1.0f + x * P(x^2)
-    h->uni_vfmadd213ps(vmm_pol, vmm_src, table_val(one));
-    // move instead first blend_with_mask?
-    h->uni_vmulps(vmm_pol, vmm_pol, vmm_src_half);
-    // Now we blend the results
-    // [saturation_ubound; +inf] : we return x
-    // [-inf; neg_saturation_ubound] : we return 0.0f
-    h->uni_vmovups(vmm_mask, table_val(gelu_erf_minimax_neg_saturation_ubound));
-    compute_cmp_mask(vmm_mask, vmm_src, _cmp_ge_os);
-    blend_with_mask(vmm_src, table_val(zero));
-    // [neg_saturation_ubound; -linear_ubound] or
-    // [linear_ubound; saturation_lbound] : we return P(x)
-    h->uni_vmovups(vmm_mask, table_val(gelu_erf_minimax_saturation_lbound));
-    compute_cmp_mask(vmm_mask, vmm_src_positive, _cmp_gt_os);
-    blend_with_mask(vmm_src, vmm_pol);
-    // [-linear_ubound; linear_ubound] : we return 0.5f * x
-    h->uni_vmovups(vmm_mask, table_val(gelu_erf_minimax_linear_ubound));
-    compute_cmp_mask(vmm_mask, vmm_src_positive, _cmp_gt_os);
-    blend_with_mask(vmm_src, vmm_src_half);
-}
-    */
-    }
-    
 
     inline void kpack_tile_B0B1(void * _dst0, void * _dst1, const void * _src, int stride, int src_rows) {
         // in 64unit
@@ -540,101 +516,122 @@ void jit_uni_eltwise_injector_f32<isa,
 // 4 tiles located at C matrix (m,n) of size (valid_m, valid_n)
 //   tC00/tC01
 //   tC10/tC11
-// REGPP is register level post-process:
-//
-//   regpp(int n, __mm512 & low512, high512)
-//
-struct regpp_empty {
-    // n : index of the first output channel
-    // r : output[   n:n+16]
-    void operator()(int n, __m512& r) {
-    }
-};
 
-// a helper callable for most frequenctly used pp kernels
-template<typename REGPP> 
-struct PP2bf16 {
-    tensor2D<bfloat16> & C;
-    REGPP regpp;
-    PP2bf16(tensor2D<bfloat16> & C, REGPP regpp) : C(C), regpp(regpp) {}
-    void operator()(tensor2D<float> & buffC, int m, int n, int valid_m, int valid_n) {
-        auto * psrc = &buffC(0,0);
-        int8_t * pdst = reinterpret_cast<int8_t*>(&(C(m, n)));
-        int stride = C.stride;
-        __mmask32 k = _cvtu32_mask32(0xFFFFFFFF >> (32-valid_n));
-        while(valid_m >= 16) {
-            for(int i = 0; i < 16; i ++) {
+namespace PP {
+
+    // PP kernel has infinite combinations, the generation
+    // of specific PP kernel with high-efficiency means
+    // it should be combined in source code level and
+    // let compiler to optimize it. extra syntax sugar
+    // through more complex meta programing is not so
+    // worthy. hard code all combinations needed is not
+    // that difficult and it also ensures most efficient
+    // implementation.
+
+    // a helper callable for most frequenctly used pp kernels
+    struct Store2bf16 {
+        tensor2D<bfloat16> & C;
+        Store2bf16(tensor2D<bfloat16> & C) : C(C) {}
+        void operator()(tensor2D<float> & buffC, int m, int n, int valid_m, int valid_n) {
+            auto * psrc = &buffC(0,0);
+            int8_t * pdst = reinterpret_cast<int8_t*>(&(C(m, n)));
+            int stride = C.stride;
+            __mmask32 k = _cvtu32_mask32(0xFFFFFFFF >> (32-valid_n));
+            for(int i = 0; i < valid_m; i ++) {
                 auto r0 = _mm512_loadu_ps(psrc);
                 auto r1 = _mm512_loadu_ps(psrc + 16);
-                regpp(n, r0);
-                regpp(n + 16, r1);
                 auto c = _mm512_cvtne2ps_pbh(r1, r0);
                 _mm512_mask_storeu_epi16(pdst, k, c);   // 32 bf16
                 pdst += stride;
                 psrc += 32;
+                m++;
             }
-            valid_m -= 16;
         }
-        for(int i = 0; i < valid_m; i ++) {
-            auto r0 = _mm512_loadu_ps(psrc);
-            auto r1 = _mm512_loadu_ps(psrc + 16);
-            regpp(n, r0);
-            regpp(n + 16, r1);
-            auto c = _mm512_cvtne2ps_pbh(r1, r0);
-            _mm512_mask_storeu_epi16(pdst, k, c);   // 32 bf16
-            pdst += stride;
-            psrc += 32;
-        }
-    }
-};
+    };
 
-template<typename REGPP> 
-struct PP2float {
-    tensor2D<float> & C;
-    REGPP regpp;
-    PP2float(tensor2D<float> & C, REGPP regpp) : C(C), regpp(regpp) {}
-    void operator()(tensor2D<float> & buffC, int m, int n, int valid_m, int valid_n) {
-        auto * psrc = &buffC(0,0);
-        int8_t * pdst = reinterpret_cast<int8_t*>(&(C(m, n)));
-        int stride = C.stride;
-        uint32_t mask = 0xFFFFFFFF >> (32-valid_n);
-        __mmask32 k0 = _cvtu32_mask32(mask & 0xFFFF);
-        __mmask32 k1 = _cvtu32_mask32(mask >> 16);
-        while(valid_m >= 16) {
-            for(int i = 0; i < 16; i ++) {
+    struct Addbias_Store2bf16 {
+        tensor2D<bfloat16> & C;
+        float * bias;
+        Addbias_Store2bf16(tensor2D<bfloat16> & C, float * bias) : C(C), bias(bias) {}
+        void operator()(tensor2D<float> & buffC, int m, int n, int valid_m, int valid_n) {
+            auto * psrc = &buffC(0,0);
+            int8_t * pdst = reinterpret_cast<int8_t*>(&(C(m, n)));
+            int stride = C.stride;
+            auto bias0 = _mm512_loadu_ps(bias);
+            auto bias1 = _mm512_loadu_ps(bias + 16);
+            __mmask32 k = _cvtu32_mask32(0xFFFFFFFF >> (32-valid_n));
+            for(int i = 0; i < valid_m; i ++) {
                 auto r0 = _mm512_loadu_ps(psrc);
                 auto r1 = _mm512_loadu_ps(psrc + 16);
-                regpp(n, r0);
-                regpp(n + 16, r1);
+                // add bias
+                r0 = _mm512_add_ps(r0, bias0);
+                r1 = _mm512_add_ps(r1, bias1);
+                // cvt2 bf16
+                auto c = _mm512_cvtne2ps_pbh(r1, r0);
+                //store
+                _mm512_mask_storeu_epi16(pdst, k, c);   // 32 bf16
+                pdst += stride;
+                psrc += 32;
+            }
+        }
+    };
+
+
+    struct Addbias_Gelu_Store2bf16 {
+        tensor2D<bfloat16> & C;
+        float * bias;
+        Addbias_Gelu_Store2bf16(tensor2D<bfloat16> & C, float * bias) : C(C), bias(bias) {}
+        void operator()(tensor2D<float> & buffC, int m, int n, int valid_m, int valid_n) {
+            auto * psrc = &buffC(0,0);
+            int8_t * pdst = reinterpret_cast<int8_t*>(&(C(m, n)));
+            int stride = C.stride;
+            auto bias0 = _mm512_loadu_ps(bias);
+            auto bias1 = _mm512_loadu_ps(bias + 16);
+            __mmask32 k = _cvtu32_mask32(0xFFFFFFFF >> (32-valid_n));
+            for(int i = 0; i < valid_m; i ++) {
+                auto r0 = _mm512_loadu_ps(psrc);
+                auto r1 = _mm512_loadu_ps(psrc + 16);
+                // add bias
+                r0 = _mm512_add_ps(r0, bias0);
+                r1 = _mm512_add_ps(r1, bias1);
+                r0 = functional::gelu_erf_minmax_approx(r0);
+                r1 = functional::gelu_erf_minmax_approx(r1);
+                // cvt2 bf16
+                auto c = _mm512_cvtne2ps_pbh(r1, r0);
+                //store
+                _mm512_mask_storeu_epi16(pdst, k, c);   // 32 bf16
+                pdst += stride;
+                psrc += 32;
+            }
+        }
+    };
+
+    struct Store2float {
+        tensor2D<float> & C;
+        Store2float(tensor2D<float> & C) : C(C) {}
+        void operator()(tensor2D<float> & buffC, int m, int n, int valid_m, int valid_n) {
+            auto * psrc = &buffC(0,0);
+            int8_t * pdst = reinterpret_cast<int8_t*>(&(C(m, n)));
+            int stride = C.stride;
+            uint32_t mask = 0xFFFFFFFF >> (32-valid_n);
+            __mmask32 k0 = _cvtu32_mask32(mask & 0xFFFF);
+            __mmask32 k1 = _cvtu32_mask32(mask >> 16);
+            for(int i = 0; i < valid_m; i ++) {
+                auto r0 = _mm512_loadu_ps(psrc);
+                auto r1 = _mm512_loadu_ps(psrc + 16);
                 _mm512_mask_storeu_ps(pdst, k0, r0);
                 _mm512_mask_storeu_ps(pdst + 64, k1, r1);
                 pdst += stride;
                 psrc += 32;
+                m++;
             }
-            valid_m -= 16;
         }
-        for(int i = 0; i < valid_m; i ++) {
-            auto r0 = _mm512_loadu_ps(psrc);
-            auto r1 = _mm512_loadu_ps(psrc + 16);
-            regpp(n, r0);
-            regpp(n + 16, r1);
-            _mm512_mask_storeu_ps(pdst, k0, r0);
-            _mm512_mask_storeu_ps(pdst + 64, k1, r1);
-            pdst += stride;
-            psrc += 32;
-        }
-    }
-};
+    };
+}
 
 // matmul (FC)
 //
-// constB constrols if it's FC or not 
-//
-// multi-thread caller can split the whole C matrix
-// into grid (better in unit with size of multiple of 32x32)
-// each grid is a considered as a independent matmul on
-// submatrix of A,B and C.
-
+// constB constrols whether it's FC or not 
 struct Matmul {
     KpackedB internalB;
     tensor2D<bfloat16> scratch;
@@ -642,56 +639,70 @@ struct Matmul {
     bool constB;
     bool transposeB;
     // 2x2 C tiles buffer
+    // most usecase requires post-processing with AVX, thus buffC
+    // is used to transfer data to AVX register
     tensor2D<float> buffC;
 
     Matmul(bool constB = false, bool transposeB = false) : 
         constB(constB), transposeB(transposeB), buffC(32, 32) {}
 
-    // REGPP kernel overload, simpler for caller
-    template<typename REGPP>
-    void operator()(tensor2D<bfloat16> & matA,
-                    tensor2D<bfloat16> & matB,
-                    tensor2D<bfloat16> & matC,
-                    REGPP regppkernel) {
-        PP2bf16<REGPP> ppkernel(matC, regppkernel);
-        (*this)(matA, matB, ppkernel);
-    }
-
-    template<typename REGPP>
-    void operator()(tensor2D<bfloat16> & matA,
-                    tensor2D<bfloat16> & matB,
-                    tensor2D<float> & matC,
-                    REGPP regppkernel) {
-        PP2float<REGPP> ppkernel(matC, regppkernel);
-        (*this)(matA, matB, ppkernel);
-    }
-
-    // empty PP
+    // empty PP (for test purpose only, uncommon in real use case)
     void operator()(tensor2D<bfloat16> & matA,
                     tensor2D<bfloat16> & matB,
                     tensor2D<bfloat16> & matC) {
-        PP2bf16<regpp_empty> ppkernel(matC, regpp_empty());
+        PP::Store2bf16 ppkernel(matC);
         (*this)(matA, matB, ppkernel);
     }
 
     void operator()(tensor2D<bfloat16> & matA,
                     tensor2D<bfloat16> & matB,
                     tensor2D<float> & matC) {
-        PP2float<regpp_empty> ppkernel(matC, regpp_empty());
+        PP::Store2float ppkernel(matC);
         (*this)(matA, matB, ppkernel);
     }
 
-    // different ppkernel has difference runtime args
-    // which is set by caller, since only caller knows
-    // what setter methods to use for specific ppkernel
     template<typename PP>
     void operator()(tensor2D<bfloat16> & matA,
                     tensor2D<bfloat16> & matB,
                     PP ppkernel) {
+        int N = matB.dims[transposeB ? 0 : 1];
+        (*this)(matA, matB, 0, N, ppkernel);
+    }
+
+    // ppkernel is a callable which captures the runtime args
+    // by itself, so no need to pass in any post-process related
+    // runtime args through this API
+    //
+    // n0/n1 allows us for calculating only partial results, so it
+    // can be used to run on multi-cores in parallel  
+    //
+    // ppkernel will be invoked with true (m,n) with n0-offset added
+    // so ppkernel don't need to know which sub-matrix it's working on.
+    //
+    // for most ppkernels w/o runtime state, a single ppkernel can be
+    // shared among all threads.
+    //
+    // but for ppkernels doing reductions, it needs separate instance
+    // for each thread, also a post-merging process to combine the results.
+    //
+    // ppkernels are simple to write, further wrapping or structurelize only
+    // makes the design more complex, so we stop doing that.
+    template<typename PP>
+    void operator()(tensor2D<bfloat16> & matA,
+                    tensor2D<bfloat16> & _matB,
+                    int n0, int n1,
+                    PP ppkernel) {
         int M = matA.dims[0];
         int K = matA.dims[1];
-        int N = matB.dims[transposeB ? 0 : 1];
+
+        //build sub-matrix B
+        int Bd0 = transposeB ? (n1-n0) : _matB.dims[0];
+        int Bd1 = transposeB ? _matB.dims[1] : (n1-n0);
+        bfloat16 * pbase = transposeB ? (&_matB(n0, 0)):(&_matB(0, n0));
+        tensor2D<bfloat16> matB(Bd0, Bd1, pbase, _matB.stride);
+
         assert(K == matB.dims[transposeB ? 1 : 0]);
+        int N = matB.dims[transposeB ? 0 : 1];
 
         // determine blocking scheme
         int elesz = sizeof(uint16_t);
@@ -782,7 +793,7 @@ struct Matmul {
             //  - do activations
             //  - convert into bfloat16
             //  - store into C matrix
-            (ppkernel)(buffC, m, n, valid_m, valid_n);
+            (ppkernel)(buffC, m, n + n0, valid_m, valid_n);
         } while(blk_it.next());
     }
 };

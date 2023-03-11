@@ -113,6 +113,10 @@ struct tensor2D {
         capacity = 0;
     }
 
+    operator bool() {
+        return dims[0] * dims[1] > 0;
+    }
+
     tensor2D(int d0, int d1) {
         capacity = 0;
         resize(d0, d1);

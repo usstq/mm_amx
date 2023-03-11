@@ -314,20 +314,19 @@ ThreadPool thp;
 // multi-threaded matmul
 struct MatmulMT {
     std::vector<std::shared_ptr<executor_amx_bf16::Matmul>> ops;
-
-    MatmulMT(bool constB = false, bool transposeB = false) {
-        for(int i = 0; i < thp.num_threads; i++) {
-            // create op for each threads
+    bool transposeB;
+    MatmulMT(bool constB = false, bool transposeB = false) : transposeB(transposeB) {
+        for(int i = 0; i < thp.num_threads; i++)
             ops.push_back(std::make_shared<executor_amx_bf16::Matmul>(constB, transposeB));
-        }
     }
 
+    template<typename P>
     void operator()(tensor2D<bfloat16> & matA,
                     tensor2D<bfloat16> & matB,
-                    tensor2D<bfloat16> & matC) {
-        int M = matC.dims[0];
-        int N = matC.dims[1];
+                    P ppkernel) {
+        int M = matA.dims[0];
         int K = matA.dims[1];
+        int N = matB.dims[transposeB ? 0:1];
         // split along N dimension
         int work_amount = rndup(N, 32)/32;
 
@@ -335,12 +334,10 @@ struct MatmulMT {
             tileconfig_t tfg(1, 0, 8, 16, 64);
             int start, end;
             splitter(work_amount, cnt, tid, start, end);
-            int N0 = start*32;
-            int N1 = end*32;
-            tensor2D<bfloat16> subB(K, N1-N0, &matB(0, N0), matB.stride);
-            tensor2D<bfloat16> subC(M, N1-N0, &matC(0, N0), matC.stride);
+            int n0 = start*32;
+            int n1 = end*32;
             // C[:, N0:N1] = A * B[:, N0:N1]
-            (*ops[tid].get())(matA, subB, subC);
+            (*ops[tid].get())(matA, matB, n0, n1, ppkernel);
         };
         thp.Paralell_NT(kernel);
     }
@@ -354,17 +351,23 @@ void amx_MatmulMT_perf(int M, int K, int N, bool transB, int times = -1000) {
     tensor2D<bfloat16> C0(M, N);
     executor_amx_bf16::Matmul mm(true, transB);
     MatmulMT                  mmMT(true, transB);
+    executor_amx_bf16::PP::Store2bf16 pp0(C0);
+    executor_amx_bf16::PP::Store2bf16 pp(C);
 
     std::cout << __func__ << " [" << M << "," << K << "," << N << "] ";
 
-    C0=0;
-    //matmul(A, B, C0);
-    {
+    timer(times, [&](){
         tileconfig_t tfg(1, 0, 8, 16, 64);
-        mm(A, transB?BT:B, C0);
-        mmMT(A, transB?BT:B, C);
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+        mm(A, transB?BT:B, pp0);
+    },
+    double(M * N) * K * 2,
+    AMXBf16PeakGops2PerCore * 1e9);
+
+    timer(times, [&](){
+        mmMT(A, transB?BT:B, pp);
+    },
+    double(M * N) * K * 2,
+    AMXBf16PeakGops2PerCore * 1e9);
     if (C0 == C) {
         std::cout << ANSIcolor("1;32") << "Match!\n" << ANSIcolor();
         //std::cout << C << std::endl;
@@ -374,19 +377,44 @@ void amx_MatmulMT_perf(int M, int K, int N, bool transB, int times = -1000) {
         std::cout << C << std::endl;
         return;
     }
+}
+
+
+void amx_MatmulMT_BiasGelu_perf(int M, int K, int N, bool transB, int times = -1000) {
+    tensor2D<bfloat16> A(M, K);
+    tensor2D<bfloat16> B(K, N);
+    tensor2D<bfloat16> BT = B.Tr();
+    tensor2D<bfloat16> C(M, N);
+    tensor2D<bfloat16> C0(M, N);
+    executor_amx_bf16::Matmul mm(true, transB);
+    MatmulMT                  mmMT(true, transB);
+    tensor2D<float> Bias(1, N);
+    executor_amx_bf16::PP::Addbias_Gelu_Store2bf16 pp0(C0, &Bias(0,0));
+    executor_amx_bf16::PP::Addbias_Gelu_Store2bf16 pp(C, &Bias(0,0));
+
+    std::cout << __func__ << " [" << M << "," << K << "," << N << "] ";
 
     timer(times, [&](){
         tileconfig_t tfg(1, 0, 8, 16, 64);
-        mm(A, transB?BT:B, C);
+        mm(A, transB?BT:B, pp0);
     },
     double(M * N) * K * 2,
     AMXBf16PeakGops2PerCore * 1e9);
 
     timer(times, [&](){
-        mmMT(A, transB?BT:B, C);
+        mmMT(A, transB?BT:B, pp);
     },
     double(M * N) * K * 2,
     AMXBf16PeakGops2PerCore * 1e9);
+    if (C0 == C) {
+        std::cout << ANSIcolor("1;32") << "Match!\n" << ANSIcolor();
+        //std::cout << C << std::endl;
+    } else {
+        std::cout << ANSIcolor("1;31") << "Mismatch!\n" << ANSIcolor();
+        std::cout << C0 << std::endl;
+        std::cout << C << std::endl;
+        return;
+    }
 }
 
 int main(int argc, const char *argv[]) {
@@ -396,6 +424,7 @@ int main(int argc, const char *argv[]) {
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
 
     amx_MatmulMT_perf(2*901, 2560, 7680, false);
+    amx_MatmulMT_BiasGelu_perf(2*901, 2560, 7680, false);
 
     amx_FC_perf(32*28, 32*80, 10240);
     amx_FC_perf(32*28 + 1, 32*80, 10240);
