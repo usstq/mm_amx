@@ -12,6 +12,7 @@
 #include <thread>
 #include <map>
 #include <limits>
+#include <functional>
 
 //#include "thread_pool.hpp"
 #include "bf16.hpp"
@@ -221,6 +222,22 @@ struct tensor2D {
         }
         return ok;
     }
+    bool compare(const tensor2D<T> & rhs, float tolerance) {
+        float max_abs_diff = 0;
+        float max_rel_diff = 0;
+        if (dims[0] != rhs.dims[0] || dims[1] != rhs.dims[1])
+            return false;
+        for(int i0=0; i0<dims[0]; i0++)
+        for(int i1=0; i1<dims[1]; i1++) {
+            auto diff = std::fabs((*this)(i0,i1) - rhs(i0,i1));
+            auto rel_diff = diff/std::fabs((*this)(i0,i1));
+            max_abs_diff = std::max(max_abs_diff, diff);
+            if (std::fabs((*this)(i0,i1) > 0) && diff > 0)
+                max_rel_diff = std::max(max_rel_diff, rel_diff);
+        }
+        std::cout << "max_abs_diff=" << max_abs_diff << " max_rel_diff=" << max_rel_diff;
+        return tolerance > max_abs_diff;
+    }
     friend std::ostream& operator<<(std::ostream& out, const tensor2D<T>& obj) {
         int i0;
         auto showline = [&](int i) {
@@ -243,7 +260,13 @@ struct tensor2D {
     }
 };
 
-void matmul(tensor2D<bfloat16> & A, tensor2D<bfloat16> & B, tensor2D<bfloat16> & C) {
+using func_act = std::function<float(float)>;
+
+void matmul(tensor2D<bfloat16> & A,
+            tensor2D<bfloat16> & B,
+            tensor2D<bfloat16> & C,
+            float * bias = nullptr,
+            func_act act = func_act()) {
     int M = C.dims[0];
     int N = C.dims[1];
     int K = A.dims[1];
@@ -264,6 +287,12 @@ void matmul(tensor2D<bfloat16> & A, tensor2D<bfloat16> & B, tensor2D<bfloat16> &
             }
             for(; k < K; k++) {
                 sum += static_cast<float>(A(m,k)) * static_cast<float>(B(k,n));
+            }
+            if (bias) {
+                sum += bias[n];
+            }
+            if (act) {
+                sum = act(sum);
             }
             C(m,n) = sum;
         }

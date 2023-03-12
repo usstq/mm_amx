@@ -557,8 +557,8 @@ namespace PP {
             auto * psrc = &buffC(0,0);
             int8_t * pdst = reinterpret_cast<int8_t*>(&(C(m, n)));
             int stride = C.stride;
-            auto bias0 = _mm512_loadu_ps(bias);
-            auto bias1 = _mm512_loadu_ps(bias + 16);
+            auto bias0 = _mm512_loadu_ps(bias + n);
+            auto bias1 = _mm512_loadu_ps(bias + n + 16);
             __mmask32 k = _cvtu32_mask32(0xFFFFFFFF >> (32-valid_n));
             for(int i = 0; i < valid_m; i ++) {
                 auto r0 = _mm512_loadu_ps(psrc);
@@ -585,8 +585,8 @@ namespace PP {
             auto * psrc = &buffC(0,0);
             int8_t * pdst = reinterpret_cast<int8_t*>(&(C(m, n)));
             int stride = C.stride;
-            auto bias0 = _mm512_loadu_ps(bias);
-            auto bias1 = _mm512_loadu_ps(bias + 16);
+            auto bias0 = _mm512_loadu_ps(bias + n);
+            auto bias1 = _mm512_loadu_ps(bias + n + 16);
             __mmask32 k = _cvtu32_mask32(0xFFFFFFFF >> (32-valid_n));
             for(int i = 0; i < valid_m; i ++) {
                 auto r0 = _mm512_loadu_ps(psrc);

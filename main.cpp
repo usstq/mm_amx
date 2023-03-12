@@ -380,15 +380,44 @@ void amx_MatmulMT_perf(int M, int K, int N, bool transB, int times = -1000) {
 }
 
 
+void amx_MatmulMT_BiasGelu_acc(int M, int K, int N, bool transB) {
+    tensor2D<bfloat16> A(M, K);
+    tensor2D<bfloat16> B(K, N);
+    tensor2D<bfloat16> BT = B.Tr();
+    tensor2D<bfloat16> C(M, N);
+    tensor2D<bfloat16> C0(M, N);
+    tensor2D<float> Bias(1, N);
+    executor_amx_bf16::Matmul mm(true, transB);
+    executor_amx_bf16::PP::Addbias_Gelu_Store2bf16 pp0(C, &Bias(0,0));
+
+    std::cout << __func__ << " [" << M << "," << K << "," << N << "] ";
+    C0 = 0;
+    matmul(A, B, C0, &Bias(0,0), [](float x){
+        return x*0.5*(1 + std::erf(x/std::sqrt(2)));
+    });
+    {
+        tileconfig_t tfg(1, 0, 8, 16, 64);
+        mm(A, transB?BT:B, pp0);
+    }
+
+    if (C0.compare(C, 0.001f)) {
+        std::cout << ANSIcolor("1;32") << "Match!\n" << ANSIcolor();
+    } else {
+        std::cout << C0 << std::endl;
+        std::cout << C << std::endl;
+        std::cout << ANSIcolor("1;31") << "Mismatch!\n" << ANSIcolor();
+    }
+}
+
 void amx_MatmulMT_BiasGelu_perf(int M, int K, int N, bool transB, int times = -1000) {
     tensor2D<bfloat16> A(M, K);
     tensor2D<bfloat16> B(K, N);
     tensor2D<bfloat16> BT = B.Tr();
     tensor2D<bfloat16> C(M, N);
     tensor2D<bfloat16> C0(M, N);
+    tensor2D<float> Bias(1, N);
     executor_amx_bf16::Matmul mm(true, transB);
     MatmulMT                  mmMT(true, transB);
-    tensor2D<float> Bias(1, N);
     executor_amx_bf16::PP::Addbias_Gelu_Store2bf16 pp0(C0, &Bias(0,0));
     executor_amx_bf16::PP::Addbias_Gelu_Store2bf16 pp(C, &Bias(0,0));
 
@@ -422,6 +451,8 @@ int main(int argc, const char *argv[]) {
     thp.Start();
 
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
+
+    amx_MatmulMT_BiasGelu_acc(88, 77, 66, false);
 
     amx_MatmulMT_perf(2*901, 2560, 7680, false);
     amx_MatmulMT_BiasGelu_perf(2*901, 2560, 7680, false);
