@@ -2,8 +2,56 @@
 
 #include "misc.hpp"
 
-namespace executor_amx_bf16
+namespace amx_bf16
 {
+struct tileconfig_t {
+    uint8_t palette_id;
+    uint8_t startRow;
+    uint8_t reserved[14];
+    uint16_t cols[16];
+    uint8_t rows[16];
+    tileconfig_t() = default;
+    tileconfig_t(int palette, int _startRow, int numTiles, int _rows, int columnsBytes) {
+        palette_id = palette;
+        startRow = _startRow;
+        for(int i = 0; i < 14; i++) {
+            reserved[i] = 0;
+        }
+        for(int i = 0; i < numTiles; i++) {
+            cols[i] = columnsBytes;
+            rows[i] = _rows;
+        }
+        for(int i = numTiles; i < 16; i++) {
+            cols[i] = 0;
+            rows[i] = 0;
+        }
+        load();
+    }
+    ~tileconfig_t() {
+        _tile_release();
+    }
+    void load() {
+        //std::cout << "\ttile load config ... " << std::flush;
+        _tile_loadconfig(this);
+        //std::cout << *this << std::flush << std::endl;
+    }
+    void store() {
+        _tile_storeconfig(this);
+    }
+    friend std::ostream& operator<<(std::ostream& out, const tileconfig_t& cfg) {
+        out << " palette_id=" << static_cast<int>(cfg.palette_id);
+        out << " startRow=" << static_cast<int>(cfg.startRow);
+        out << " row x colsb=(";
+        for (int i = 0; i < 16;i++) {
+            if (cfg.rows[i] == 0 && cfg.cols[i] == 0)
+                continue;
+            if (i > 0) out << ",";
+            out << static_cast<int>(cfg.rows[i]) << "x" << static_cast<int>(cfg.cols[i]);
+        }
+        out << ")";
+        return out;
+    }
+} __attribute__ ((__packed__));
 
 // BlockIterator: kernels can use this to
 //   - quickly go to some sequential index
@@ -709,7 +757,10 @@ struct Matmul {
         int L2 = 2048*1024; // 2MB
         int slice_size = 32*K*elesz;
         int mc = L2/slice_size - 1;
-        assert(mc > 0);
+        
+        // if 1 32xK slice cannot fit L2, use 1 slice at least
+        if (mc == 0)
+            mc = 1;
 
         auto dmax = std::numeric_limits<int>::max();
         BlockIterator::blkloop bloops[] = {
@@ -739,6 +790,7 @@ struct Matmul {
             }
         }
         // main loop
+        tileconfig_t tfg(1, 0, 8, 16, 64);
         do
         {
             int m = blk_it.m;
@@ -773,14 +825,15 @@ struct Matmul {
                 _tile_stored(tC01, &buffC(0,16), buffC.stride);
             } else {
                 // 2x2
+                _tile_loadd(tA0, pA0 + 0, strideA);
                 for (int k = 0; k < K; k += 32) {
-                    _tile_loadd(tA0, pA0 + k, strideA);
                     _tile_loadd(tB0, pB, 64); pB += (16*32);
                     _tile_dpbf16ps(tC00, tA0, tB0);
                     _tile_loadd(tA1, pA1 + k, strideA);
                     _tile_dpbf16ps(tC10, tA1, tB0);
                     _tile_loadd(tB1, pB, 64); pB += (16*32);
                     _tile_dpbf16ps(tC01, tA0, tB1);
+                    _tile_loadd(tA0, pA0 + k + 32, strideA);    // balance load & dp. load next
                     _tile_dpbf16ps(tC11, tA1, tB1);
                 }
                 _tile_stored(tC00, &buffC(0,0), buffC.stride);
@@ -1071,4 +1124,4 @@ void Matmul(tensor2D<bfloat16> & matA,
     // loop according to blk
 }
 #endif
-} // namespace executor_amx_bf16
+} // namespace amx_bf16

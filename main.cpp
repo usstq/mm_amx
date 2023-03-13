@@ -51,7 +51,7 @@ int amx_unit_test_perf() {
     tensor2D<bfloat16> A(M, K);
     tensor2D<bfloat16> BT(N, K);
     tensor2D<bfloat16> C(M, N);
-    tileconfig_t tfg(1, 0, 8, 16, 64);
+    amx_bf16::tileconfig_t tfg(1, 0, 8, 16, 64);
 
     std::cout << "A & B in L1D (should give theoratical peak Gflops)\n\t";
     timer(-100,[&](){
@@ -186,9 +186,8 @@ void amx_FC_acc(int M, int K, int N) {
     tensor2D<bfloat16> B(K, N);
     tensor2D<bfloat16> C(M, N);
     tensor2D<bfloat16> C0(M, N);
-    executor_amx_bf16::Matmul fc(true);
+    amx_bf16::Matmul fc(true);
 
-    tileconfig_t tfg(1, 0, 8, 16, 64);
     fc(A, B, C);
 
     C0=0;
@@ -209,9 +208,8 @@ void amx_FC_perf(int M, int K, int N, int times = -1000) {
     tensor2D<bfloat16> B(K, N);
     tensor2D<bfloat16> C(M, N);
     tensor2D<bfloat16> C0(M, N);
-    executor_amx_bf16::Matmul mm(true);
+    amx_bf16::Matmul mm(true);
 
-    tileconfig_t tfg(1, 0, 8, 16, 64);
     std::cout << __func__ << " [" << M << "," << K << "," << N << "] ";
     timer(times, [&](){
         mm(A, B, C);
@@ -226,9 +224,8 @@ void amx_Matmul_perf(int M, int K, int N, bool transB, int times = -1000) {
     tensor2D<bfloat16> BT = B.Tr();
     tensor2D<bfloat16> C(M, N);
     tensor2D<bfloat16> C0(M, N);
-    executor_amx_bf16::Matmul mm(false, transB);
+    amx_bf16::Matmul mm(false, transB);
 
-    tileconfig_t tfg(1, 0, 8, 16, 64);
     std::cout << __func__ << " [" << M << "," << K << "," << N << "] ";
 
     C0=0;
@@ -257,7 +254,7 @@ void amx_unit_test_gemAvB(int M, int K, int times = -1000) {
     tensor2D<bfloat16> B0(K, 1);
     tensor2D<bfloat16> C0(M, 1);
     tensor2D<bfloat16> C(1, M);
-    executor_amx_bf16::GemAvB gemAvB;
+    amx_bf16::GemAvB gemAvB;
 
     // same B, different layout
     std::cout << __func__ << " [" << M << "," << K << "," << N << "] ";
@@ -285,8 +282,8 @@ void amx_unit_test_gemAvB(int M, int K, int times = -1000) {
 
 void test_blk_loops() {
     int max = 9999;
-    executor_amx_bf16::BlockIterator loc;
-    executor_amx_bf16::BlockIterator::blkloop bloops[] = {
+    amx_bf16::BlockIterator loc;
+    amx_bf16::BlockIterator::blkloop bloops[] = {
         {10,32,0},{max,0,32},{max,320,0}
     };
     //loc.reset(bloops, 896,10240);
@@ -313,11 +310,11 @@ ThreadPool thp;
 
 // multi-threaded matmul
 struct MatmulMT {
-    std::vector<std::shared_ptr<executor_amx_bf16::Matmul>> ops;
+    std::vector<std::shared_ptr<amx_bf16::Matmul>> ops;
     bool transposeB;
     MatmulMT(bool constB = false, bool transposeB = false) : transposeB(transposeB) {
         for(int i = 0; i < thp.num_threads; i++)
-            ops.push_back(std::make_shared<executor_amx_bf16::Matmul>(constB, transposeB));
+            ops.push_back(std::make_shared<amx_bf16::Matmul>(constB, transposeB));
     }
 
     template<typename P>
@@ -331,7 +328,6 @@ struct MatmulMT {
         int work_amount = rndup(N, 32)/32;
 
         auto kernel = [&](int tid, int cnt) {
-            tileconfig_t tfg(1, 0, 8, 16, 64);
             int start, end;
             splitter(work_amount, cnt, tid, start, end);
             int n0 = start*32;
@@ -349,15 +345,14 @@ void amx_MatmulMT_perf(int M, int K, int N, bool transB, int times = -1000) {
     tensor2D<bfloat16> BT = B.Tr();
     tensor2D<bfloat16> C(M, N);
     tensor2D<bfloat16> C0(M, N);
-    executor_amx_bf16::Matmul mm(true, transB);
+    amx_bf16::Matmul mm(true, transB);
     MatmulMT                  mmMT(true, transB);
-    executor_amx_bf16::PP::Store2bf16 pp0(C0);
-    executor_amx_bf16::PP::Store2bf16 pp(C);
+    amx_bf16::PP::Store2bf16 pp0(C0);
+    amx_bf16::PP::Store2bf16 pp(C);
 
     std::cout << __func__ << " [" << M << "," << K << "," << N << "] ";
 
     timer(times, [&](){
-        tileconfig_t tfg(1, 0, 8, 16, 64);
         mm(A, transB?BT:B, pp0);
     },
     double(M * N) * K * 2,
@@ -387,8 +382,8 @@ void amx_MatmulMT_BiasGelu_acc(int M, int K, int N, bool transB) {
     tensor2D<bfloat16> C(M, N);
     tensor2D<bfloat16> C0(M, N);
     tensor2D<float> Bias(1, N);
-    executor_amx_bf16::Matmul mm(true, transB);
-    executor_amx_bf16::PP::Addbias_Gelu_Store2bf16 pp0(C, &Bias(0,0));
+    amx_bf16::Matmul mm(true, transB);
+    amx_bf16::PP::Addbias_Gelu_Store2bf16 pp0(C, &Bias(0,0));
 
     std::cout << __func__ << " [" << M << "," << K << "," << N << "] ";
     C0 = 0;
@@ -396,7 +391,6 @@ void amx_MatmulMT_BiasGelu_acc(int M, int K, int N, bool transB) {
         return x*0.5*(1 + std::erf(x/std::sqrt(2)));
     });
     {
-        tileconfig_t tfg(1, 0, 8, 16, 64);
         mm(A, transB?BT:B, pp0);
     }
 
@@ -416,15 +410,14 @@ void amx_MatmulMT_BiasGelu_perf(int M, int K, int N, bool transB, int times = -1
     tensor2D<bfloat16> C(M, N);
     tensor2D<bfloat16> C0(M, N);
     tensor2D<float> Bias(1, N);
-    executor_amx_bf16::Matmul mm(true, transB);
+    amx_bf16::Matmul mm(true, transB);
     MatmulMT                  mmMT(true, transB);
-    executor_amx_bf16::PP::Addbias_Gelu_Store2bf16 pp0(C0, &Bias(0,0));
-    executor_amx_bf16::PP::Addbias_Gelu_Store2bf16 pp(C, &Bias(0,0));
+    amx_bf16::PP::Addbias_Gelu_Store2bf16 pp0(C0, &Bias(0,0));
+    amx_bf16::PP::Addbias_Gelu_Store2bf16 pp(C, &Bias(0,0));
 
     std::cout << __func__ << " [" << M << "," << K << "," << N << "] ";
 
     timer(times, [&](){
-        tileconfig_t tfg(1, 0, 8, 16, 64);
         mm(A, transB?BT:B, pp0);
     },
     double(M * N) * K * 2,
@@ -451,6 +444,8 @@ int main(int argc, const char *argv[]) {
     thp.Start();
 
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
+
+    //amx_FC_perf(32, 5120, 32, -1000); return 0;
 
     amx_MatmulMT_BiasGelu_acc(88, 77, 66, false);
 
