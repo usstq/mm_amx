@@ -332,23 +332,24 @@ namespace functional {
         auto * dst = reinterpret_cast<uint32_t*>(_dst);
         __m512i r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, ra, rb, rc, rd, re, rf;
         auto * pA = reinterpret_cast<const uint8_t*>(src);
-        __mmask16 k = _cvtu32_mask32(0xFFFFFFFF >> (32-valid_n));
-        r0 = _mm512_maskz_loadu_epi16 (k, pA);
-        r1 = _mm512_maskz_loadu_epi16 (k, pA + stride);
-        r2 = _mm512_maskz_loadu_epi16 (k, pA + 2*stride);
-        r3 = _mm512_maskz_loadu_epi16 (k, pA + 3*stride);
-        r4 = _mm512_maskz_loadu_epi16 (k, pA + 4*stride);
-        r5 = _mm512_maskz_loadu_epi16 (k, pA + 5*stride);
-        r6 = _mm512_maskz_loadu_epi16 (k, pA + 6*stride);
-        r7 = _mm512_maskz_loadu_epi16 (k, pA + 7*stride);
-        r8 = _mm512_maskz_loadu_epi16 (k, pA + 8*stride);
-        r9 = _mm512_maskz_loadu_epi16 (k, pA + 9*stride);
-        ra = _mm512_maskz_loadu_epi16 (k, pA + 10*stride);
-        rb = _mm512_maskz_loadu_epi16 (k, pA + 11*stride);
-        rc = _mm512_maskz_loadu_epi16 (k, pA + 12*stride);
-        rd = _mm512_maskz_loadu_epi16 (k, pA + 13*stride);
-        re = _mm512_maskz_loadu_epi16 (k, pA + 14*stride);
-        rf = _mm512_maskz_loadu_epi16 (k, pA + 15*stride);
+        uint32_t mask_value = 0xFFFFFFFF >> (32-valid_n);
+        __mmask32 mask = _cvtu32_mask32(mask_value);
+        r0 = _mm512_maskz_loadu_epi16 (mask, pA);
+        r1 = _mm512_maskz_loadu_epi16 (mask, pA + stride);
+        r2 = _mm512_maskz_loadu_epi16 (mask, pA + 2*stride);
+        r3 = _mm512_maskz_loadu_epi16 (mask, pA + 3*stride);
+        r4 = _mm512_maskz_loadu_epi16 (mask, pA + 4*stride);
+        r5 = _mm512_maskz_loadu_epi16 (mask, pA + 5*stride);
+        r6 = _mm512_maskz_loadu_epi16 (mask, pA + 6*stride);
+        r7 = _mm512_maskz_loadu_epi16 (mask, pA + 7*stride);
+        r8 = _mm512_maskz_loadu_epi16 (mask, pA + 8*stride);
+        r9 = _mm512_maskz_loadu_epi16 (mask, pA + 9*stride);
+        ra = _mm512_maskz_loadu_epi16 (mask, pA + 10*stride);
+        rb = _mm512_maskz_loadu_epi16 (mask, pA + 11*stride);
+        rc = _mm512_maskz_loadu_epi16 (mask, pA + 12*stride);
+        rd = _mm512_maskz_loadu_epi16 (mask, pA + 13*stride);
+        re = _mm512_maskz_loadu_epi16 (mask, pA + 14*stride);
+        rf = _mm512_maskz_loadu_epi16 (mask, pA + 15*stride);
         transpose_m512i_16x16(r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, ra, rb, rc, rd, re, rf);
         _mm512_storeu_epi32(dst, r0);
         _mm512_storeu_epi32(dst + 16, r1);
@@ -518,7 +519,7 @@ namespace functional {
                     auto * src0 = &matB(n, 0);
                     auto * src1 = &matB(n + 16, 0);
                     int k;
-                    for(k = 0; k + 32 <= K; k+=32, src0+=32, src1+=32) {
+                    for(k = 0; (k + 32) <= K; k+=32, src0+=32, src1+=32) {
                         // B0 (16x32) => transpose+repack as 32x16 => 16x16x2
                         functional::transpose_epi32_16x16(dst, src0, matB.stride);
                         dst += (16*32);
@@ -755,18 +756,27 @@ struct Matmul {
         // determine blocking scheme
         int elesz = sizeof(uint16_t);
         int L2 = 2048*1024; // 2MB
-        int slice_size = 32*K*elesz;
+        int slice_size = 32*rndup(K, 32)*elesz;
         int mc = L2/slice_size - 1;
         
         // if 1 32xK slice cannot fit L2, use 1 slice at least
         if (mc == 0)
             mc = 1;
 
+        int L1 = 48*1024; // 48K
+        int mcL1 = L1/slice_size - 1;
+
+        //std::cout << "mc=" << mc << std::endl;
+        //if (mcL1 > 2) {
+        //mc = 2;
+        //}
+
+
         auto dmax = std::numeric_limits<int>::max();
-        BlockIterator::blkloop bloops[] = {
-            {mc,32,0}, {dmax,0,32}, {dmax,mc*32,0}
-        };
+        BlockIterator::blkloop bloops[] = {{mc,32,0}, {dmax,0,32}, {dmax,mc*32,0}};
         blk_it.reset(bloops, 3, M, N);
+        //BlockIterator::blkloop bloops[] = {{2,32,0}, {2,0,32}, {dmax, 64, 0}, {dmax, 0, 64}};
+        //blk_it.reset(bloops, 4, M, N);
 
         // for non-constB, internalB is updated every time
         // for constB, internalB is updated once

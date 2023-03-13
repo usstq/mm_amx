@@ -445,7 +445,11 @@ int main(int argc, const char *argv[]) {
 
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
 
+    amx_Matmul_perf(32, 120, 5, true); return 0;
+    //amx_Matmul_perf(32, 18, 5, true); return 0;
+
     //amx_FC_perf(32, 5120, 32, -1000); return 0;
+    //amx_Matmul_perf(928, 96, 928, true); return 0;
 
     amx_MatmulMT_BiasGelu_acc(88, 77, 66, false);
 
