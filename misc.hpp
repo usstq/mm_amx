@@ -48,6 +48,10 @@ const double AMXBf16Freq2GHz = 3;//2.32;
 const double AMXBf16PeakGopsPerCore = AMXBf16OpsPerCycleCore * AMXBf16FreqGHz;
 const double AMXBf16PeakGops2PerCore = AMXBf16OpsPerCycleCore * AMXBf16Freq2GHz;
 
+const double AVX512FreqGHz = 3;//2.32;
+const double FP32OpsPerCycleCore = 64; // 2 AVX512_FMAs/cycle/core = 2*(16+16) Ops/cycle/core
+const double FP32PeakGopsPerCore = FP32OpsPerCycleCore * AVX512FreqGHz;
+
 //===============================================================
 using ov::bfloat16;
 
@@ -262,9 +266,10 @@ struct tensor2D {
 
 using func_act = std::function<float(float)>;
 
-void matmul(tensor2D<bfloat16> & A,
-            tensor2D<bfloat16> & B,
-            tensor2D<bfloat16> & C,
+template<typename T>
+void matmul(tensor2D<T> & A,
+            tensor2D<T> & B,
+            tensor2D<T> & C,
             float * bias = nullptr,
             func_act act = func_act()) {
     int M = C.dims[0];

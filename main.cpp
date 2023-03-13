@@ -282,8 +282,8 @@ void amx_unit_test_gemAvB(int M, int K, int times = -1000) {
 
 void test_blk_loops() {
     int max = 9999;
-    amx_bf16::BlockIterator loc;
-    amx_bf16::BlockIterator::blkloop bloops[] = {
+    BlockIterator loc;
+    BlockIterator::blkloop bloops[] = {
         {10,32,0},{max,0,32},{max,320,0}
     };
     //loc.reset(bloops, 896,10240);
@@ -439,13 +439,47 @@ void amx_MatmulMT_BiasGelu_perf(int M, int K, int N, bool transB, int times = -1
     }
 }
 
+
+
+void amx_Matmul_perf_float(int M, int K, int N, int times = -1000) {
+    tensor2D<float> A(M, K);
+    tensor2D<float> B(K, N);
+    tensor2D<float> C(M, N);
+    tensor2D<float> C0(M, N);
+    tensor2D<float> Bias(1, N);
+    avx512::Matmul<avx512::RELU> mm;
+    std::cout << __func__ << " [" << M << "," << K << "," << N << "] ";
+
+    C0=0;
+    matmul(A, B, C0, &Bias(0,0), [](float x){
+        return std::max(x, 0.0f);
+    });
+    mm(A, B, C, &Bias(0,0));
+    if (C0 == C) {
+        std::cout << ANSIcolor("1;32") << "Match!\n" << ANSIcolor();
+        //std::cout << C << std::endl;
+    } else {
+        std::cout << ANSIcolor("1;31") << "Mismatch!\n" << ANSIcolor();
+        std::cout << C0 << std::endl;
+        std::cout << C << std::endl;
+    }
+
+    timer(times, [&](){
+        mm(A, B, C, &Bias(0,0));
+    },
+    double(M * N) * K * 2,
+    FP32PeakGopsPerCore * 1e9);
+}
+
 int main(int argc, const char *argv[]) {
     timer.set_app(argv[0]);
     thp.Start();
 
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
 
-    amx_Matmul_perf(32, 120, 5, true); return 0;
+    amx_Matmul_perf_float(16, 256, 256);
+    amx_Matmul_perf_float(224, 256, 256);
+    //amx_Matmul_perf(32, 120, 5, true); return 0;
     //amx_Matmul_perf(32, 18, 5, true); return 0;
 
     //amx_FC_perf(32, 5120, 32, -1000); return 0;
