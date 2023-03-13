@@ -1,89 +1,197 @@
 #pragma once
 
+/*
+https://www.intel.com/content/www/us/en/develop/documentation/cpp-compiler-developer-guide-and-reference/top/compiler-reference/intrinsics/intrinsics-for-amx-instructions/intrinsics-for-amx-tile-instructions/tile-loadconfig.html
+
+void _tile_loadconfig (const void * mem_addr)
+	format of memory payload. each field is a byte.
+		 0: palette_id
+		 1: startRow (8b)
+	 2-15: reserved (must be zero)
+	16-17: tile0.colsb -- bytes_per_row
+	18-19: tile1.colsb
+	20-21: tile2.colsb
+			...
+	46-47: tile15.colsb
+		48: tile0.rows
+		49: tile1.rows
+		50: tile2.rows
+			 ...
+		63: tile15.rows
+
+void _tile_storeconfig (void * mem_addr)
+    Stores the current tile configuration to a 64-byte memory location specified by "mem_addr".
+    The tile configuration format is specified below, and includes the tile type pallette,
+    the number of bytes per row, and the number of rows. If tiles are not configured,
+    all zeroes will be stored to memory.
+*/
+
+/*
+void _tile_loadd (__tile dst, const void * base, int stride)
+    Load tile rows from memory specifieid by "base" address and "stride"
+    into destination tile "dst" using the tile configuration previously
+    configured via "_tile_loadconfig".
+    Operation:
+        start := tileconfig.startRow
+        IF start == 0 // not restarting, zero incoming state
+            tilezero(dst)
+        FI
+        nbytes := dst.colsb
+        DO WHILE start < dst.rows
+            memptr := base + start * stride
+            write_row_and_zero(dst, start, read_memory(memptr, nbytes), nbytes)
+            start := start + 1
+        OD
+        zero_upper_rows(dst, dst.rows)
+        zero_tileconfig_start()
+
+void _tile_stored (__tile src, void * base, int stride)
+    Store the tile specified by "src" to memory specifieid by "base" address and "stride"
+    using the tile configuration previously configured via "_tile_loadconfig".
+    Operation:
+        start := tileconfig.startRow
+        DO WHILE start < src.rows
+            memptr := base + start * stride
+            write_memory(memptr, src.colsb, src.row[start])
+            start := start + 1
+        OD
+        zero_tileconfig_start()
+
+void _tile_stream_loadd (__tile dst, const void * base, int stride)
+    Load tile rows from memory specifieid by "base" address and "stride"
+    into destination tile "dst" using the tile configuration previously
+    configured via "_tile_loadconfig". This intrinsic provides a hint to
+    the implementation that the data will likely not be reused in the near
+    future and the data caching can be optimized accordingly.
+
+void _tile_zero (__tile tdest)
+    Zero the tile specified by "tdest".
+    Operation:
+        nbytes := palette_table[tileconfig.palette_id].bytes_per_row
+        FOR i := 0 TO palette_table[tileconfig.palette_id].max_rows-1
+            FOR j := 0 TO nbytes-1
+                tdest.row[i].byte[j] := 0
+            ENDFOR
+        ENDFOR
+	
+
+void _tile_release ()
+    Release the tile configuration to return to the init state, which releases all storage it currently holds.
+
+
+Instruction Throughput Latency
+LDTILECFG                204
+STTILECFG                19
+TILETRELEASE             13
+TDP / *          16      52
+TILELOADD         8      45
+TILELOADDT1      33      48
+TILESTORED       16
+TILEZERO          0      16
+
+Due to the high latency of the LDTILECFG instruction we recommend issuing a single pair
+of LDTILECFG and TILERELEASE operations per Intel AMX-based DL layer implementation.
+
+
+• A-tiles can have between 1-16 rows and 1-MAX_TILE_K columns.
+• B-tiles can have between 1-MAX_TILE_K rows and 1–16 columns.
+• C-tiles can have between 1-16 rows and 1–16 columns.
+
+MAX_TILE_K=64/sizeof(type_t)
+          = 32 BF16
+          = 64 INT8
+
+A tiles and B tiles contain data of type_t, which can be (u)int8 or bfloat16.
+• C tiles contain data of type res_type_t:
+• int32 if type_t=(u)int8
+• float if type_t=bfloat16
+
+Like the Intel® DL Boost use case, the B matrix must undergo a re-layout before it can be used within the
+corresponding Intel AMX multiply instruction.
+
+BF16    C_float_16x16 = A_bfloat16_16x32 * B_bfloat16_32x16 (re-layout as 16x16x2 Ab2a)
+INT8    C_int32_16x16 = A_int8_16x64 * B_int8_64x16 (re-layout as 16x16x4 Ab4a)
+
+
+
+FC:
+    (2,1~900,2560)x(2560,7680)
+    (2,1~900,2560)x(2560,2560)
+    (2,1~900,2560)x(2560,10240) GELU
+    (2,1~900,10240)x(10240,2560)
+
+matmul:
+    (1~990,80) * (80,1~990)
+    (1~990,1~990) * (1~990,80)
+
+    // (2,32,1~990,80)*(2,32,80,1~990)
+    // (2,32,1~990,1~990)(2,32,1~990,80)
+*/
+
 #include "misc.hpp"
+#include "block_iter.hpp"
+#include "tensor2D.hpp"
 
+#ifdef _WIN32
+#include <intrin.h>
+#else
+#include <x86intrin.h>
+#endif
 
-// BlockIterator: kernels can use this to
-//   - quickly go to some sequential index
-//   - move to next location
+//===============================================================
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE         /* See feature_test_macros(7) */
+#endif
+#include <unistd.h>
+#include <sys/syscall.h>   /* For SYS_xxx definitions */
 
-struct BlockIterator {
-    struct blkloop {
-        int cnt;
-        int sz_m;
-        int sz_n;
-    };
+#define XFEATURE_XTILECFG 17
+#define XFEATURE_XTILEDATA 18
+#define XFEATURE_MASK_XTILECFG (1 << XFEATURE_XTILECFG)
+#define XFEATURE_MASK_XTILEDATA (1 << XFEATURE_XTILEDATA)
+#define XFEATURE_MASK_XTILE (XFEATURE_MASK_XTILECFG | XFEATURE_MASK_XTILEDATA)
+#define ARCH_GET_XCOMP_PERM 0x1022
+#define ARCH_REQ_XCOMP_PERM 0x1023
 
-    int idx[16];  // index at each level of blocks
-    const blkloop *bloops;
-    int num_bloops;
+inline bool initXTILE() {
+    unsigned long bitmask = 0;
+    long status = syscall(SYS_arch_prctl, ARCH_GET_XCOMP_PERM, &bitmask);
+    if (0 != status) return false;
+    if (bitmask & XFEATURE_MASK_XTILEDATA) return true;
 
-    int M;
-    int N;
+    status = syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA);
+    if (0 != status)
+        return false; // XFEATURE_XTILEDATA setup is failed, TMUL usage is not allowed
+    status = syscall(SYS_arch_prctl, ARCH_GET_XCOMP_PERM, &bitmask);
 
-    int m;
-    int n;
-    int seq;
-    bool reach_end;
+    // XFEATURE_XTILEDATA setup is failed, can't use TMUL
+    if (0 != status || !(bitmask & XFEATURE_MASK_XTILEDATA)) return false;
 
-    BlockIterator() = default;
+    // XFEATURE_XTILEDATA set successfully, TMUL usage is allowed
+    return true;
+}
+//===============================================================
 
-    void reset(const blkloop * _bloops, int _num_bloops, int _M, int _N) {
-        assert(_num_bloops <= 16);
-        bloops = _bloops;
-        num_bloops = _num_bloops;
-        M = _M;
-        N = _N;
-        // reset coordinates to sequence index
-        for(int i = 0; i < num_bloops; i++)
-            idx[i] = 0;
-        seq = 0;
-        m = 0;
-        n = 0;
-        reach_end = false;
+#include "bf16.hpp"
+
+using ov::bfloat16;
+
+namespace amx_bf16 {
+
+template<typename T, int tile>
+void tshow() {
+    if (std::is_same<bfloat16,T>::value) {
+        bfloat16 data[16*32];
+        _tile_stored(tile, data, 64);
+        show(data, 16, 32);
     }
-    // update coordinates
-    bool next() {
-        if (reach_end)
-            return false;
-        int carry_on = 1;
-        for(int i = 0; i < num_bloops; i++) {
-            const auto & bl = bloops[i];
-            if (idx[i] == (bl.cnt - 1)) {
-                // carry-on on block boundary, no contribution to m/n
-                m -= idx[i] * bl.sz_m;
-                n -= idx[i] * bl.sz_n;
-                idx[i] = 0;
-            } else {
-                // carry-on on matrix boundary
-                if (m + bl.sz_m >= M || n + bl.sz_n >= N) {
-                    m -= idx[i] * bl.sz_m;
-                    n -= idx[i] * bl.sz_n;
-                    idx[i] = 0;
-                } else {
-                    idx[i]++;
-                    m += bl.sz_m;
-                    n += bl.sz_n;
-                    carry_on = 0;
-                    break;
-                }
-            }
-        }
-        seq++;
-        if (carry_on) {
-            // after reach_end
-            //  - seq has the number of blocks
-            //  - idx are all zeros
-            reach_end = true;
-            return false;
-        }
-        return true;
+    if (std::is_same<float,T>::value) {
+        float data[16*16];
+        _tile_stored(tile, data, 64);
+        show(data, 16, 16);
     }
-};
+}
 
-
-namespace amx_bf16
-{
 struct tileconfig_t {
     uint8_t palette_id;
     uint8_t startRow;
@@ -1138,174 +1246,3 @@ void Matmul(tensor2D<bfloat16> & matA,
 #endif
 } // namespace amx_bf16
 
-
-namespace avx512 {
-/*
- numactl -m 0 -C 12 ./benchdnn --ip --reset --mode=p --allow-enum-tags-only=0 --engine=cpu --dir=FWD_B \
- --cfg=f32 --stag=ab --wtag=AB16b64a --dtag=ab mb12ic4864oc256
-
-numactl -m 0 -C 12 ./benchdnn --ip --reset --mode=p --allow-enum-tags-only=0 --engine=cpu --dir=FWD_B --cfg=f32 --stag=ab --wtag=AB16b64a --dtag=ab mb1ic160oc256
-Output template: perf,%engine%,%impl%,%name%,%prb%,%Gops%,%-time%,%-Gflops%,%0time%,%0Gflops%
-perf,cpu,brgemm:avx512_core,,--ip --allow-enum-tags-only=false --mode=P --stag=ab --wtag=AB16b64a --dtag=ab mb1ic160oc256,8.192e-05,0.0012207,67.1089,0.00159982,51.2057
-tests:1 passed:1 skipped:0 mistrusted:0 unimplemented:0 invalid_arguments:0 failed:0 listed:0
-total perf: min(ms):0.0012207 avg(ms):0.00159982
-*/
-
-enum Activation {
-    RELU,
-};
-
-template<Activation act>
-struct Matmul {
-    BlockIterator blk_it;
-    tensor2D<float> scratch;
-    Matmul() {};
-
-    void operator()(tensor2D<float> & matA,
-                    tensor2D<float> & matB,
-                    tensor2D<float> & matC,
-                    float * bias) {
-        int M = matA.dims[0];
-        int K = matA.dims[1];
-        assert(K == matB.dims[0]);
-        int N = matB.dims[1];
-
-        // determine blocking scheme
-        int elesz = sizeof(uint16_t);
-        int L2 = 2048*1024; // 2MB
-        int slice_size = 6*rndup(K, 6)*elesz;
-        int mc = L2/slice_size - 1;
-
-        // if 1 32xK slice cannot fit L2, use 1 slice at least
-        if (mc == 0)
-            mc = 1;
-
-        auto dmax = std::numeric_limits<int>::max();
-        BlockIterator::blkloop bloops[] = {{mc,6,0}, {dmax,0,64}, {dmax,mc*6,0}};
-        blk_it.reset(bloops, 3, M, N);
-
-        tensor2D<float> & Atails = scratch;
-        int mtails = M % 6;
-        if (mtails > 0) {
-            Atails.resize(6, rndup(K, 16));
-            // copy tails into Atails (in unit of 32x32)
-            for (int m = 0; m < mtails; m++) {
-                memcpy(&Atails(m, 0), &matA(M - mtails + m, 0), matA.stride);
-                if (Atails.stride > matA.stride) {
-                    memset(reinterpret_cast<int8_t*>(&Atails(m, 0)) + matA.stride,
-                            0,
-                            Atails.stride - matA.stride);
-                }
-            }
-        }
-
-        auto strideB = matB.stride/sizeof(float);
-        auto strideC = matC.stride/sizeof(float);
-        do
-        {
-            int m = blk_it.m;
-            int n = blk_it.n;
-            int valid_m = std::min(M - m, 6);
-            int valid_n = std::min(N - n, 64);
-            auto * pA = &matA(m, 0);
-            auto * pB = &matB(0, n);
-            auto strideA = matA.stride/sizeof(float);
-            if (valid_m < 6) {
-                // use Atails buffer to prevent memory read segmentfault
-                pA = &Atails(0, 0);
-                strideA = Atails.stride/sizeof(float);
-            }
-
-            // do a 6x64 result, use 6x(4x16)=24 512bit register
-            auto c00 = _mm512_setzero_ps(); auto c01 = _mm512_setzero_ps(); auto c02 = _mm512_setzero_ps(); auto c03 = _mm512_setzero_ps();
-            auto c10 = _mm512_setzero_ps(); auto c11 = _mm512_setzero_ps(); auto c12 = _mm512_setzero_ps(); auto c13 = _mm512_setzero_ps();
-            auto c20 = _mm512_setzero_ps(); auto c21 = _mm512_setzero_ps(); auto c22 = _mm512_setzero_ps(); auto c23 = _mm512_setzero_ps();
-            auto c30 = _mm512_setzero_ps(); auto c31 = _mm512_setzero_ps(); auto c32 = _mm512_setzero_ps(); auto c33 = _mm512_setzero_ps();
-            auto c40 = _mm512_setzero_ps(); auto c41 = _mm512_setzero_ps(); auto c42 = _mm512_setzero_ps(); auto c43 = _mm512_setzero_ps();
-            auto c50 = _mm512_setzero_ps(); auto c51 = _mm512_setzero_ps(); auto c52 = _mm512_setzero_ps(); auto c53 = _mm512_setzero_ps();
-
-            for(int k = 0; k < K; k++, pB += strideB) {
-                auto b0 = _mm512_loadu_ps(pB);
-                auto b1 = _mm512_loadu_ps(pB + 16);
-                auto b2 = _mm512_loadu_ps(pB + 16*2);
-                auto b3 = _mm512_loadu_ps(pB + 16*3);
-
-                auto a0 = _mm512_set1_ps(pA[k + 0*strideA]);
-                c00 = _mm512_fmadd_ps(a0, b0, c00);
-                c01 = _mm512_fmadd_ps(a0, b1, c01);
-                c02 = _mm512_fmadd_ps(a0, b2, c02);
-                c03 = _mm512_fmadd_ps(a0, b3, c03);
-
-                auto a1 = _mm512_set1_ps(pA[k + 1*strideA]);
-                c10 = _mm512_fmadd_ps(a1, b0, c10);
-                c11 = _mm512_fmadd_ps(a1, b1, c11);
-                c12 = _mm512_fmadd_ps(a1, b2, c12);
-                c13 = _mm512_fmadd_ps(a1, b3, c13);
-
-                auto a2 = _mm512_set1_ps(pA[k + 2*strideA]);
-                c20 = _mm512_fmadd_ps(a2, b0, c20);
-                c21 = _mm512_fmadd_ps(a2, b1, c21);
-                c22 = _mm512_fmadd_ps(a2, b2, c22);
-                c23 = _mm512_fmadd_ps(a2, b3, c23);
-
-                auto a3 = _mm512_set1_ps(pA[k + 3*strideA]);
-                c30 = _mm512_fmadd_ps(a3, b0, c30);
-                c31 = _mm512_fmadd_ps(a3, b1, c31);
-                c32 = _mm512_fmadd_ps(a3, b2, c32);
-                c33 = _mm512_fmadd_ps(a3, b3, c33);
-
-                auto a4 = _mm512_set1_ps(pA[k + 4*strideA]);
-                c40 = _mm512_fmadd_ps(a4, b0, c40);
-                c41 = _mm512_fmadd_ps(a4, b1, c41);
-                c42 = _mm512_fmadd_ps(a4, b2, c42);
-                c43 = _mm512_fmadd_ps(a4, b3, c43);
-
-                auto a5 = _mm512_set1_ps(pA[k + 5*strideA]);
-                c50 = _mm512_fmadd_ps(a5, b0, c50);
-                c51 = _mm512_fmadd_ps(a5, b1, c51);
-                c52 = _mm512_fmadd_ps(a5, b2, c52);
-                c53 = _mm512_fmadd_ps(a5, b3, c53);
-            }
-
-            //save 6x(4x16) to matC
-            auto bias0 = bias ? _mm512_loadu_ps(bias + n) : _mm512_setzero_ps();
-            auto bias1 = bias ? _mm512_loadu_ps(bias + n + 16) : _mm512_setzero_ps();
-            auto bias2 = bias ? _mm512_loadu_ps(bias + n + 16*2) : _mm512_setzero_ps();
-            auto bias3 = bias ? _mm512_loadu_ps(bias + n + 16*3) : _mm512_setzero_ps();
-
-            auto * pC = &matC(m, n);
-            auto zero = _mm512_setzero_ps();
-            __mmask16 mask = _cvtu32_mask16(0xFFFFFFFF >> (32-valid_n));
-
-            // this lambda function is easier to optimize by compiler
-            auto lppkernel = [&](__m512 & v0,__m512 & v1,__m512 & v2,__m512 & v3){
-                v0 = _mm512_add_ps(v0, bias0);
-                v1 = _mm512_add_ps(v1, bias1);
-                v2 = _mm512_add_ps(v2, bias2);
-                v3 = _mm512_add_ps(v3, bias3);
-                if (act == RELU) {
-                    v0 = _mm512_mask_mov_ps(v0, _mm512_cmplt_ps_mask(v0, zero), zero);
-                    v1 = _mm512_mask_mov_ps(v1, _mm512_cmplt_ps_mask(v1, zero), zero);
-                    v2 = _mm512_mask_mov_ps(v2, _mm512_cmplt_ps_mask(v2, zero), zero);
-                    v3 = _mm512_mask_mov_ps(v3, _mm512_cmplt_ps_mask(v3, zero), zero);
-                }
-                _mm512_mask_storeu_ps (pC       , mask, v0);
-                _mm512_mask_storeu_ps (pC + 16  , mask, v1);
-                _mm512_mask_storeu_ps (pC + 16*2, mask, v2);
-                _mm512_mask_storeu_ps (pC + 16*3, mask, v3);
-                pC += strideC;
-                valid_m --;
-            };
-
-            if(valid_m) lppkernel(c00, c01, c02, c03);
-            if(valid_m) lppkernel(c10, c11, c12, c13);
-            if(valid_m) lppkernel(c20, c21, c22, c23);
-            if(valid_m) lppkernel(c30, c31, c32, c33);
-            if(valid_m) lppkernel(c40, c41, c42, c43);
-            if(valid_m) lppkernel(c50, c51, c52, c53);
-
-        }while(blk_it.next());
-    }
-};
-
-}

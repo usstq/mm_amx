@@ -11,27 +11,12 @@
 #include <cstring>
 #include <thread>
 
-#include "bf16.hpp"
-
-// g++-11 ./test_conv.cpp -O2 -lpthread -march=native && ./a.out
-
-// to use VNNI, we need higher version of compiler:
-//    clang-9 ./test_conv.cpp -O2 -lpthread -march=native -lstdc++ && ./a.out
-
-// to use AMX, we need intel compiler 
-//   source  ~/intel/oneapi/setvars.sh
-//   icx ./mm_amx_bf16.cpp -O2 -lpthread -march=native -lstdc++
-
-// objdump -C -S ./a.out > a.asm
-
-#ifdef _WIN32
-#include <intrin.h>
-#else
-#include <x86intrin.h>
-#endif
-
+#include "kernels_amxbf16.hpp"
+#include "kernels_avx512.hpp"
+#include "thread_pool.hpp"
+#include "timeit.hpp"
 #include "misc.hpp"
-#include "kernels.hpp"
+
 #include "thread_pool.hpp"
 
 timeit timer;
@@ -486,7 +471,6 @@ int main(int argc, const char *argv[]) {
     //amx_Matmul_perf(928, 96, 928, true); return 0;
 
     amx_MatmulMT_BiasGelu_acc(88, 77, 66, false);
-
     amx_MatmulMT_perf(2*901, 2560, 7680, false);
     amx_MatmulMT_BiasGelu_perf(2*901, 2560, 7680, false);
 

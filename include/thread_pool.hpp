@@ -1,3 +1,4 @@
+#pragma once
 
 #include <mutex>
 #include <condition_variable>
@@ -46,9 +47,12 @@ public:
     // job(int thread_id, int total_threads)
     void Paralell_NT(const std::function<void(int, int)>& job) {
         nt_job = job;
-        // set flags for each worker threads
-        for (uint32_t i = 0; i < num_worker_threads; i++)
-            nt_flags[i].store(1);
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex);
+            // set flags for each worker threads
+            for (uint32_t i = 0; i < num_worker_threads; i++)
+                nt_flags[i].store(1);
+        }
 
         // inform all worker threads
         mutex_condition.notify_all();
@@ -97,7 +101,7 @@ private:
             }
 
             nt_job(thread_id, total_threads);
-            --nt_flag;
+            nt_flag.store(0);
 
             mutex_finished.notify_one();
         }
