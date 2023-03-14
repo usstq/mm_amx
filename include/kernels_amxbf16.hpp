@@ -794,6 +794,7 @@ namespace PP {
 struct Matmul {
     KpackedB internalB;
     tensor2D<bfloat16> scratch;
+    tensor2D<bfloat16> scratch2;
     BlockIterator blk_it;
     bool constB;
     bool transposeB;
@@ -909,6 +910,32 @@ struct Matmul {
                 }
             }
         }
+
+        tensor2D<bfloat16> & Aktails = scratch2;
+        int ktails = K % 32;
+        int Kbody = (K/32)*32;
+        if (ktails > 0) {
+            Aktails.resize(32, 32);
+        }
+        __mmask32 ktail_mask = _cvtu32_mask32(0xFFFFFFFF >> (32-ktails));
+
+        auto load_Aktails = [&](bfloat16 * _src, int stride) {
+            auto * src = reinterpret_cast<uint8_t*>(_src);
+            auto * dst = &Aktails(0,0);
+            for(int r = 0; r < 32; r += 4) {
+                auto a0 = _mm512_maskz_loadu_epi16 (ktail_mask, src);
+                auto a1 = _mm512_maskz_loadu_epi16 (ktail_mask, src + stride);
+                auto a2 = _mm512_maskz_loadu_epi16 (ktail_mask, src + 2*stride);
+                auto a3 = _mm512_maskz_loadu_epi16 (ktail_mask, src + 3*stride);
+                _mm512_storeu_epi16(dst, a0);
+                _mm512_storeu_epi16(dst + 32, a1);
+                _mm512_storeu_epi16(dst + 32*2, a2);
+                _mm512_storeu_epi16(dst + 32*3, a3);
+                dst += 32*4;
+                src += 4*stride;
+            }
+        };
+
         // main loop
         tileconfig_t tfg(1, 0, 8, 16, 64);
         do
@@ -934,8 +961,19 @@ struct Matmul {
             _tile_zero(tC11);
             if (valid_m <= 16) {
                 // 1x2 is enough
-                for (int k = 0; k < K; k += 32) {
+                int k;
+                for (k = 0; k < Kbody; k += 32) {
                     _tile_loadd(tA0, pA0 + k, strideA);
+                    _tile_loadd(tB0, pB, 64); pB += (16*32);
+                    _tile_dpbf16ps(tC00, tA0, tB0);
+                    _tile_loadd(tB1, pB, 64); pB += (16*32);
+                    _tile_dpbf16ps(tC01, tA0, tB1);
+                }
+                // ktail
+                if (k < K) {
+                    load_Aktails(pA0 + k, strideA);
+                    auto * src = &Aktails(0,0);
+                    _tile_loadd(tA0, src, 64);
                     _tile_loadd(tB0, pB, 64); pB += (16*32);
                     _tile_dpbf16ps(tC00, tA0, tB0);
                     _tile_loadd(tB1, pB, 64); pB += (16*32);
@@ -946,7 +984,8 @@ struct Matmul {
             } else {
                 // 2x2
                 _tile_loadd(tA0, pA0 + 0, strideA);
-                for (int k = 0; k < K; k += 32) {
+                int k;
+                for (k = 0; k < Kbody; k += 32) {
                     _tile_loadd(tB0, pB, 64); pB += (16*32);
                     _tile_dpbf16ps(tC00, tA0, tB0);
                     _tile_loadd(tA1, pA1 + k, strideA);
@@ -954,6 +993,18 @@ struct Matmul {
                     _tile_loadd(tB1, pB, 64); pB += (16*32);
                     _tile_dpbf16ps(tC01, tA0, tB1);
                     _tile_loadd(tA0, pA0 + k + 32, strideA);    // balance load & dp. load next
+                    _tile_dpbf16ps(tC11, tA1, tB1);
+                }
+                if (k < K) {
+                    load_Aktails(pA0 + k, strideA);
+                    auto * src = &Aktails(0,0);
+                    _tile_loadd(tA0, src, 64);
+                    _tile_loadd(tB0, pB, 64); pB += (16*32);
+                    _tile_dpbf16ps(tC00, tA0, tB0);
+                    _tile_loadd(tA1, src + (16*32), 64);
+                    _tile_dpbf16ps(tC10, tA1, tB0);
+                    _tile_loadd(tB1, pB, 64); pB += (16*32);
+                    _tile_dpbf16ps(tC01, tA0, tB1);
                     _tile_dpbf16ps(tC11, tA1, tB1);
                 }
                 _tile_stored(tC00, &buffC(0,0), buffC.stride);
