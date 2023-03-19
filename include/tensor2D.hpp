@@ -3,6 +3,7 @@
 #include <memory>
 #include <iostream>
 #include <functional>
+#include "numa.h"
 
 #define rndup(x, n) (((x + n - 1)/n)*n)
 
@@ -47,7 +48,18 @@ struct tensor2D {
         }
         return ret;
     }
-
+    tensor2D<T> clone() {
+        tensor2D<T> ret;
+        ret.resize(dims[0], dims[1]);
+        if (ret.stride == stride) {
+            memcpy(ret.data.get(), data.get(), dims[0] * stride);
+        }else{
+            for(int i=0;i<dims[0];i++) {
+                memcpy(&ret(i,0), &(*this)(i,0), ret.stride);
+            }
+        }
+        return ret;
+    }
     void resize(int d0, int d1) {
         dims[0] = d0;
         dims[1] = d1;
@@ -66,9 +78,18 @@ struct tensor2D {
             capacity = need_capacity;
             // align begin address to cache line is vital, so tile load can
             // use all bandwidth (L1D/L2 only deliver data in unit of 64-byte aligned cache-line)
-            data = std::shared_ptr<T>(
-                        reinterpret_cast<T*>(aligned_alloc(64, capacity)),
-                        [](void * p) { free(p); });
+
+            if (USE_NUMA) {
+                data = std::shared_ptr<T>(
+                            reinterpret_cast<T*>(numa_alloc_local(capacity)),
+                            [need_capacity](void * p){ numa_free(p, need_capacity); });
+            } else {
+                data = std::shared_ptr<T>(
+                            reinterpret_cast<T*>(aligned_alloc(64, capacity)),
+                            [](void * p) { free(p); });
+            }
+            if (reinterpret_cast<uintptr_t>(data.get()) % 64)
+                std::cout << "WARNING: resize(), data is not cache-line aligned!" << std::endl;
         }
     }
 

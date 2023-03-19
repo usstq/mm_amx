@@ -18,7 +18,7 @@
 #include "misc.hpp"
 
 #include "thread_pool.hpp"
-
+#include <omp.h>
 timeit timer;
 
 //================================================================================
@@ -224,7 +224,8 @@ void amx_Matmul_perf(int M, int K, int N, bool transB, int times = -1000) {
         std::cout << C0 << std::endl;
         std::cout << C << std::endl;
     }
-
+    std::cout << C0 << std::endl;
+    std::cout << C << std::endl;
     timer(times, [&](){
         mm(A, transB?BT:B, C);
     },
@@ -317,10 +318,57 @@ struct MatmulMT {
             splitter(work_amount, cnt, tid, start, end);
             int n0 = start*32;
             int n1 = end*32;
+            if (n1 > N) n1 = N;
+            tensor2D<bfloat16> copyA = matA.clone();
+            // C[:, N0:N1] = A * B[:, N0:N1]
+            (*ops[tid].get())(copyA, matB, n0, n1, ppkernel);
+        };
+        thp.Paralell_NT(kernel);
+    }
+};
+
+int omp_thread_count() {
+    int n = 0;
+    #pragma omp parallel reduction(+:n)
+    n += 1;
+    return n;
+}
+
+int OMP_NT = omp_thread_count();
+
+struct MatmulMTOMP {
+    std::vector<std::shared_ptr<amx_bf16::Matmul>> ops;
+    bool transposeB;
+    MatmulMTOMP(bool constB = false, bool transposeB = false) : transposeB(transposeB) {
+        for(int i = 0; i < thp.num_threads; i++)
+            ops.push_back(std::make_shared<amx_bf16::Matmul>(constB, transposeB));
+    }
+
+    template<typename P>
+    void operator()(tensor2D<bfloat16> & matA,
+                    tensor2D<bfloat16> & matB,
+                    P ppkernel) {
+        int M = matA.dims[0];
+        int K = matA.dims[1];
+        int N = matB.dims[transposeB ? 0:1];
+        // split along N dimension
+        int work_amount = rndup(N, 32)/32;
+
+        auto kernel = [&](int tid, int cnt) {
+            int start, end;
+            splitter(work_amount, cnt, tid, start, end);
+            int n0 = start*32;
+            int n1 = end*32;
+            if (n1 > N) n1 = N;
+            //tensor2D<bfloat16> copyA = matA.clone();
             // C[:, N0:N1] = A * B[:, N0:N1]
             (*ops[tid].get())(matA, matB, n0, n1, ppkernel);
         };
-        thp.Paralell_NT(kernel);
+
+        #pragma omp parallel for
+        for(int i = 0; i<OMP_NT; i++) {
+            kernel(i, OMP_NT);
+        }
     }
 };
 
@@ -358,6 +406,8 @@ void amx_MatmulMT_perf(int M, int K, int N, bool transB, int times = -1000) {
         return;
     }
 }
+
+
 
 
 void amx_MatmulMT_BiasGelu_acc(int M, int K, int N, bool transB) {
@@ -432,14 +482,15 @@ void amx_Matmul_perf_float(int M, int K, int N, int times = -1000) {
     tensor2D<float> C(M, N);
     tensor2D<float> C0(M, N);
     tensor2D<float> Bias(1, N);
-    avx512::Matmul<avx512::RELU> mm;
+    avx512::Matmul mm;
+    avx512::PP::AddbiasRelu pp(&Bias(0,0));
     std::cout << __func__ << " [" << M << "," << K << "," << N << "] ";
 
     C0=0;
     matmul(A, B, C0, &Bias(0,0), [](float x){
         return std::max(x, 0.0f);
     });
-    mm(A, B, C, &Bias(0,0));
+    mm(A, B, C, pp);
     if (C0 == C) {
         std::cout << ANSIcolor("1;32") << "Match!\n" << ANSIcolor();
         //std::cout << C << std::endl;
@@ -450,10 +501,80 @@ void amx_Matmul_perf_float(int M, int K, int N, int times = -1000) {
     }
 
     timer(times, [&](){
-        mm(A, B, C, &Bias(0,0));
+        mm(A, B, C, pp);
     },
     double(M * N) * K * 2,
     FP32PeakGopsPerCore * 1e9);
+}
+
+void test_bf16() {
+    for(int i=0;i<65536;i++) {
+        auto bf16i = bfloat16(i);
+        auto bf16i2i = static_cast<int>(static_cast<float>(bf16i));
+        if (bf16i2i != i) {
+            std::cout << "bfloat16 cannot represent int " << i << std::endl;
+            break;
+        }
+    }
+    {
+        auto a = bfloat16(std::nan("1"));
+        auto b = bfloat16(0.0f);
+        auto c = a*b;
+        std::cout << c << std::endl;
+    }
+    {
+        tensor2D<bfloat16> A(16, 32);
+        tensor2D<bfloat16> BT(16, 32);
+        tensor2D<bfloat16> C(16, 16);
+        amx_bf16::tileconfig_t tfg(1, 0, 8, 16, 64);
+        const int tileA = 0;
+        const int tileB = 1;
+        const int tileC = 2;
+        A = bfloat16(std::nan("0"));
+        BT = bfloat16(0.0f);
+        _tile_loadd(tileA, &A(0,0), 64);
+        _tile_loadd(tileB, &BT(0,0), 64);
+        _tile_dpbf16ps(tileC, tileA, tileB);
+        amx_bf16::tshow<float, 2>();
+    }
+
+}
+
+/*
+repeate following topology 
+   [M,K][K,N] => [M,N]   A1*B1=>A2
+   [M,N][N,K] => [M,K]   A2*B2=>A1
+   ...
+
+*/
+void amx_MatmulMT_multi_perf(int M, int K, int N, int repeates, int times = -1000) {
+    tensor2D<bfloat16> A1(M, K);
+    tensor2D<bfloat16> A2(M, N);
+
+    std::vector<tensor2D<bfloat16>> B1s;
+    std::vector<tensor2D<bfloat16>> B2s;
+    for(int i = 0; i<repeates; i++) {
+        B1s.emplace_back(K, N);
+        B2s.emplace_back(N, K);
+    }
+
+    amx_bf16::PP::Store2bf16 ppToA2(A2);
+    amx_bf16::PP::Store2bf16 ppToA1(A1);
+
+    //MatmulMT                  mmMT(true, false);
+    MatmulMTOMP               mmMT(true, false);
+
+    std::cout << __func__ << " [" << M << "," << K << "," << N << "] ";
+
+    timer(times, [&](){
+        for(int i = 0; i<repeates; i++) {
+            mmMT(A1, B1s[i], ppToA2);
+            mmMT(A2, B2s[i], ppToA1);
+        }
+    },
+    (double(N) * K * sizeof(bfloat16)) * 2 * repeates,
+    1e12,
+    "Byte/s");
 }
 
 int main(int argc, const char *argv[]) {
@@ -461,9 +582,19 @@ int main(int argc, const char *argv[]) {
     thp.Start();
 
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
+    std::cout << ANSIcolor("31") << "omp_get_num_threads() = " << omp_get_num_threads() << std::endl << ANSIcolor();
+    std::cout << ANSIcolor("31") << "OMP_NT = " << OMP_NT << std::endl << ANSIcolor();
+
+    amx_MatmulMT_multi_perf(2, 2560, 7680*4, 13, -10000);
+    return 0;
+
+    //test_bf16(); return 0;
+    //amx_Matmul_perf(12, 256, 32, true); return 0;
 
     amx_Matmul_perf_float(16, 256, 256);
     amx_Matmul_perf_float(224, 256, 256);
+    amx_Matmul_perf_float(512, 256, 256);
+    
     //amx_Matmul_perf(32, 120, 5, true); return 0;
     //amx_Matmul_perf(32, 18, 5, true); return 0;
 

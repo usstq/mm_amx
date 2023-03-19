@@ -19,6 +19,12 @@ int get_cpu_affinity_size() {
         perror("sched_getaffinity");
         return std::thread::hardware_concurrency();
     }
+    for(int i=0; i<CPU_SETSIZE ;i++) {
+        if (CPU_ISSET(i, &cpus)) {
+            std::cout << "[cpu " << i << "]";
+        }
+    }
+    std::cout << std::endl;
     return CPU_COUNT(&cpus);
 }
 
@@ -29,18 +35,34 @@ class ThreadPool {
 public:
     uint32_t num_threads;
     uint32_t num_worker_threads;
+    cpu_set_t cpus;
+    std::map<int, int> tid2cpu;
 
     ~ThreadPool() {
         Stop();
     }
     void Start() {
         // the first worker thread is main thread itself
-        num_threads = get_cpu_affinity_size();
+        if (sched_getaffinity(0, sizeof(cpus), &cpus) < 0) {
+            perror("sched_getaffinity");
+            abort();
+        }
+        {
+            int tid = 0;
+            for(int i=0; i<CPU_SETSIZE ;i++) {
+                if (CPU_ISSET(i, &cpus)) {
+                    tid2cpu[tid++] = i;
+                }
+            }
+        }
+
+        num_threads = CPU_COUNT(&cpus);
         num_worker_threads = num_threads - 1;
         for (uint32_t i = 0; i < num_worker_threads; i++) {
             nt_flags.emplace_back(0);
             threads.emplace_back(&ThreadPool::ThreadLoop, this, 1+i, num_worker_threads+1, std::ref(nt_flags.back()));
         }
+        bind_cpu(tid2cpu[0]);
         std::cout << "ThreadPool with " << num_worker_threads + 1 << " worker threads is created!" << std::endl;
     }
 
@@ -62,17 +84,17 @@ public:
 
         // busy wait to minimize wait latency
         // (only good choice when HW concurrency is used)
-        std::unique_lock<std::mutex> lock(finished_mutex);
-        mutex_finished.wait(lock, [this] {
-            for (uint32_t i = 0; i < num_worker_threads; i++) {
-                if (nt_flags[i].load() > 0)
-                    return false;
-            }
-            return true;
-        });
-        //for (uint32_t i = 0; i < num_worker_threads; i++) {
-        //    while (nt_flags[i].load() > 0);
-        //}
+        //std::unique_lock<std::mutex> lock(finished_mutex);
+        //mutex_finished.wait(lock, [this] {
+        //    for (uint32_t i = 0; i < num_worker_threads; i++) {
+        //        if (nt_flags[i].load() > 0)
+        //            return false;
+        //    }
+        //    return true;
+        //});
+        for (uint32_t i = 0; i < num_worker_threads; i++) {
+            while (nt_flags[i].load() > 0);
+        }
     }
 
     void Stop() {
@@ -88,7 +110,19 @@ public:
     }
 
 private:
+    void bind_cpu(int cpu_id) {
+        cpu_set_t cpuset;
+        pthread_t thread;
+        thread = pthread_self();
+        CPU_ZERO(&cpuset);
+        CPU_SET(cpu_id, &cpuset);
+        int ret = pthread_setaffinity_np(thread, sizeof(cpuset), &cpuset);
+        if (ret != 0) {
+            std::abort();
+        }
+    }
     void ThreadLoop(int thread_id, int total_threads, std::atomic<int>& nt_flag) {
+        bind_cpu(tid2cpu[thread_id]);
         while (true) {
             {
                 std::unique_lock<std::mutex> lock(queue_mutex);
@@ -103,7 +137,7 @@ private:
             nt_job(thread_id, total_threads);
             nt_flag.store(0);
 
-            mutex_finished.notify_one();
+            //mutex_finished.notify_one();
         }
     }
 

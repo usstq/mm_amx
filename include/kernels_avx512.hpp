@@ -21,20 +21,52 @@ tests:1 passed:1 skipped:0 mistrusted:0 unimplemented:0 invalid_arguments:0 fail
 total perf: min(ms):0.0012207 avg(ms):0.00159982
 */
 
-enum Activation {
-    RELU,
+namespace PP {
+struct AddbiasRelu {
+    float * bias;
+    AddbiasRelu(float * bias) : bias(bias) {};
+
+    __m512 bias0;
+    __m512 bias1;
+    __m512 bias2;
+    __m512 bias3;
+    __m512 zero;
+    void prepare(int n) {
+        // prepare 4x16 biases
+        zero = _mm512_setzero_ps();
+        bias0 = _mm512_loadu_ps(bias + n);
+        bias1 = _mm512_loadu_ps(bias + n + 16);
+        bias2 = _mm512_loadu_ps(bias + n + 16*2);
+        bias3 = _mm512_loadu_ps(bias + n + 16*3);
+    }
+    void exec(__m512 & v0, __m512 & v1, __m512 & v2, __m512 & v3) {
+        // bias
+        v0 = _mm512_add_ps(v0, bias0);
+        v1 = _mm512_add_ps(v1, bias1);
+        v2 = _mm512_add_ps(v2, bias2);
+        v3 = _mm512_add_ps(v3, bias3);
+
+        // relu
+        v0 = _mm512_max_ps (v0, zero);
+        v1 = _mm512_max_ps (v1, zero);
+        v2 = _mm512_max_ps (v2, zero);
+        v3 = _mm512_max_ps (v3, zero);
+    }
 };
 
-template<Activation act>
+}
+
+
 struct Matmul {
     BlockIterator blk_it;
     tensor2D<float> scratch;
     Matmul() {};
 
+    template<typename P>
     void operator()(tensor2D<float> & matA,
                     tensor2D<float> & matB,
                     tensor2D<float> & matC,
-                    float * bias) {
+                    P pp) {
         int M = matA.dims[0];
         int K = matA.dims[1];
         assert(K == matB.dims[0]);
@@ -138,27 +170,12 @@ struct Matmul {
             }
 
             //save 6x(4x16) to matC
-            auto bias0 = bias ? _mm512_loadu_ps(bias + n) : _mm512_setzero_ps();
-            auto bias1 = bias ? _mm512_loadu_ps(bias + n + 16) : _mm512_setzero_ps();
-            auto bias2 = bias ? _mm512_loadu_ps(bias + n + 16*2) : _mm512_setzero_ps();
-            auto bias3 = bias ? _mm512_loadu_ps(bias + n + 16*3) : _mm512_setzero_ps();
+            pp.prepare(n);
 
             auto * pC = &matC(m, n);
-            auto zero = _mm512_setzero_ps();
             __mmask16 mask = _cvtu32_mask16(0xFFFFFFFF >> (32-valid_n));
-
-            // this lambda function is easier to optimize by compiler
             auto lppkernel = [&](__m512 & v0,__m512 & v1,__m512 & v2,__m512 & v3){
-                v0 = _mm512_add_ps(v0, bias0);
-                v1 = _mm512_add_ps(v1, bias1);
-                v2 = _mm512_add_ps(v2, bias2);
-                v3 = _mm512_add_ps(v3, bias3);
-                if (act == RELU) {
-                    v0 = _mm512_max_ps (v0, zero);
-                    v1 = _mm512_max_ps (v1, zero);
-                    v2 = _mm512_max_ps (v2, zero);
-                    v3 = _mm512_max_ps (v3, zero);
-                }
+                pp.exec(v0, v1, v2, v3);
                 _mm512_mask_storeu_ps (pC       , mask, v0);
                 _mm512_mask_storeu_ps (pC + 16  , mask, v1);
                 _mm512_mask_storeu_ps (pC + 16*2, mask, v2);

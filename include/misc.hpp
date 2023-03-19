@@ -36,7 +36,6 @@
 #endif
 #include <stdlib.h>
 
-
 #define rndup(x, n) (((x + n - 1)/n)*n)
 
 template<typename T>
@@ -75,3 +74,14 @@ struct ANSIcolor {
     }
 };
 
+
+inline int readenv(const char * name) {
+    int v = 0;
+    auto * p = std::getenv(name);
+    if (p)
+        v = std::atoi(p);
+    std::cout << ANSIcolor("32") << "ENV: " << name << " = " << v << std::endl << ANSIcolor();
+    return v;
+}
+
+static auto USE_NUMA = readenv("USE_NUMA");

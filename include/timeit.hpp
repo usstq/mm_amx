@@ -74,13 +74,14 @@ struct timeit {
                       const Callable & c,
                       double opsPerCall = 0,
                       double peakOpsPerSecond = 0,
-                      const char * prob = nullptr) {
+                      const char * unit = "Ops") {
         int times;
 
         // cache warm-up
+        std::cout << "warm-up..." << std::flush;
         c();
         c();
-
+        std::cout << "done" << std::endl;
         // determine times
         if (expect_times_milliseconds > 0) {
             times = expect_times_milliseconds;
@@ -92,21 +93,21 @@ struct timeit {
             auto oneshot = __rdtsc() - start;
             times = second2tsc(expect_duration)/oneshot;
         }
-
+        std::cout << "start..." << std::flush;
         // profiling
         auto start = std::chrono::high_resolution_clock::now();
         for(int i = 0; i < times; i++) {
             c();
         }
         auto finish = std::chrono::high_resolution_clock::now();
-
+        std::cout << "done" << std::endl;
         std::chrono::duration<double> total_latency = finish-start;
         auto avg_latency = total_latency.count()/times;
         std::cout << ANSIcolor("0;33") << "Average latency : " << avg_latency*1e6 << " us x " << times;
         if (opsPerCall > 0 && peakOpsPerSecond > 0) {
             std::cout << "  HW Usage : " << static_cast<int>(100*(opsPerCall/avg_latency)/(peakOpsPerSecond)) << "% ("
-                    << opsPerCall/avg_latency/(1e9) << " Gops /"
-                    << peakOpsPerSecond/1e9 << " Gops)";
+                    << opsPerCall/avg_latency/(1e9) << " G" << unit << " /"
+                    << peakOpsPerSecond/1e9 << " G" << unit << ")";
         }
         std::cout << ANSIcolor() << std::endl;
         return avg_latency;

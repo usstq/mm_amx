@@ -173,6 +173,7 @@ inline bool initXTILE() {
 //===============================================================
 
 #include "bf16.hpp"
+#include "numa.h"
 
 using ov::bfloat16;
 
@@ -257,6 +258,7 @@ struct tileconfig_t {
 //   - support transpose
 //   - blocking scheme
 //
+
 struct KpackedB {
     std::shared_ptr<bfloat16> data;
     int64_t capacity;
@@ -298,9 +300,18 @@ struct KpackedB {
         need_capacity = rndup(need_capacity, 64);
         if (capacity < need_capacity) {
             capacity = need_capacity;
-            data = std::shared_ptr<bfloat16>(
-                        reinterpret_cast<bfloat16*>(aligned_alloc(64, capacity)),
-                        [](void * p){ free(p); });
+            if (USE_NUMA) {
+                data = std::shared_ptr<bfloat16>(
+                            reinterpret_cast<bfloat16*>(numa_alloc_local(capacity)),
+                            [need_capacity](void * p){ numa_free(p, need_capacity); });
+            } else {
+                data = std::shared_ptr<bfloat16>(
+                            reinterpret_cast<bfloat16*>(aligned_alloc(64, capacity)),
+                            [](void * p){ free(p); });
+            }
+            if (reinterpret_cast<uintptr_t>(data.get()) % 64)
+                std::cout << "WARNING: data is not cache-line aligned!" << std::endl;
+
         }
     }
 
