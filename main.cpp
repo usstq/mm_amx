@@ -16,6 +16,7 @@
 #include "thread_pool.hpp"
 #include "timeit.hpp"
 #include "misc.hpp"
+#include "test_bw.hpp"
 
 #include "thread_pool.hpp"
 #include <omp.h>
@@ -327,13 +328,6 @@ struct MatmulMT {
     }
 };
 
-int omp_thread_count() {
-    int n = 0;
-    #pragma omp parallel reduction(+:n)
-    n += 1;
-    return n;
-}
-
 int OMP_NT = omp_thread_count();
 
 struct MatmulMTOMP {
@@ -580,6 +574,8 @@ void amx_MatmulMT_multi_perf(int M, int K, int N, int repeates, int times = -100
 int main(int argc, const char *argv[]) {
     timer.set_app(argv[0]);
     thp.Start();
+
+    test_all_bw<8 * 1024>(3.0); return 0;
 
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
     std::cout << ANSIcolor("31") << "omp_get_num_threads() = " << omp_get_num_threads() << std::endl << ANSIcolor();
