@@ -547,13 +547,14 @@ void amx_MatmulMT_multi_perf(int M, int K, int N, int repeates, int times = -100
 
     std::vector<tensor2D<bfloat16>> B1s;
     std::vector<tensor2D<bfloat16>> B2s;
+    std::vector<tensor2D<float>> biasA1;
+    std::vector<tensor2D<float>> biasA2;
     for(int i = 0; i<repeates; i++) {
         B1s.emplace_back(K, N);
         B2s.emplace_back(N, K);
+        biasA1.emplace_back(1, K);
+        biasA2.emplace_back(1, N);
     }
-
-    amx_bf16::PP::Store2bf16 ppToA2(A2);
-    amx_bf16::PP::Store2bf16 ppToA1(A1);
 
     //MatmulMT                  mmMT(true, false);
     MatmulMTOMP               mmMT(true, false);
@@ -562,6 +563,11 @@ void amx_MatmulMT_multi_perf(int M, int K, int N, int repeates, int times = -100
 
     timer(times, [&](){
         for(int i = 0; i<repeates; i++) {
+            amx_bf16::PP::Addbias_Gelu_Store2bf16 ppToA2(A2, &biasA2[i](0,0));
+            amx_bf16::PP::Addbias_Gelu_Store2bf16 ppToA1(A1, &biasA1[i](0,0));
+            //amx_bf16::PP::Store2bf16 ppToA2(A2);
+            //amx_bf16::PP::Store2bf16 ppToA1(A1);
+
             mmMT(A1, B1s[i], ppToA2);
             mmMT(A2, B2s[i], ppToA1);
         }
@@ -575,13 +581,13 @@ int main(int argc, const char *argv[]) {
     timer.set_app(argv[0]);
     thp.Start();
 
-    test_all_bw<8 * 1024>(3.0); return 0;
+    //test_all_bw(3.0); return 0;
 
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
     std::cout << ANSIcolor("31") << "omp_get_num_threads() = " << omp_get_num_threads() << std::endl << ANSIcolor();
     std::cout << ANSIcolor("31") << "OMP_NT = " << OMP_NT << std::endl << ANSIcolor();
 
-    amx_MatmulMT_multi_perf(2, 2560, 7680*4, 13, -10000);
+    amx_MatmulMT_multi_perf(2, 2560, 10240, 13, -10000);
     return 0;
 
     //test_bf16(); return 0;

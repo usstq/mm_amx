@@ -11,9 +11,10 @@
 
 
 // test BW
-template<int64_t size>
-double test_bw(double dur) {
+double test_bw(double dur, int64_t size) {
     // allocate per-thread buffer
+    auto tsc_second = get_tsc_ticks_per_second();
+
     uint8_t* data[128] = { 0 };
     int failed = 0;
     #pragma omp parallel reduction(+:failed)
@@ -24,30 +25,40 @@ double test_bw(double dur) {
             std::cout << "Error, aligned_alloc failed!" << std::endl;
             failed++;
         }
+        // memset to 1 ensures physical pages are really allocated
+        memset(data[tid], 1, size);
     }
     if (failed) {
         return 0;
     }
 
-    auto doTest = [&](uint8_t* base, int64_t repeats) {
+    auto doTest = [&](uint8_t* base, int duration_ms, int64_t & actual_reps) {
         auto sum0 = _mm256_setzero_ps();
         auto sum1 = _mm256_setzero_ps();
         auto sum2 = _mm256_setzero_ps();
         auto sum3 = _mm256_setzero_ps();
-        for (int64_t r = 0; r < repeats; r++) {
+        auto tsc0 = __rdtsc();
+        int64_t r;
+        auto tsc_limit = tsc_second * duration_ms/1000l;
+        for (r = 0; ; r++) {
             uint8_t* src = base;
-            for (int64_t i = 0; i < size; i += 32*4) {
+            for (int64_t i = 0; i < size; i += 64*4) {
                 auto a0 = _mm256_load_ps(reinterpret_cast<const float*>(src));
-                auto a1 = _mm256_load_ps(reinterpret_cast<const float*>(src + 32));
-                auto a2 = _mm256_load_ps(reinterpret_cast<const float*>(src + 32 * 2));
-                auto a3 = _mm256_load_ps(reinterpret_cast<const float*>(src + 32 * 3));
+                auto a1 = _mm256_load_ps(reinterpret_cast<const float*>(src + 64));
+                auto a2 = _mm256_load_ps(reinterpret_cast<const float*>(src + 64 * 2));
+                auto a3 = _mm256_load_ps(reinterpret_cast<const float*>(src + 64 * 3));
                 src+= 32*4;
                 sum0 = _mm256_add_ps(sum0, a0);
                 sum1 = _mm256_add_ps(sum1, a1);
                 sum2 = _mm256_add_ps(sum2, a2);
                 sum3 = _mm256_add_ps(sum3, a3);
             }
+            if (__rdtsc() - tsc0 > tsc_limit) {
+                actual_reps = r+1;
+                break;
+            }
         }
+
         sum0 = _mm256_add_ps(sum0, sum1);
         sum2 = _mm256_add_ps(sum2, sum3);
         sum0 = _mm256_add_ps(sum0, sum2);
@@ -62,40 +73,21 @@ double test_bw(double dur) {
     };
 
     // warm-up cache 
+    int64_t actual_reps;
     int prevent_opt = 0;
     #pragma omp parallel reduction(+:prevent_opt)
     {
         int tid = omp_get_thread_num();
-        prevent_opt += doTest(data[tid], 10);
-    }
-    // estimate rep_for_dur
-    int64_t rep_for_dur = 0;
-    for (int64_t rep = 10; ; rep *= 2) {
-        // count time
-        auto t1 = std::chrono::high_resolution_clock::now();
-        #pragma omp parallel reduction(+:prevent_opt)
-        {
-            int tid = omp_get_thread_num();
-            prevent_opt += doTest(data[tid],rep);
-        }
-        auto t2 = std::chrono::high_resolution_clock::now();
-        auto time_us = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
-        //std::cout << __LINE__ << "," << rep << ", " << time_us << std::endl;
-        if (time_us > 100*1000) {
-            // >100ms, we can estimate how many repeates required to last `dur` second
-            rep_for_dur = (dur * 1e6 / time_us) * rep;
-            break;
-        }
+        prevent_opt += doTest(data[tid], 100, actual_reps);
     }
 
-
-    auto t1 = std::chrono::high_resolution_clock::now();
+    auto t1 = std::chrono::steady_clock::now();
     #pragma omp parallel reduction(+:prevent_opt)
     {
         int tid = omp_get_thread_num();
-        prevent_opt += doTest(data[tid],rep_for_dur);
+        prevent_opt += doTest(data[tid], dur*1000, actual_reps);
     }
-    auto t2 = std::chrono::high_resolution_clock::now();
+    auto t2 = std::chrono::steady_clock::now();
 
     #pragma omp parallel
     {
@@ -105,8 +97,7 @@ double test_bw(double dur) {
 
     std::chrono::duration<double> dt = t2 - t1;
 
-    auto bytes_per_sec = rep_for_dur / dt.count() * size;
-    //std::cout << "rep_for_dur=" << rep_for_dur << " dt.count()=" << dt.count() << " size=" << size << " bytes_per_sec=" << bytes_per_sec;
+    auto bytes_per_sec = actual_reps / dt.count() * size;
 
     if (prevent_opt == 123) {
         std::cout << prevent_opt << std::endl;
@@ -129,13 +120,20 @@ inline int omp_thread_count() {
     return n;
 }
 
-template<int64_t size>
 void test_all_bw(double duration){
-    auto OMP_NT = omp_thread_count();
-    auto bw = test_bw<size>(duration);
-    std::cout << "@BufferSize " << pretty_size(size) << " : " << pretty_size(bw) << "B/s  x " << OMP_NT << std::endl;
-    
-    constexpr int64_t nsize = next_size<size>();
-    if (nsize)
-        test_all_bw<nsize>(duration);
+    auto test = [&](int64_t size) {
+        auto OMP_NT = omp_thread_count();
+        auto bw = test_bw(duration, size);
+        std::cout << "@BufferSize " << pretty_size(size) << " : " << pretty_size(bw) << "B/s  x " << OMP_NT << std::endl;
+    };
+
+    test(15*1024);
+    test(30*1024);
+    test(1*1024*1024);  // 1MB  L2
+    test(13*1024*1024); // 13MB L3
+    test(56*1024*1024); // 56MB L3
+    test(128*1024*1024); // 128MB L3 + DDR
+    test(512*1024*1024); // 512MB
+    test(1024*1024*1024l); // 1GB DDR
+    test(2*1024*1024*1024l); // 1GB DDR
 }
