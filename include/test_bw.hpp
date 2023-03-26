@@ -73,19 +73,19 @@ double test_bw(double dur, int64_t size) {
     };
 
     // warm-up cache 
-    int64_t actual_reps;
+    int64_t actual_reps[128];
     int prevent_opt = 0;
     #pragma omp parallel reduction(+:prevent_opt)
     {
         int tid = omp_get_thread_num();
-        prevent_opt += doTest(data[tid], 100, actual_reps);
+        prevent_opt += doTest(data[tid], 100, actual_reps[tid]);
     }
 
     auto t1 = std::chrono::steady_clock::now();
     #pragma omp parallel reduction(+:prevent_opt)
     {
         int tid = omp_get_thread_num();
-        prevent_opt += doTest(data[tid], dur*1000, actual_reps);
+        prevent_opt += doTest(data[tid], dur*1000, actual_reps[tid]);
     }
     auto t2 = std::chrono::steady_clock::now();
 
@@ -95,9 +95,16 @@ double test_bw(double dur, int64_t size) {
         free(data[tid]);
     }
 
+    int64_t total_reps = 0;
+    #pragma omp parallel reduction(+:total_reps)
+    {
+        int tid = omp_get_thread_num();
+        total_reps += actual_reps[tid];
+    }
+
     std::chrono::duration<double> dt = t2 - t1;
 
-    auto bytes_per_sec = actual_reps / dt.count() * size;
+    auto bytes_per_sec = total_reps / dt.count() * size;
 
     if (prevent_opt == 123) {
         std::cout << prevent_opt << std::endl;

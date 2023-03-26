@@ -587,7 +587,7 @@ int main(int argc, const char *argv[]) {
     std::cout << ANSIcolor("31") << "omp_get_num_threads() = " << omp_get_num_threads() << std::endl << ANSIcolor();
     std::cout << ANSIcolor("31") << "OMP_NT = " << OMP_NT << std::endl << ANSIcolor();
 
-    amx_MatmulMT_multi_perf(2, 2560, 10240, 13, -10000);
+    amx_MatmulMT_multi_perf(2, 2560, 10240, 51, -10000);
     return 0;
 
     //test_bf16(); return 0;

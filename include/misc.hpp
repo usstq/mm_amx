@@ -81,7 +81,7 @@ struct pretty_size {
     std::string txt;
     pretty_size(double sz) : sz(sz) {
         std::stringstream ss;
-        ss << std::setprecision(3) << std::setw(3);
+        ss << std::setprecision(5) << std::setw(5);
         if (sz < 1024)
             ss << sz;
         else if (sz < 1024 * 1024)
