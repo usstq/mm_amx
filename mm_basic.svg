@@ -1,0 +1,26 @@
+<svg width="349" height="252" xmlns="http://www.w3.org/2000/svg">
+
+ <g>
+  <title>Layer 1</title>
+  <rect id="svg_20" height="248.9811" width="339" y="-0.19108" x="1.02953" stroke-dasharray="2,2" stroke-width="0" stroke="#000" fill="#ffffff"/>
+  <rect id="svg_1" height="106" width="158" y="108.58511" x="130.85709" stroke="#000" fill="#fff"/>
+  <rect stroke="#000" id="svg_2" height="80" width="158" y="26.58512" x="130.85709" fill="#fff"/>
+  <rect stroke="#000" id="svg_3" height="105.67113" width="105" y="108.58511" x="23.8571" fill="#fff"/>
+  <text font-weight="bold" xml:space="preserve" text-anchor="start" font-family="'Crimson Pro'" font-size="24" stroke-width="0" id="svg_4" y="127.58511" x="26.81627" stroke="#000" fill="#422C10">A</text>
+  <text font-weight="bold" xml:space="preserve" text-anchor="start" font-family="'Crimson Pro'" font-size="24" stroke-width="0" id="svg_5" y="45.52387" x="133.69378" stroke="#000" fill="#000000">B</text>
+  <text font-weight="bold" xml:space="preserve" text-anchor="start" font-family="'Crimson Pro'" font-size="24" id="svg_6" y="126.50346" x="132.71419" stroke-width="0" stroke="#000" fill="#000000">C</text>
+  <line stroke-width="0" id="svg_7" y2="160.58511" x2="128.8571" y1="159.58511" x1="22.8571" stroke="#000" fill="none"/>
+  <line stroke-width="4" id="svg_8" y2="104.58511" x2="201.85709" y1="26.58512" x1="201.85709" stroke="#000" fill="none"/>
+  <line id="svg_9" y2="182.58511" x2="725.85708" y1="183.58511" x1="725.85708" stroke="#000" fill="none"/>
+  <line stroke-width="4" id="svg_10" y2="158.58511" x2="126.8571" y1="158.58511" x1="22.8571" stroke="#000" fill="none"/>
+  <line stroke-dasharray="2,2" id="svg_11" y2="157.58511" x2="196.85709" y1="157.58511" x1="132.85709" stroke="#000" fill="none"/>
+  <line id="svg_12" y2="157.58511" x2="200.85709" y1="108.58511" x1="200.85709" stroke-dasharray="2,2" stroke="#000" fill="none"/>
+  <ellipse ry="4" rx="4" id="svg_13" cy="159.58511" cx="200.35709" stroke-dasharray="2,2" stroke-width="0" stroke="#000" fill="#000000"/>
+  <text font-weight="normal" xml:space="preserve" text-anchor="start" font-family="'Crimson Pro'" font-size="18" id="svg_14" y="185.58511" x="156.85709" stroke-dasharray="2,2" stroke-width="0" stroke="#000" fill="#000000">C[i,j]=A[i,:]•B[:,j]</text>
+  <text font-style="italic" xml:space="preserve" text-anchor="start" font-family="'Crimson Pro'" font-size="24" id="svg_15" y="164.62594" x="0" stroke-dasharray="2,2" stroke-width="0" stroke="#000" fill="#000000">M</text>
+  <text font-style="italic" xml:space="preserve" text-anchor="start" font-family="'Crimson Pro'" font-size="24" id="svg_16" y="100.62594" x="64.8571" stroke-width="0" stroke="#000" fill="#000000">K</text>
+  <text font-style="italic" xml:space="preserve" text-anchor="start" font-family="'Crimson Pro'" font-size="24" id="svg_17" y="73.76884" x="111.8571" stroke-width="0" stroke="#000" fill="#000000">K</text>
+  <text font-style="italic" xml:space="preserve" text-anchor="start" font-family="'Crimson Pro'" font-size="24" id="svg_18" y="21.76884" x="196.85709" stroke-width="0" stroke="#000" fill="#000000">N</text>
+  <text xml:space="preserve" text-anchor="start" font-family="'Crimson Pro'" font-size="24" id="svg_19" y="246.58511" x="104.8571" stroke-dasharray="2,2" stroke-width="0" stroke="#000" fill="#000000">C=A*B</text>
+ </g>
+</svg>
