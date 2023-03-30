@@ -31,23 +31,23 @@ consider each dot in above graph as an element, which is sub-matrix in general.
 
 ## Baisc calculation scheme
 
-As shown in [Intel manual](#aorm), AMX can do sub-matrix multiplication & accumulation with tile registers (which has 2D layout instead 1D/vector registers used in SIMD).
+As shown in Intel manual[^1], AMX can do sub-matrix multiplication & accumulation with tile registers (which has 2D layout instead 1D/vector registers used in SIMD).
 
-As [brgemm paper](#brgemm) suggested, we should choose the size of sub-matrix of C so it can fit tile register(s), and load & store it only once, before & after all accumulations into it were done.
+As brgemm paper [^brgemm] suggested, we should choose the size of sub-matrix of C so it can fit tile register(s), and load & store it only once, before & after all accumulations into it were done.
 
 Thus the basic flow is, for each sub-matrix $C_{ij}$, we do what specified in GEMM Formula:
 
  1. load $C_{ij}$ into tile registers
  2. go over the dimension K:
     - load sub-matrix $A_{ik}$, $B_{kj}$
-    - do sub-matrix multiplication & accumulation of $ C_{ij} += A_{ik} \cdot B_{kj}$
+    - do sub-matrix multiplication & accumulation of $C_{ij} += A_{ik} \cdot B_{kj}$
  3. store $C_{ij}$ into memory
 
-Step 2 reduce-procedure which is usually the computational heavy part or hot-spot, and it's heavily memory bounded, given that the throughput of TDP* instruction (*the AMX matmul & accumulation instruction*) is 16 cycles, during which (see [ref](aorm2)):
+Step 2 is a reduce-procedure which is usually the computational heavy part or hot-spot, and it's heavily memory bounded, given that the throughput of TDP* instruction (*the AMX matmul & accumulation instruction*) is 16 cycles, during which:
 
  - L1D can load (64x2)x16 = 2KB which is 2 tiles
- - L2 can load (48)x16 = 768 Bytes which is 75% tile
- - LLC can load (21)x16 = 336 Bytes which is 32.8% tile
+ - L2 can load (48)x16 = 768 Bytes which is 75% tile [^2]
+ - LLC can load (21)x16 = 336 Bytes which is 32.8% tile [^2]
  - 8-channel 4800MT/s DDR can load (4.8e9*8*8/1024/1024/1024)/2=143 Bytes @2GHz CPU frequency, which is 13.9% tile
 
 so we should load less tiles in order to perform a single TDP* instruction, which can be done by register blocking.
@@ -83,6 +83,9 @@ If we only considering L2 cache, we have following cache blocking scheme which d
 
 
 ## Refernces
- - chap 20 [Intel® 64 and IA-32 Architectures Optimization Reference Manual](#aorm)
- - Table 2-7. Cache Parameters of the Ice Lake Client Microarchitecture [Intel® 64 and IA-32 Architectures Optimization Reference Manual](#aorm2)
- - [High-Performance Deep Learning via a Single Building Block](#brgemm)
+
+[^1]: chap 20 - "Intel® 64 and IA-32 Architectures Optimization Reference Manual"
+
+[^2]: Table 2-7. Cache Parameters of the Ice Lake Client Microarchitecture - "Intel® 64 and IA-32 Architectures Optimization Reference Manual"
+
+[^brgemm]: High-Performance Deep Learning via a Single Building Block
