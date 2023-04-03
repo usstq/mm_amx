@@ -3,7 +3,9 @@
 #include <memory>
 #include <iostream>
 #include <functional>
+#ifdef ENABLE_NUMA
 #include "numa.h"
+#endif
 
 #define rndup(x, n) (((x + n - 1)/n)*n)
 
@@ -79,14 +81,18 @@ struct tensor2D {
             // align begin address to cache line is vital, so tile load can
             // use all bandwidth (L1D/L2 only deliver data in unit of 64-byte aligned cache-line)
 
+#ifdef ENABLE_NUMA
             if (USE_NUMA) {
                 data = std::shared_ptr<T>(
                             reinterpret_cast<T*>(numa_alloc_local(capacity)),
                             [need_capacity](void * p){ numa_free(p, need_capacity); });
             } else {
+#else
+            {
+#endif
                 data = std::shared_ptr<T>(
                             reinterpret_cast<T*>(aligned_alloc(64, capacity)),
-                            [](void * p) { free(p); });
+                            [](void * p) { ::free(p); });
             }
             if (reinterpret_cast<uintptr_t>(data.get()) % 64)
                 std::cout << "WARNING: resize(), data is not cache-line aligned!" << std::endl;

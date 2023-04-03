@@ -14,6 +14,7 @@
 #include <limits>
 #include <functional>
 #include <iomanip>
+#include <sstream>
 
 //#include "thread_pool.hpp"
 #include "bf16.hpp"
@@ -40,7 +41,7 @@
 #define rndup(x, n) (((x + n - 1)/n)*n)
 
 template<typename T>
-void show(const T * data, int rows, int cols) {
+inline void show(const T * data, int rows, int cols) {
     std::ostream& out = std::cout;
     out << "==============\n";
     for(int i0=0; i0 < rows; i0++) {
@@ -52,14 +53,14 @@ void show(const T * data, int rows, int cols) {
 }
 
 template<typename T>
-void vshow(__m512i v) {
+inline void vshow(__m512i v) {
     T values[512/8/sizeof(T)];
     _mm512_storeu_si512(values, v);
     show(values, 1, 512/8/sizeof(T));
 }
 
 template<typename T>
-void vshow(__m512 v) {
+inline void vshow(__m512 v) {
     T values[512/8/sizeof(T)];
     _mm512_storeu_ps(values, v);
     show(values, 1, 512/8/sizeof(T));
@@ -106,5 +107,6 @@ inline int readenv(const char * name) {
     std::cout << ANSIcolor("32") << "ENV: " << name << " = " << v << std::endl << ANSIcolor();
     return v;
 }
-
+#ifdef ENABLE_NUMA
 static auto USE_NUMA = readenv("USE_NUMA");
+#endif

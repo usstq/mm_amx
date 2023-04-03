@@ -173,14 +173,16 @@ inline bool initXTILE() {
 //===============================================================
 
 #include "bf16.hpp"
+#ifdef ENABLE_NUMA
 #include "numa.h"
+#endif
 
 using ov::bfloat16;
 
 namespace amx_bf16 {
 
 template<typename T, int tile>
-void tshow() {
+inline void tshow() {
     if (std::is_same<bfloat16,T>::value) {
         bfloat16 data[16*32];
         _tile_stored(tile, data, 64);
@@ -258,21 +260,23 @@ struct tileconfig_t {
 //   - support transpose
 //   - blocking scheme
 //
-
+template<typename T>
 struct KpackedB {
-    std::shared_ptr<bfloat16> data;
+    std::shared_ptr<T> data;
     int64_t capacity;
     int K;
     int N;
     int Kblocks;
     int Nblocks;
+    float quant_scale;
+    float dequant_scale;
     KpackedB() {
         capacity = 0;
         K = N = 0;
         Kblocks = Nblocks = 0;
     }
 
-    bfloat16 & operator()(int k, int n) {
+    T & operator()(int k, int n) {
         int kb = k/32;
         int nb = n/32;
         int block_offset = (nb*Kblocks + kb)*(32*32);
@@ -296,28 +300,82 @@ struct KpackedB {
         N = _N;
         Kblocks = rndup(K, 32)/32;
         Nblocks = rndup(N, 32)/32;
-        int64_t need_capacity = Kblocks * Nblocks * 32 * 32 * sizeof(bfloat16);
+        int64_t need_capacity = (Kblocks * Nblocks + 1) * 32 * 32 * sizeof(T);
         need_capacity = rndup(need_capacity, 64);
         if (capacity < need_capacity) {
             capacity = need_capacity;
+#ifdef ENABLE_NUMA
             if (USE_NUMA) {
-                data = std::shared_ptr<bfloat16>(
-                            reinterpret_cast<bfloat16*>(numa_alloc_local(capacity)),
+                data = std::shared_ptr<T>(
+                            reinterpret_cast<T*>(numa_alloc_local(capacity)),
                             [need_capacity](void * p){ numa_free(p, need_capacity); });
             } else {
-                data = std::shared_ptr<bfloat16>(
-                            reinterpret_cast<bfloat16*>(aligned_alloc(64, capacity)),
-                            [](void * p){ free(p); });
+#else
+            {
+#endif
+                data = std::shared_ptr<T>(
+                            reinterpret_cast<T*>(aligned_alloc(64, capacity)),
+                            [](void * p){ ::free(p); });
             }
+            memset(data.get(), 0, capacity);
             if (reinterpret_cast<uintptr_t>(data.get()) % 64)
                 std::cout << "WARNING: data is not cache-line aligned!" << std::endl;
 
         }
     }
 
+    void set_scale(float quant, float dequant) {
+        quant_scale = quant;
+        dequant_scale = dequant;
+    }
+
     void operator=(const float & v) {
-        for(int k = 0; k<capacity/sizeof(bfloat16); k++)
+        for(int k = 0; k<capacity/sizeof(T); k++)
             data.get()[k] = v;
+    }
+
+    // quant from src weight and store all in data
+    // quant: bf16->fp32->int8:
+    //  1, q_scale = 127 / max(abs(w))
+    //  2, w_i8 = round(w * q_scale)
+    void quant_from(KpackedB<bfloat16>& src) {
+        resize(src.K, src.N);
+        auto scale = _mm512_set1_ps(quant_scale);
+        auto p_src = &src(0, 0);
+        auto p_dst = data.get();
+        for (int k = 0; k < src.Kblocks*32; k++) {
+            for (int n = 0; n < src.Nblocks*32; n += 16, p_src += 16, p_dst += 16) {
+                auto a = _mm512_cvtepi16_epi32(_mm256_loadu_epi16(p_src));
+                a = _mm512_slli_epi32(a, 16);
+                auto a_f = _mm512_mul_ps((__m512)a, scale);
+                a = _mm512_cvtps_epi32(a_f);
+                auto a_256 = _mm512_cvtsepi32_epi16(a);
+                auto a_128 = _mm256_cvtsepi16_epi8(a_256);
+                _mm_store_si128((__m128i*)(p_dst), a_128);
+            }
+        }
+    }
+
+    // dequant one block 16x32 i8->bf16
+    // dequant: int8->fp32->bf16
+    //  1, dq_scale = max(abs(w)) / 127
+    //  2, w = w_i8 * dq_scale
+    void dequant16x32_to(int8_t* src, bfloat16* dst) {
+        auto dq_scale = _mm512_set1_ps(dequant_scale);
+        for (int k = 0; k < 16; k++) {
+            auto a = _mm_load_si128((__m128i*)src);
+            auto b = _mm_load_si128((__m128i*)(src + 16));
+            auto a_512 = _mm512_cvtepi8_epi32(a);
+            auto b_512 = _mm512_cvtepi8_epi32(b);
+            auto a_f = _mm512_cvtepi32_ps(a_512);
+            auto b_f = _mm512_cvtepi32_ps(b_512);
+            a_f = _mm512_mul_ps(a_f, dq_scale);
+            b_f = _mm512_mul_ps(b_f, dq_scale);
+            auto reg_out = _mm512_cvtne2ps_pbh(b_f, a_f);
+            _mm512_store_epi32(dst, (__m512i)reg_out);
+            src += 32;
+            dst += 32;
+        }
     }
 };
 
@@ -627,7 +685,7 @@ namespace functional {
     //   0 2 4 6 ... ...
     //   1 3 5 7 ... ...
     // 
-    inline void prepareB(KpackedB & B, tensor2D<bfloat16> & matB, bool transpose = false) {
+    inline void prepareB(KpackedB<bfloat16> & B, tensor2D<bfloat16> & matB, bool transpose = false) {
         int K = matB.dims[transpose?1:0];
         int N = matB.dims[transpose?0:1];
         B.resize(K, N);
@@ -678,6 +736,31 @@ namespace functional {
                     B(k, n) = 0; // padding zero
             }
         }
+    }
+
+    inline void get_min_max(tensor2D<bfloat16> & matB, float& min, float& max) {
+        int K = matB.dims[0];
+        int N = matB.dims[1];
+        auto m_max = _mm512_set1_ps(-__FLT_MAX__);
+        auto m_min = _mm512_set1_ps(__FLT_MAX__);
+        for (int k = 0; k < K; k++) {
+            int n = 0;
+            for (; n < N / 16 * 16; n += 16) {
+                auto a = _mm512_cvtepi16_epi32(_mm256_loadu_epi16(&matB(k, n)));
+                a = _mm512_slli_epi32(a, 16);
+                m_max = _mm512_max_ps((__m512)a, m_max);
+                m_min = _mm512_min_ps((__m512)a, m_min);
+            }
+            if (n != N) {
+                __mmask16 msk = _cvtu32_mask16(0xFFFFu >> (16 - (N - n)));
+                auto a = _mm512_cvtepi16_epi32(_mm256_maskz_loadu_epi16(msk, &matB(k, n)));
+                a = _mm512_slli_epi32(a, 16);
+                m_max = _mm512_mask_max_ps(m_max, msk, (__m512)a, m_max);
+                m_min = _mm512_mask_min_ps(m_min, msk, (__m512)a, m_min);
+            }
+        }
+        max = _mm512_reduce_max_ps(m_max);
+        min = _mm512_reduce_min_ps(m_min);
     }
 };
 
@@ -803,19 +886,27 @@ namespace PP {
 //
 // constB constrols whether it's FC or not 
 struct Matmul {
-    KpackedB internalB;
+    KpackedB<bfloat16> internalB;
+    KpackedB<int8_t> internalBI8;
     tensor2D<bfloat16> scratch;
     tensor2D<bfloat16> scratch2;
     BlockIterator blk_it;
     bool constB;
     bool transposeB;
+    enum WeightPrecision {
+        Weight_F32,
+        Weight_BF16,
+        Weight_INT8,
+        Weight_INT4
+    };
+    WeightPrecision weight_precision;
     // 2x2 C tiles buffer
     // most usecase requires post-processing with AVX, thus buffC
     // is used to transfer data to AVX register
     tensor2D<float> buffC;
 
-    Matmul(bool constB = false, bool transposeB = false) : 
-        constB(constB), transposeB(transposeB), buffC(32, 32) {}
+    Matmul(bool constB = false, bool transposeB = false, WeightPrecision weight_precision = Weight_BF16) : 
+        constB(constB), transposeB(transposeB), weight_precision(weight_precision), buffC(32, 32) {}
 
     // empty PP (for test purpose only, uncommon in real use case)
     void operator()(tensor2D<bfloat16> & matA,
@@ -903,7 +994,14 @@ struct Matmul {
         // for non-constB, internalB is updated every time
         // for constB, internalB is updated once
         if (!constB || (internalB.capacity == 0)) {
-            functional::prepareB(internalB, matB, transposeB);
+            if (weight_precision == Weight_BF16) {
+                functional::prepareB(internalB, matB, transposeB);
+            } else if (weight_precision == Weight_INT8) {
+                internalB.capacity = 1;
+                KpackedB<bfloat16> internalTmpB;
+                functional::prepareB(internalTmpB, matB, transposeB);
+                internalBI8.quant_from(internalTmpB);
+            }
         }
 
         // prepare tails buffer
@@ -958,7 +1056,15 @@ struct Matmul {
             auto * pA0 = &matA(m, 0);
             auto * pA1 = &matA(m + 16, 0);
             auto strideA = matA.stride;
-            auto * pB = &internalB(0, n);
+            bfloat16 * pB;
+            int8_t *pBI8;
+            if (weight_precision == Weight_INT8) {
+                pBI8 = &internalBI8(0, n);
+                pB = reinterpret_cast<bfloat16*>(&buffC(0,0));
+                internalBI8.dequant16x32_to(pBI8, pB);
+            } else {
+                pB = &internalB(0, n);
+            }
             if (valid_m < 32) {
                 // use Atails buffer to prevent memory read segmentfault
                 pA0 = &Atails(0, 0);
@@ -975,20 +1081,46 @@ struct Matmul {
                 int k;
                 for (k = 0; k < Kbody; k += 32) {
                     _tile_loadd(tA0, pA0 + k, strideA);
-                    _tile_loadd(tB0, pB, 64); pB += (16*32);
+                    _tile_loadd(tB0, pB, 64);
                     _tile_dpbf16ps(tC00, tA0, tB0);
-                    _tile_loadd(tB1, pB, 64); pB += (16*32);
+                    if (weight_precision == Weight_INT8) {
+                        pBI8 += (16*32);
+                        internalBI8.dequant16x32_to(pBI8, pB);
+                    } else {
+                        pB += (16*32);
+                    }
+
+                    _tile_loadd(tB1, pB, 64);
                     _tile_dpbf16ps(tC01, tA0, tB1);
+                    if (weight_precision == Weight_INT8) {
+                        pBI8 += (16*32);
+                        internalBI8.dequant16x32_to(pBI8, pB);
+                    } else {
+                        pB += (16*32);
+                    }
                 }
                 // ktail
                 if (k < K) {
                     load_Aktails(pA0 + k, strideA);
                     auto * src = &Aktails(0,0);
                     _tile_loadd(tA0, src, 64);
-                    _tile_loadd(tB0, pB, 64); pB += (16*32);
+                    _tile_loadd(tB0, pB, 64);
                     _tile_dpbf16ps(tC00, tA0, tB0);
-                    _tile_loadd(tB1, pB, 64); pB += (16*32);
+                    if (weight_precision == Weight_INT8) {
+                        pBI8 += (16*32);
+                        internalBI8.dequant16x32_to(pBI8, pB);
+                    } else {
+                        pB += (16*32);
+                    }
+
+                    _tile_loadd(tB1, pB, 64);
                     _tile_dpbf16ps(tC01, tA0, tB1);
+                    if (weight_precision == Weight_INT8) {
+                        pBI8 += (16*32);
+                        internalBI8.dequant16x32_to(pBI8, pB);
+                    } else {
+                        pB += (16*32);
+                    }
                 }
                 _tile_stored(tC00, &buffC(0,0), buffC.stride);
                 _tile_stored(tC01, &buffC(0,16), buffC.stride);
@@ -997,12 +1129,26 @@ struct Matmul {
                 _tile_loadd(tA0, pA0 + 0, strideA);
                 int k;
                 for (k = 0; k < Kbody; k += 32) {
-                    _tile_loadd(tB0, pB, 64); pB += (16*32);
+                    _tile_loadd(tB0, pB, 64);
                     _tile_dpbf16ps(tC00, tA0, tB0);
+                    if (weight_precision == Weight_INT8) {
+                        pBI8 += (16*32);
+                        internalBI8.dequant16x32_to(pBI8, pB);
+                    } else {
+                        pB += (16*32);
+                    }
+
                     _tile_loadd(tA1, pA1 + k, strideA);
                     _tile_dpbf16ps(tC10, tA1, tB0);
-                    _tile_loadd(tB1, pB, 64); pB += (16*32);
+                    _tile_loadd(tB1, pB, 64);
                     _tile_dpbf16ps(tC01, tA0, tB1);
+                    if (weight_precision == Weight_INT8) {
+                        pBI8 += (16*32);
+                        internalBI8.dequant16x32_to(pBI8, pB);
+                    } else {
+                        pB += (16*32);
+                    }
+
                     _tile_loadd(tA0, pA0 + k + 32, strideA);    // balance load & dp. load next
                     _tile_dpbf16ps(tC11, tA1, tB1);
                 }
@@ -1010,12 +1156,26 @@ struct Matmul {
                     load_Aktails(pA0 + k, strideA);
                     auto * src = &Aktails(0,0);
                     _tile_loadd(tA0, src, 64);
-                    _tile_loadd(tB0, pB, 64); pB += (16*32);
+                    _tile_loadd(tB0, pB, 64);
                     _tile_dpbf16ps(tC00, tA0, tB0);
+                    if (weight_precision == Weight_INT8) {
+                        pBI8 += (16*32);
+                        internalBI8.dequant16x32_to(pBI8, pB);
+                    } else {
+                        pB += (16*32);
+                    }
+
                     _tile_loadd(tA1, src + (16*32), 64);
                     _tile_dpbf16ps(tC10, tA1, tB0);
-                    _tile_loadd(tB1, pB, 64); pB += (16*32);
+                    _tile_loadd(tB1, pB, 64);
                     _tile_dpbf16ps(tC01, tA0, tB1);
+                    if (weight_precision == Weight_INT8) {
+                        pBI8 += (16*32);
+                        internalBI8.dequant16x32_to(pBI8, pB);
+                    } else {
+                        pB += (16*32);
+                    }
+
                     _tile_dpbf16ps(tC11, tA1, tB1);
                 }
                 _tile_stored(tC00, &buffC(0,0), buffC.stride);
