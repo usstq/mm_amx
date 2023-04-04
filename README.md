@@ -48,13 +48,13 @@ Step 2 is a reduce-procedure which is usually the computational heavy part or ho
  - L1D can load (64x2)x16 = 2KB which is 2 tiles
  - L2 can load (48)x16 = 768 Bytes which is 75% tile [^2]
  - LLC can load (21)x16 = 336 Bytes which is 32.8% tile [^2]
- - 8-channel 4800MT/s DDR can load (4.8e9*8*8/1024/1024/1024)/2=143 Bytes @2GHz CPU frequency, which is 13.9% tile
+ - 8-channel 4800MT/s DDR can load (4.8e9 x 8 x 8/2e9)/56 x 16 = 43.8 Bytes/core @2GHz CPU frequency on chip with 56-cores, which is 4.2% tile
 
 so we should load less tiles in order to perform a single TDP* instruction, which can be done by register blocking.
 
 ## Register blocking
 
-consider using single tile for C submatrix, then we would load tile A & tile B for each `C+=A*B`, this gives 2 tiles load per TDP*, similarly:
+consider using single tile for C submatrix, then we need load one tile A and one tile B for each TDP* computation `C+=A*B`, this gives 2 tile-loads per TDP*, similarly:
 
  - 1x2 blocking: `1A*2B=>2C`, 3/2 tile loads per TDP*
  - 1x4 blocking: `1A*4B=>4C`, 5/4 tile loads per TDP*
