@@ -9,6 +9,20 @@
 
 #define rndup(x, n) (((x + n - 1)/n)*n)
 
+// https://stackoverflow.com/questions/570669/checking-if-a-double-or-float-is-nan-in-c/57770634#57770634
+static inline uint32_t load_ieee754_rep(float a) {
+    uint32_t r;
+    static_assert(sizeof r == sizeof a, "Unexpected sizes.");
+    std::memcpy(&r, &a, sizeof a); // Generates movd instruction.
+    return r;
+}
+constexpr uint32_t inf_float_shl1 = UINT32_C(0xff000000);
+// The shift left removes the sign bit. The exponent moves into the topmost bits,
+// so that plain unsigned comparison is enough.
+static inline bool isnan2(float a)     { return load_ieee754_rep(a) << 1  > inf_float_shl1; }
+static inline bool isinf2(float a)     { return load_ieee754_rep(a) << 1 == inf_float_shl1; }
+static inline bool isfinite2(float a)  { return load_ieee754_rep(a) << 1  < inf_float_shl1; }
+
 template<typename T>
 struct tensor2D {
     int dims[2];
@@ -154,19 +168,29 @@ struct tensor2D {
     }
 
     bool operator==(const tensor2D<T> & rhs) {
-        bool ok = true;
         if (dims[0] != rhs.dims[0] || dims[1] != rhs.dims[1])
             return false;
         for(int i0=0; i0<dims[0]; i0++)
         for(int i1=0; i1<dims[1]; i1++) {
-            if ((*this)(i0,i1) != rhs(i0,i1)) {
-                std::cout << " operator== failed at (" << i0 << ", " << i1 << ")  value "
-                          << (*this)(i0,i1) << "!=" << rhs(i0,i1) << std::endl;
-                ok = false;
-                return ok;
+            // with -ffast-math,  std::isnan, std::isinf,  x != x  always return false
+            // so we need special logic to test nan here
+            if (std::is_same<T, ov::bfloat16>::value ||
+                std::is_same<T, float>::value) {
+                float f0 = (*this)(i0,i1);
+                float f1 = rhs(i0,i1);
+                if (isnan2(f1) || isnan2(f0)) {
+                    std::cout << " nan is found: f0=" << f0 << ",  f1=" << f1 << std::endl;
+                    return false;
+                }
             }
+
+            if ((*this)(i0,i1) == rhs(i0,i1))
+                continue;
+            std::cout << " operator== failed at (" << i0 << ", " << i1 << ")  value "
+                        << (*this)(i0,i1) << "!=" << rhs(i0,i1) << std::endl;
+            return false;
         }
-        return ok;
+        return true;
     }
     bool compare(const tensor2D<T> & rhs, float tolerance) {
         float max_abs_diff = 0;
