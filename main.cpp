@@ -39,7 +39,7 @@ int amx_unit_test_perf() {
     tensor2D<bfloat16> A(M, K);
     tensor2D<bfloat16> BT(N, K);
     tensor2D<bfloat16> C(M, N);
-    amx_bf16::tileconfig_t tfg(1, 0, 8, 16, 64);
+    tileconfig_t tfg(1, 0, 8, 16, 64);
 
     std::cout << "A & B in L1D (should give theoratical peak Gflops)\n\t";
     timer(-100,[&](){
@@ -531,7 +531,7 @@ void test_bf16() {
         tensor2D<bfloat16> A(16, 32);
         tensor2D<bfloat16> BT(16, 32);
         tensor2D<bfloat16> C(16, 16);
-        amx_bf16::tileconfig_t tfg(1, 0, 8, 16, 64);
+        tileconfig_t tfg(1, 0, 8, 16, 64);
         const int tileA = 0;
         const int tileB = 1;
         const int tileC = 2;
@@ -540,7 +540,7 @@ void test_bf16() {
         _tile_loadd(tileA, &A(0,0), 64);
         _tile_loadd(tileB, &BT(0,0), 64);
         _tile_dpbf16ps(tileC, tileA, tileB);
-        amx_bf16::tshow<float, 2>();
+        tshow<float, 2>();
     }
 
 }
