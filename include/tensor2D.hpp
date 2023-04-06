@@ -117,9 +117,23 @@ struct tensor2D {
     }
 
     void fill_rnd() {
-        for(int i = 0; i<dims[0]*padded_dim1; i++) {
+        auto * p = data.get();
+        int i = 0;
+        for(i = 0; i<dims[0]*padded_dim1; i+=8) {
             // lower mantissa can help to avoid small errors in accuracy comparison
-            (*this)[i] = (rand() & 1) - 0.5;
+            auto num = rand() & 0x07;
+            p[i] = (num & 1) - 0.5f; num>>=1;
+            p[i+1] = (num & 1) - 0.5f; num>>=1;
+            p[i+2] = (num & 1) - 0.5f; num>>=1;
+            p[i+3] = (num & 1) - 0.5f; num>>=1;
+            p[i+4] = (num & 1) - 0.5f; num>>=1;
+            p[i+5] = (num & 1) - 0.5f; num>>=1;
+            p[i+6] = (num & 1) - 0.5f; num>>=1;
+            p[i+7] = (num & 1) - 0.5f; num>>=1;
+        }
+        for(i = 0; i<dims[0]*padded_dim1; i++) {
+            auto num = rand();
+            p[i] = (num & 1) - 0.5f;
         }
     }
 

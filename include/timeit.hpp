@@ -68,6 +68,18 @@ struct timeit {
         }
     };
 
+    std::string _tag = "";
+
+    template<typename ... Ts>
+    timeit& tag(Ts... args) {
+        std::stringstream ss;
+        int dummy[sizeof...(Ts)] = { (ss << args << "_", 0)... };
+        _tag = ss.str();
+        if (_tag.size() > 1 && _tag.back() == '_')
+            _tag.pop_back();
+        return *this;
+    }
+
     template<typename Callable>
     double operator()(
                       int expect_times_milliseconds,
@@ -76,12 +88,11 @@ struct timeit {
                       double peakOpsPerSecond = 0,
                       const char * unit = "Ops") {
         int times;
-
         // cache warm-up
         std::cout << "warm-up..." << std::flush;
         c();
         c();
-        std::cout << "done" << std::endl;
+        std::cout << "done\r" << std::flush;
         // determine times
         if (expect_times_milliseconds > 0) {
             times = expect_times_milliseconds;
@@ -100,10 +111,10 @@ struct timeit {
             c();
         }
         auto finish = std::chrono::high_resolution_clock::now();
-        std::cout << "done" << std::endl;
+        std::cout << "done\r" << std::flush;
         std::chrono::duration<double> total_latency = finish-start;
         auto avg_latency = total_latency.count()/times;
-        std::cout << ANSIcolor("0;33") << "Average latency : " << avg_latency*1e6 << " us x " << times;
+        std::cout << ANSIcolor("0;33") << _tag << " Avg latency : " << avg_latency*1e6 << " us x " << times;
         if (opsPerCall > 0 && peakOpsPerSecond > 0) {
             std::cout << "  HW Usage : " << static_cast<int>(100*(opsPerCall/avg_latency)/(peakOpsPerSecond)) << "% ("
                     << opsPerCall/avg_latency/(1e9) << " G" << unit << " /"

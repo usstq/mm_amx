@@ -998,6 +998,20 @@ struct Matmul {
                 functional::prepareB(internalB, matB, transposeB);
             } else if (weight_precision == Weight_INT8) {
                 internalB.capacity = 1;
+
+                // this dynamic quantization of weight matrix using minmax
+                // is time-consuming, should be used only for constB
+                if (!constB) {
+                    std::cout << "\t WANING: dynamic quantization of weight matrix for non-constB is time-consuming " << std::endl;
+                }
+                float min, max;
+                amx_bf16::functional::get_min_max(matB, min, max);
+                float q, dq;
+                max = std::max(std::abs(max), std::abs(min));
+                q = 127 / max;
+                dq = max / 127;
+                internalBI8.set_scale(q, dq);
+
                 KpackedB<bfloat16> internalTmpB;
                 functional::prepareB(internalTmpB, matB, transposeB);
                 internalBI8.quant_from(internalTmpB);
@@ -1193,6 +1207,16 @@ struct Matmul {
     }
 };
 
+std::ostream & operator<<(std::ostream & os, Matmul::WeightPrecision & prec) {
+    static const char* names_prec[] = {
+    "f32",
+    "bf16",
+    "int8",
+    "int4"
+    };
+    os << names_prec[(int)prec];
+    return os;
+}
 
 #if 0
 // using only 1 tile in C matrix:

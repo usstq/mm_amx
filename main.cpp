@@ -26,6 +26,8 @@ timeit timer;
 // initialize AMX
 static bool initAMX = initXTILE();
 
+static amx_bf16::Matmul::WeightPrecision precision = amx_bf16::Matmul::Weight_BF16;
+
 //================================================================================
 int amx_unit_test_perf() {
     int M = 32;
@@ -166,38 +168,18 @@ int amx_unit_test_perf() {
     std::cout << C(0,0) << std::endl;
     return 0;
 }
-static const char* names_prec[] = {
-    "f32",
-    "bf16",
-    "int8",
-    "int4"
-};
 
-void amx_FC_acc(int M, int K, int N, amx_bf16::Matmul::WeightPrecision precision=amx_bf16::Matmul::Weight_BF16) {
+void amx_FC_acc(int M, int K, int N) {
     tensor2D<bfloat16> A(M, K);
     tensor2D<bfloat16> B(K, N);
     tensor2D<bfloat16> C(M, N);
     tensor2D<bfloat16> C0(M, N);
-    if (precision==amx_bf16::Matmul::Weight_BF16) {
-        amx_bf16::Matmul fc(true);
-        fc(A, B, C);
-    } else if (precision==amx_bf16::Matmul::Weight_INT8) {
-        amx_bf16::Matmul fc(true, false, amx_bf16::Matmul::Weight_INT8);
-
-        float min, max;
-        amx_bf16::functional::get_min_max(B, min, max);
-        float q, dq;
-        max = std::max(std::abs(max), std::abs(min));
-        q = 127 / max;
-        dq = max / 127;
-        fc.internalBI8.set_scale(q, dq);
-
-        fc(A, B, C);
-    }
+    amx_bf16::Matmul fc(true, false, precision);
+    fc(A, B, C);
 
     C0=0;
     matmul(A, B, C0);
-    std::cout << __func__ << " [" << M << "," << K << "," << N << "," << names_prec[(int)precision] << "] ";
+    std::cout << __func__ << " [" << M << "," << K << "," << N << "," << precision << "] ";
     if (C0 == C) {
         std::cout << ANSIcolor("1;32") << "Match!\n" << ANSIcolor();
         //std::cout << C << std::endl;
@@ -208,36 +190,17 @@ void amx_FC_acc(int M, int K, int N, amx_bf16::Matmul::WeightPrecision precision
     }
 }
 
-void amx_FC_perf(int M, int K, int N, int times = -1000, amx_bf16::Matmul::WeightPrecision precision=amx_bf16::Matmul::Weight_BF16) {
+void amx_FC_perf(int M, int K, int N, int times = -1000) {
     tensor2D<bfloat16> A(M, K);
     tensor2D<bfloat16> B(K, N);
     tensor2D<bfloat16> C(M, N);
-    std::cout << __func__ << " [" << M << "," << K << "," << N << "," << names_prec[(int)precision] << "] ";
-    if (precision==amx_bf16::Matmul::Weight_BF16) {
-        tensor2D<bfloat16> C0(M, N);
-        amx_bf16::Matmul mm(true);
-        timer(times, [&](){
-            mm(A, B, C);
-        },
-        double(M * N) * K * 2,
-        AMXBf16PeakGops2PerCore * 1e9);        
-    } else if (precision==amx_bf16::Matmul::Weight_INT8) {
-        amx_bf16::Matmul mm(true, false, amx_bf16::Matmul::Weight_INT8);
+    amx_bf16::Matmul mm(true, false, precision);
 
-        float min, max;
-        amx_bf16::functional::get_min_max(B, min, max);
-        float q, dq;
-        max = std::max(std::abs(max), std::abs(min));
-        q = 127 / max;
-        dq = max / 127;
-        mm.internalBI8.set_scale(q, dq);
-
-        timer(times, [&](){
-            mm(A, B, C);
-        },
-        double(M * N) * K * 2,
-        AMXBf16PeakGops2PerCore * 1e9);
-    }
+    timer.tag(__func__, M, K, N, precision)(times, [&](){
+        mm(A, B, C);
+    },
+    double(M * N) * K * 2,
+    AMXBf16PeakGops2PerCore * 1e9);
 }
 
 void amx_Matmul_perf(int M, int K, int N, bool transB, int times = -1000) {
@@ -328,14 +291,20 @@ void test_blk_loops() {
     });
 }
 
+#if 0
+
+// ThreadPool has much lower performance than OMP
 
 ThreadPool thp;
 
 // multi-threaded matmul
 struct MatmulMT {
+    amx_bf16::Matmul::WeightPrecision rt_precision;
     std::vector<std::shared_ptr<amx_bf16::Matmul>> ops;
     bool transposeB;
-    MatmulMT(bool constB = false, bool transposeB = false) : transposeB(transposeB) {
+    MatmulMT(bool constB = false,
+             bool transposeB = false,
+             amx_bf16::Matmul::WeightPrecision precision=amx_bf16::Matmul::Weight_BF16) : transposeB(transposeB), rt_precision(precision) {
         for(int i = 0; i < thp.num_threads; i++)
             ops.push_back(std::make_shared<amx_bf16::Matmul>(constB, transposeB));
     }
@@ -363,15 +332,19 @@ struct MatmulMT {
         thp.Paralell_NT(kernel);
     }
 };
+#endif
 
 int OMP_NT = omp_thread_count();
 
 struct MatmulMTOMP {
+    amx_bf16::Matmul::WeightPrecision rt_precision;
     std::vector<std::shared_ptr<amx_bf16::Matmul>> ops;
     bool transposeB;
-    MatmulMTOMP(bool constB = false, bool transposeB = false) : transposeB(transposeB) {
-        for(int i = 0; i < thp.num_threads; i++)
-            ops.push_back(std::make_shared<amx_bf16::Matmul>(constB, transposeB));
+    MatmulMTOMP(bool constB = false,
+                bool transposeB = false,
+                amx_bf16::Matmul::WeightPrecision precision=amx_bf16::Matmul::Weight_BF16) : transposeB(transposeB), rt_precision(precision) {
+        for(int i = 0; i < OMP_NT; i++)
+            ops.push_back(std::make_shared<amx_bf16::Matmul>(constB, transposeB, rt_precision));
     }
 
     template<typename P>
@@ -408,24 +381,26 @@ void amx_MatmulMT_perf(int M, int K, int N, bool transB, int times = -1000) {
     tensor2D<bfloat16> BT = B.Tr();
     tensor2D<bfloat16> C(M, N);
     tensor2D<bfloat16> C0(M, N);
-    amx_bf16::Matmul mm(true, transB);
-    MatmulMT                  mmMT(true, transB);
-    amx_bf16::PP::Store2bf16 pp0(C0);
-    amx_bf16::PP::Store2bf16 pp(C);
+    amx_bf16::Matmul mm(true, transB, precision);
+    MatmulMTOMP      mmMT(true, transB, precision);
+    //amx_bf16::PP::Store2bf16 pp0(C0);
+    //amx_bf16::PP::Store2bf16 pp(C);
+    tensor2D<float> Bias0(1, N);
+    amx_bf16::PP::Addbias_Gelu_Store2bf16 pp0(C0, &Bias0(0,0));
+    amx_bf16::PP::Addbias_Gelu_Store2bf16 pp(C, &Bias0(0,0));
 
-    std::cout << __func__ << " [" << M << "," << K << "," << N << "] ";
-
-    timer(times, [&](){
+    timer.tag(__func__, "ST", M, K, N, precision)(times, [&](){
         mm(A, transB?BT:B, pp0);
     },
     double(M * N) * K * 2,
     AMXBf16PeakGops2PerCore * 1e9);
 
-    timer(times, [&](){
+    timer.tag(__func__, "MT", M, K, N, precision)(times, [&](){
         mmMT(A, transB?BT:B, pp);
     },
     double(M * N) * K * 2,
     AMXBf16PeakGops2PerCore * 1e9);
+
     if (C0 == C) {
         std::cout << ANSIcolor("1;32") << "Match!\n" << ANSIcolor();
         //std::cout << C << std::endl;
@@ -476,7 +451,7 @@ void amx_MatmulMT_BiasGelu_perf(int M, int K, int N, bool transB, int times = -1
     tensor2D<bfloat16> C0(M, N);
     tensor2D<float> Bias(1, N);
     amx_bf16::Matmul mm(true, transB);
-    MatmulMT                  mmMT(true, transB);
+    MatmulMTOMP      mmMT(true, transB);
     amx_bf16::PP::Addbias_Gelu_Store2bf16 pp0(C0, &Bias(0,0));
     amx_bf16::PP::Addbias_Gelu_Store2bf16 pp(C, &Bias(0,0));
 
@@ -593,11 +568,9 @@ void amx_MatmulMT_multi_perf(int M, int K, int N, int repeates, int times = -100
     }
 
     //MatmulMT                  mmMT(true, false);
-    MatmulMTOMP               mmMT(true, false);
+    MatmulMTOMP               mmMT(true, false, precision);
 
-    std::cout << __func__ << " [" << M << "," << K << "," << N << "] ";
-
-    timer(times, [&](){
+    timer.tag(__func__, M, K, N, precision)(times, [&](){
         for(int i = 0; i<repeates; i++) {
             amx_bf16::PP::Addbias_Gelu_Store2bf16 ppToA2(A2, &biasA2[i](0,0));
             amx_bf16::PP::Addbias_Gelu_Store2bf16 ppToA1(A1, &biasA1[i](0,0));
@@ -615,7 +588,7 @@ void amx_MatmulMT_multi_perf(int M, int K, int N, int repeates, int times = -100
 
 int main(int argc, const char *argv[]) {
     timer.set_app(argv[0]);
-    thp.Start();
+    //thp.Start();
 
     //test_all_bw(3.0); return 0;
 
@@ -623,7 +596,25 @@ int main(int argc, const char *argv[]) {
     std::cout << ANSIcolor("31") << "omp_get_num_threads() = " << omp_get_num_threads() << std::endl << ANSIcolor();
     std::cout << ANSIcolor("31") << "OMP_NT = " << OMP_NT << std::endl << ANSIcolor();
 
-    // amx_MatmulMT_multi_perf(2, 2560, 10240, 51, -10000);
+    precision = amx_bf16::Matmul::Weight_BF16;
+    amx_FC_acc(32*22 + 31, 10*32 + 17, 256 + 15);
+    precision = amx_bf16::Matmul::Weight_INT8;
+    amx_FC_acc(32*22 + 31, 10*32 + 17, 256 + 15);
+
+    precision = amx_bf16::Matmul::Weight_BF16;
+    amx_MatmulMT_perf(2, 2560, 10240, false, -1000);
+    amx_MatmulMT_perf(2, 2560, 10240, false, -1000);
+    precision = amx_bf16::Matmul::Weight_INT8;
+    amx_MatmulMT_perf(2, 2560, 10240, false, -1000);
+    amx_MatmulMT_perf(2, 2560, 10240, false, -1000);
+
+    precision = amx_bf16::Matmul::Weight_BF16;
+    amx_MatmulMT_multi_perf(2, 2560, 10240, 51, -10000);
+    amx_MatmulMT_multi_perf(2, 2560, 10240, 51, -10000);
+    precision = amx_bf16::Matmul::Weight_INT8;
+    amx_MatmulMT_multi_perf(2, 2560, 10240, 51, -10000);
+    amx_MatmulMT_multi_perf(2, 2560, 10240, 51, -10000);
+    return 0;
     // return 0;
 
     //test_bf16(); return 0;
@@ -665,13 +656,13 @@ int main(int argc, const char *argv[]) {
     amx_FC_acc(32*22 + 31, 10*32 + 1, 256 + 15);
     amx_FC_acc(32*22 + 31, 10*32 + 17, 256 + 15);
 
-    amx_FC_acc(2, 10*32, 256, amx_bf16::Matmul::Weight_INT8);
-    amx_FC_acc(32*22, 10*32, 256, amx_bf16::Matmul::Weight_INT8);
-    amx_FC_acc(32*22 + 1, 10*32, 256 + 1, amx_bf16::Matmul::Weight_INT8);
-    amx_FC_acc(32*22 + 16, 10*32, 256 + 17, amx_bf16::Matmul::Weight_INT8);
-    amx_FC_acc(32*22 + 31, 10*32, 256 + 15, amx_bf16::Matmul::Weight_INT8);
-    amx_FC_acc(32*22 + 31, 10*32 + 1, 256 + 15, amx_bf16::Matmul::Weight_INT8);
-    amx_FC_acc(32*22 + 31, 10*32 + 17, 256 + 15, amx_bf16::Matmul::Weight_INT8);
+    amx_FC_acc(2, 10*32, 256);
+    amx_FC_acc(32*22, 10*32, 256);
+    amx_FC_acc(32*22 + 1, 10*32, 256 + 1);
+    amx_FC_acc(32*22 + 16, 10*32, 256 + 17);
+    amx_FC_acc(32*22 + 31, 10*32, 256 + 15);
+    amx_FC_acc(32*22 + 31, 10*32 + 1, 256 + 15);
+    amx_FC_acc(32*22 + 31, 10*32 + 17, 256 + 15);
 
     amx_FC_perf(32*28, 32*80, 10240);
     amx_FC_perf(32*28 + 1, 32*80, 10240);
@@ -682,14 +673,14 @@ int main(int argc, const char *argv[]) {
 
     amx_FC_perf(896, 256, 1024, 10000);
 
-    amx_FC_perf(32*28, 32*80, 10240, -1000, amx_bf16::Matmul::Weight_INT8);
-    amx_FC_perf(32*28 + 1, 32*80, 10240, -1000, amx_bf16::Matmul::Weight_INT8);
-    amx_FC_perf(32*28, 32*80 + 1, 10240, -1000, amx_bf16::Matmul::Weight_INT8);
-    amx_FC_perf(32*28, 32*80, 10240 + 1, -1000, amx_bf16::Matmul::Weight_INT8);
-    amx_FC_perf(32*28 + 1, 32*80 + 1, 10240 + 1, -1000, amx_bf16::Matmul::Weight_INT8);
-    amx_FC_perf(32*28 + 32, 32*80 + 32, 10240 + 32, -1000, amx_bf16::Matmul::Weight_INT8);
+    amx_FC_perf(32*28, 32*80, 10240, -1000);
+    amx_FC_perf(32*28 + 1, 32*80, 10240, -1000);
+    amx_FC_perf(32*28, 32*80 + 1, 10240, -1000);
+    amx_FC_perf(32*28, 32*80, 10240 + 1, -1000);
+    amx_FC_perf(32*28 + 1, 32*80 + 1, 10240 + 1, -1000);
+    amx_FC_perf(32*28 + 32, 32*80 + 32, 10240 + 32, -1000);
 
-    amx_FC_perf(896, 256, 1024, 10000, amx_bf16::Matmul::Weight_INT8);
+    amx_FC_perf(896, 256, 1024, 10000);
 
     return 0;
 }
