@@ -8,7 +8,10 @@ icx ./main.cpp -O2 -DENABLE_NUMA -I./include -lpthread -march=native -lstdc++ -S
 cat _main.s | c++filt > main.s &&
 icx ./main.cpp -O2 -DENABLE_NUMA -I./include -lpthread -march=native -lstdc++ -lnuma -qopenmp -o $target &&
 icx ./main.cpp -O0 -DENABLE_NUMA -g -I./include -lpthread -march=native -lstdc++ -lnuma -qopenmp -o debug.out &&
-numactl -m 0-3 -C 0-55 ./$target &&
+echo $target is generated &&
 echo main.s is generated &&
 echo debug.out is generated &&
-echo $target is generated
+echo ======== test begin========== &&
+echo numactl --localalloc -C 0-55 ./$target &&
+numactl --localalloc -C 0-55 ./$target
+

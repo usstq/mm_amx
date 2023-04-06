@@ -552,7 +552,7 @@ repeate following topology
    ...
 
 */
-void amx_MatmulMT_multi_perf(int M, int K, int N, int repeates, int times = -1000) {
+void amx_FC_MTML_perf(int M, int K, int N, int repeates, int times = -1000) {
     tensor2D<bfloat16> A1(M, K);
     tensor2D<bfloat16> A2(M, N);
 
@@ -560,15 +560,22 @@ void amx_MatmulMT_multi_perf(int M, int K, int N, int repeates, int times = -100
     std::vector<tensor2D<bfloat16>> B2s;
     std::vector<tensor2D<float>> biasA1;
     std::vector<tensor2D<float>> biasA2;
+    std::vector<MatmulMTOMP> FC1;
+    std::vector<MatmulMTOMP> FC2;
+    //MatmulMTOMP               mmMT(true, false, precision);
+
     for(int i = 0; i<repeates; i++) {
         B1s.emplace_back(K, N);
         B2s.emplace_back(N, K);
         biasA1.emplace_back(1, K);
         biasA2.emplace_back(1, N);
+        // MatmulMTOMP internally will cache B matrix, so we need
+        // multiple instances, one for each FC layer.
+        FC1.emplace_back(true, false, precision);
+        FC2.emplace_back(true, false, precision);
     }
 
-    //MatmulMT                  mmMT(true, false);
-    MatmulMTOMP               mmMT(true, false, precision);
+    double elesize = (precision == amx_bf16::Matmul::Weight_BF16)? sizeof(bfloat16) : sizeof(int8_t);
 
     timer.tag(__func__, M, K, N, precision)(times, [&](){
         for(int i = 0; i<repeates; i++) {
@@ -576,14 +583,51 @@ void amx_MatmulMT_multi_perf(int M, int K, int N, int repeates, int times = -100
             amx_bf16::PP::Addbias_Gelu_Store2bf16 ppToA1(A1, &biasA1[i](0,0));
             //amx_bf16::PP::Store2bf16 ppToA2(A2);
             //amx_bf16::PP::Store2bf16 ppToA1(A1);
-
-            mmMT(A1, B1s[i], ppToA2);
-            mmMT(A2, B2s[i], ppToA1);
+            FC1[i](A1, B1s[i], ppToA2);
+            FC2[i](A2, B2s[i], ppToA1);
         }
     },
-    (double(N) * K * sizeof(bfloat16)) * 2 * repeates,
+    (double(N) * K * elesize) * 2 * repeates,
     1e12,
     "Byte/s");
+}
+
+void test_acc() {
+    auto do_test_acc = [&](){
+        amx_FC_acc(32*22, 10*32, 256);
+        amx_FC_acc(32*22 + 1, 10*32, 256 + 1);
+        amx_FC_acc(32*22 + 16, 10*32, 256 + 17);
+        amx_FC_acc(32*22 + 31, 10*32, 256 + 15);
+        amx_FC_acc(32*22 + 31, 10*32 + 1, 256 + 15);
+        amx_FC_acc(32*22 + 31, 10*32 + 17, 256 + 15);
+        amx_FC_acc(2, 10*32, 256);
+    };
+    precision = amx_bf16::Matmul::Weight_BF16;
+    do_test_acc();
+    precision = amx_bf16::Matmul::Weight_INT8;
+    do_test_acc();
+}
+
+void test_perf() {
+    auto do_test_perf = [&](){
+        amx_FC_perf(32*28, 32*80, 10240);
+        amx_FC_perf(32*28 + 1, 32*80, 10240);
+        amx_FC_perf(32*28 + 16, 32*80, 10240);
+        amx_FC_perf(32*28 + 17, 32*80, 10240);
+        amx_FC_perf(32*28 + 31, 32*80, 10240);
+        amx_FC_perf(32*28, 32*80, 10240);
+        amx_FC_perf(32*28 + 1, 32*80, 10240);
+        amx_FC_perf(32*28, 32*80 + 1, 10240);
+        amx_FC_perf(32*28, 32*80, 10240 + 1);
+        amx_FC_perf(32*28 + 1, 32*80 + 1, 10240 + 1);
+        amx_FC_perf(32*28 + 32, 32*80 + 32, 10240 + 32);
+        amx_FC_perf(896, 256, 1024, 10000);
+        amx_FC_perf(896, 256, 1024, 10000);
+    };
+    precision = amx_bf16::Matmul::Weight_BF16;
+    do_test_perf();
+    precision = amx_bf16::Matmul::Weight_INT8;
+    do_test_perf();
 }
 
 int main(int argc, const char *argv[]) {
@@ -596,6 +640,9 @@ int main(int argc, const char *argv[]) {
     std::cout << ANSIcolor("31") << "omp_get_num_threads() = " << omp_get_num_threads() << std::endl << ANSIcolor();
     std::cout << ANSIcolor("31") << "OMP_NT = " << OMP_NT << std::endl << ANSIcolor();
 
+    //test_acc();
+    //test_perf();
+
     precision = amx_bf16::Matmul::Weight_BF16;
     amx_FC_acc(32*22 + 31, 10*32 + 17, 256 + 15);
     precision = amx_bf16::Matmul::Weight_INT8;
@@ -609,11 +656,11 @@ int main(int argc, const char *argv[]) {
     amx_MatmulMT_perf(2, 2560, 10240, false, -1000);
 
     precision = amx_bf16::Matmul::Weight_BF16;
-    amx_MatmulMT_multi_perf(2, 2560, 10240, 51, -10000);
-    amx_MatmulMT_multi_perf(2, 2560, 10240, 51, -10000);
+    amx_FC_MTML_perf(2, 2560, 10240, 20, -10000);
+    amx_FC_MTML_perf(2, 2560, 10240, 20, -10000);
     precision = amx_bf16::Matmul::Weight_INT8;
-    amx_MatmulMT_multi_perf(2, 2560, 10240, 51, -10000);
-    amx_MatmulMT_multi_perf(2, 2560, 10240, 51, -10000);
+    amx_FC_MTML_perf(2, 2560, 10240, 20, -10000);
+    amx_FC_MTML_perf(2, 2560, 10240, 20, -10000);
     return 0;
     // return 0;
 
@@ -634,11 +681,6 @@ int main(int argc, const char *argv[]) {
     amx_MatmulMT_perf(2*901, 2560, 7680, false);
     amx_MatmulMT_BiasGelu_perf(2*901, 2560, 7680, false);
 
-    amx_FC_perf(32*28, 32*80, 10240);
-    amx_FC_perf(32*28 + 1, 32*80, 10240);
-    amx_FC_perf(32*28 + 16, 32*80, 10240);
-    amx_FC_perf(32*28 + 17, 32*80, 10240);
-    amx_FC_perf(32*28 + 31, 32*80, 10240);
 
     amx_Matmul_perf(928, 96, 928, true);
     amx_Matmul_perf(901, 80, 901, true);
@@ -647,40 +689,5 @@ int main(int argc, const char *argv[]) {
     test_blk_loops();
 
     amx_unit_test_gemAvB(901, 80);
-
-    //amx_unit_test_perf();
-    amx_FC_acc(32*22, 10*32, 256);
-    amx_FC_acc(32*22 + 1, 10*32, 256 + 1);
-    amx_FC_acc(32*22 + 16, 10*32, 256 + 17);
-    amx_FC_acc(32*22 + 31, 10*32, 256 + 15);
-    amx_FC_acc(32*22 + 31, 10*32 + 1, 256 + 15);
-    amx_FC_acc(32*22 + 31, 10*32 + 17, 256 + 15);
-
-    amx_FC_acc(2, 10*32, 256);
-    amx_FC_acc(32*22, 10*32, 256);
-    amx_FC_acc(32*22 + 1, 10*32, 256 + 1);
-    amx_FC_acc(32*22 + 16, 10*32, 256 + 17);
-    amx_FC_acc(32*22 + 31, 10*32, 256 + 15);
-    amx_FC_acc(32*22 + 31, 10*32 + 1, 256 + 15);
-    amx_FC_acc(32*22 + 31, 10*32 + 17, 256 + 15);
-
-    amx_FC_perf(32*28, 32*80, 10240);
-    amx_FC_perf(32*28 + 1, 32*80, 10240);
-    amx_FC_perf(32*28, 32*80 + 1, 10240);
-    amx_FC_perf(32*28, 32*80, 10240 + 1);
-    amx_FC_perf(32*28 + 1, 32*80 + 1, 10240 + 1);
-    amx_FC_perf(32*28 + 32, 32*80 + 32, 10240 + 32);
-
-    amx_FC_perf(896, 256, 1024, 10000);
-
-    amx_FC_perf(32*28, 32*80, 10240, -1000);
-    amx_FC_perf(32*28 + 1, 32*80, 10240, -1000);
-    amx_FC_perf(32*28, 32*80 + 1, 10240, -1000);
-    amx_FC_perf(32*28, 32*80, 10240 + 1, -1000);
-    amx_FC_perf(32*28 + 1, 32*80 + 1, 10240 + 1, -1000);
-    amx_FC_perf(32*28 + 32, 32*80 + 32, 10240 + 32, -1000);
-
-    amx_FC_perf(896, 256, 1024, 10000);
-
     return 0;
 }
