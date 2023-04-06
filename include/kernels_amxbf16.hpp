@@ -362,6 +362,15 @@ struct KpackedB {
     //  2, w = w_i8 * dq_scale
     void dequant16x32_to(int8_t* src, bfloat16* dst) {
         auto dq_scale = _mm512_set1_ps(dequant_scale);
+        auto p = src + 1024;
+        _mm_prefetch(p + 64 * 0, _MM_HINT_T0);
+        _mm_prefetch(p + 64 * 1, _MM_HINT_T0);
+        _mm_prefetch(p + 64 * 2, _MM_HINT_T0);
+        _mm_prefetch(p + 64 * 3, _MM_HINT_T0);
+        _mm_prefetch(p + 64 * 4, _MM_HINT_T0);
+        _mm_prefetch(p + 64 * 5, _MM_HINT_T0);
+        _mm_prefetch(p + 64 * 6, _MM_HINT_T0);
+        _mm_prefetch(p + 64 * 7, _MM_HINT_T0);
         for (int k = 0; k < 16; k++) {
             auto a = _mm_load_si128((__m128i*)src);
             auto b = _mm_load_si128((__m128i*)(src + 16));
