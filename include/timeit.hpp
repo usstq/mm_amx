@@ -114,7 +114,7 @@ struct timeit {
         std::cout << "done\r" << std::flush;
         std::chrono::duration<double> total_latency = finish-start;
         auto avg_latency = total_latency.count()/times;
-        std::cout << ANSIcolor("0;33") << _tag << " Avg latency : " << avg_latency*1e6 << " us x " << times;
+        std::cout << ANSIcolor("0;33") << _tag << "\t: " << avg_latency*1e6 << " us x " << times;
         if (opsPerCall > 0 && peakOpsPerSecond > 0) {
             std::cout << "  HW Usage : " << static_cast<int>(100*(opsPerCall/avg_latency)/(peakOpsPerSecond)) << "% ("
                     << opsPerCall/avg_latency/(1e9) << " G" << unit << " /"

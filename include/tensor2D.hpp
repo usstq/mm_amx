@@ -29,6 +29,7 @@ struct tensor2D {
     std::shared_ptr<T> data;
     int capacity;
     int stride;
+    bool force_compact;
     int padded_dim1;
     tensor2D() {
         dims[0] = 0;
@@ -40,7 +41,8 @@ struct tensor2D {
         return dims[0] * dims[1] > 0;
     }
 
-    tensor2D(int d0, int d1) {
+    tensor2D(int d0, int d1, bool _force_compact = false) {
+        force_compact = _force_compact;
         capacity = 0;
         resize(d0, d1);
         fill_rnd();
@@ -80,7 +82,7 @@ struct tensor2D {
         dims[0] = d0;
         dims[1] = d1;
         stride = d1 * sizeof(T);
-        if (stride % 64) {
+        if ((stride % 64) && (!force_compact)) {
             auto stride_fix = rndup(stride, 64);
             std::cout << "\tWarnning: stride " << stride << " is not aligned to cache line, will increase to " << stride_fix
                       << " (" << stride_fix/64 << " cache lines)\n";
@@ -156,7 +158,7 @@ struct tensor2D {
             (*this)[k] = v;
     }
 
-    void operator=(const tensor2D<T> & t2) {
+    tensor2D<T>& operator=(const tensor2D<T> & t2) {
         assert(dims[0]*dims[1] == t2.dims[0] * t2.dims[1]);
         for(int c0 = 0; c0 < dims[0]; c0++)
         for(int c1 = 0; c1 < dims[1]; c1++) {
@@ -165,6 +167,33 @@ struct tensor2D {
             auto c3 = k % t2.dims[1];
             (*this)(c0, c1) = t2(c2, c3);
         }
+        return *this;
+    }
+
+    // move semantics
+    tensor2D(tensor2D<T> && t2) {
+        dims[0] = t2.dims[0];
+        dims[1] = t2.dims[1];
+        data = t2.data;
+        capacity = t2.capacity;
+        stride = t2.stride;
+        padded_dim1 = t2.padded_dim1;
+
+        t2.capacity = 0;
+        t2.data.reset();
+    }
+
+    tensor2D<T>&  operator=(tensor2D<T> && t2) {
+        dims[0] = t2.dims[0];
+        dims[1] = t2.dims[1];
+        data = t2.data;
+        capacity = t2.capacity;
+        stride = t2.stride;
+        padded_dim1 = t2.padded_dim1;
+
+        t2.capacity = 0;
+        t2.data.reset();
+        return *this;
     }
 
     bool operator==(const tensor2D<T> & rhs) {
@@ -192,6 +221,23 @@ struct tensor2D {
         }
         return true;
     }
+
+    bool is_normal() {
+        for(int i0=0; i0<dims[0]; i0++)
+        for(int i1=0; i1<dims[1]; i1++) {
+            float f0 = (*this)(i0,i1);
+            if (isnan2(f0)) {
+                std::cout << " found nan at (" << i0 << "," << i1 << ")" << std::endl;
+                return false;
+            }
+            if (isinf2(f0)) {
+                std::cout << " found inf at (" << i0 << "," << i1 << ")" << std::endl;
+                return false;
+            }
+        }
+        return true;
+    }
+
     bool compare(const tensor2D<T> & rhs, float tolerance) {
         float max_abs_diff = 0;
         float max_rel_diff = 0;
