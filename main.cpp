@@ -182,7 +182,6 @@ void amx_FC_acc(int M, int K, int N) {
     std::cout << __func__ << " [" << M << "," << K << "," << N << "," << precision << "] ";
     if (C0 == C) {
         std::cout << ANSIcolor("1;32") << "Match!\n" << ANSIcolor();
-        //std::cout << C << std::endl;
     } else {
         std::cout << ANSIcolor("1;31") << "Mismatch!\n" << ANSIcolor();
         std::cout << C0 << std::endl;
@@ -395,25 +394,26 @@ void amx_MatmulMT_perf(int M, int K, int N, bool transB, int times = -1000) {
     double(M * N) * K * 2,
     AMXBf16PeakGops2PerCore * 1e9);
 
-    timer.tag(__func__, "MT", M, K, N, precision)(times, [&](){
-        mmMT(A, transB?BT:B, pp);
-    },
-    double(M * N) * K * 2,
-    AMXBf16PeakGops2PerCore * 1e9);
+    // only test perf on MultiThread case when
+    // N is big enough to be divided into OMP_NT cores
+    if (N >= 32*OMP_NT) {
+        timer.tag(__func__, "MT", M, K, N, precision)(times, [&](){
+            mmMT(A, transB?BT:B, pp);
+        },
+        double(M * N) * K * 2,
+        AMXBf16PeakGops2PerCore * 1e9);
 
-    if (C0 == C) {
-        std::cout << ANSIcolor("1;32") << "Match!\n" << ANSIcolor();
-        //std::cout << C << std::endl;
-    } else {
-        std::cout << ANSIcolor("1;31") << "Mismatch!\n" << ANSIcolor();
-        std::cout << C0 << std::endl;
-        std::cout << C << std::endl;
-        return;
+        if (C0 == C) {
+            std::cout << ANSIcolor("1;32") << "Match!\n" << ANSIcolor();
+            //std::cout << C << std::endl;
+        } else {
+            std::cout << ANSIcolor("1;31") << "Mismatch!\n" << ANSIcolor();
+            std::cout << C0 << std::endl;
+            std::cout << C << std::endl;
+            return;
+        }
     }
 }
-
-
-
 
 void amx_MatmulMT_BiasGelu_acc(int M, int K, int N, bool transB) {
     tensor2D<bfloat16> A(M, K);
@@ -577,7 +577,7 @@ void amx_FC_MTML_perf(int M, int K, int N, int repeates, int times = -1000) {
 
     double elesize = (precision == amx_bf16::Matmul::Weight_BF16)? sizeof(bfloat16) : sizeof(int8_t);
 
-    timer.tag(__func__, M, K, N, precision)(times, [&](){
+    timer.tag(__func__, M, K, N, precision, repeates)(times, [&](){
         for(int i = 0; i<repeates; i++) {
             amx_bf16::PP::Addbias_Gelu_Store2bf16 ppToA2(A2, &biasA2[i](0,0));
             amx_bf16::PP::Addbias_Gelu_Store2bf16 ppToA1(A1, &biasA1[i](0,0));
@@ -630,37 +630,542 @@ void test_perf() {
     do_test_perf();
 }
 
+/*
+ B matrix is 50MB, 56-cores took 2.8GB, so it can use almost full HBM bandwidth 600GB+
+    test_parallel_FC_2_2560_10240_bf16 Avg latency:
+        4420.87 us x 221  HW Usage : 66% (664.125 GByte/s /1000 GByte/s)
+*/
+void test_parallel_FC(int L, int M, int K, int N, int times = -5000) {
+    tensor2D<bfloat16> A0(M, K);
+    tensor2D<bfloat16> B0(K, N);
+    tensor2D<bfloat16> C0(M, N);
+    tensor2D<float> Bias0(1, N);
+
+    struct mm_single_layer {
+        tensor2D<bfloat16> A;
+        tensor2D<bfloat16> B;
+        tensor2D<bfloat16> C;
+        tensor2D<float> Bias;
+        int _N;
+        std::shared_ptr<amx_bf16::Matmul> mm;
+        void create(tensor2D<bfloat16> & Atemplate,
+                    tensor2D<bfloat16> & Btemplate,
+                    tensor2D<bfloat16> & Ctemplate,
+                    tensor2D<float> & BiasTemplate) {
+            A = Atemplate.clone();
+            B = Btemplate.clone();
+            C = Ctemplate.clone();
+            Bias = BiasTemplate.clone();
+            _N = B.dims[1];
+            mm.reset(new amx_bf16::Matmul(true, false, precision));
+        }
+        void run() {
+            // post-ops do nothing
+            //amx_bf16::PP::Dummy ppkernel(C);
+            amx_bf16::PP::Addbias_Gelu_Store2bf16 ppkernel(C, &Bias(0,0));
+            (*mm.get())(A, B, 0, _N, ppkernel);
+        }
+    };
+
+    struct mm_multi_layer {
+        std::vector<mm_single_layer> mms;
+        void create(int layers,
+                    tensor2D<bfloat16> & Atemplate,
+                    tensor2D<bfloat16> & Btemplate,
+                    tensor2D<bfloat16> & Ctemplate,
+                    tensor2D<float> & BiasTemplate) {
+            mms.resize(layers);
+            for(int i = 0; i < layers; i++) {
+                mms[i].create(Atemplate, Btemplate, Ctemplate, BiasTemplate);
+            }
+        }
+        void run() {
+            for(auto & layer : mms) {
+                layer.run();
+            }
+        }
+    };
+
+    std::vector<mm_multi_layer> mms(OMP_NT);
+
+    #pragma omp parallel
+    {
+        int i = omp_get_thread_num();
+        mms[i].create(L, A0, B0, C0, Bias0);
+    }
+
+    double elesize = (precision == amx_bf16::Matmul::Weight_BF16)? sizeof(bfloat16) : sizeof(int8_t);
+    timer.tag(__func__, L, M, K, N, precision)(times, [&](){
+        #pragma omp parallel
+        {
+            int i = omp_get_thread_num();
+            mms[i].run();
+        }
+    },
+    (double(N) * K * elesize * L) * OMP_NT,
+    1e12,
+    "Byte/s");
+}
+
+void test_parallel_FC() {
+    precision = amx_bf16::Matmul::Weight_BF16;
+    // K*N is same, but K is bigger, bandwidth usage is high & more stable
+    while(1) {
+        std::cout << "=========================\n";
+        test_parallel_FC(1, 2, 25600, 1024);
+        test_parallel_FC(1, 2, 25600, 1024);
+        test_parallel_FC(1, 2, 25600, 1024);
+        std::cout << "=========================\n";
+        test_parallel_FC(1, 2, 2560, 10240);
+        test_parallel_FC(1, 2, 2560, 10240);
+        test_parallel_FC(1, 2, 2560, 10240);
+        std::cout << "=========================\n";
+        // multi-layer, bandwidth usage is very unstable
+        test_parallel_FC(40, 2, 2560, 256);
+        test_parallel_FC(40, 2, 2560, 256);
+        test_parallel_FC(40, 2, 2560, 256);
+    }
+}
+
+
+
+
+
+
+//=====================================================================================================
+
+void unittest_base(tensor2D<bfloat16> & A,
+                    tensor2D<bfloat16> & B,
+                    tensor2D<float> & C) {
+    int K = A.dims[1];
+    assert(A.dims[0] == 32);
+    assert(B.dims[1] == 32);
+    assert(B.dims[0] == K);
+    
+    const int C00 = 0, C01 = 1, C10 = 2, C11 = 3, A0 = 4, A1 = 5, B0 = 6, B1 = 7;
+    auto * pA0 = &A(0,0);
+    auto * pA1 = &A(16,0);
+    auto * pB0 = &B(0,0);
+    _tile_zero(C00);
+    _tile_zero(C01);
+    _tile_zero(C10);
+    _tile_zero(C11);
+    // A0 A1 only load once
+    _tile_loadd(A0, pA0, 64); pA0 += 16*32;
+    _tile_loadd(A1, pA1, 64); pA1 += 16*32;
+    for(int k = 0; k < K; k+=32) {
+        _tile_loadd(B0, pB0, 64); pB0 += 16*32;
+        _tile_loadd(B1, pB0, 64);  pB0 += 16*32;
+        _tile_dpbf16ps(C00, A0, B0);
+        _tile_dpbf16ps(C10, A1, B0);
+        _tile_dpbf16ps(C01, A0, B1);
+        _tile_dpbf16ps(C11, A1, B1);
+    }
+    _tile_stored(C00, &C(0,0), C.stride);
+    _tile_stored(C01, &C(0,16), C.stride);
+    _tile_stored(C10, &C(16,0), C.stride);
+    _tile_stored(C11, &C(16,16), C.stride);
+    if(!C.is_normal()) std::cout << ANSIcolor("1;31") << "Error!" << ANSIcolor() << std::endl;
+}
+
+
+void unittest_halfB(tensor2D<bfloat16> & A,
+                    tensor2D<bfloat16> & B,
+                    tensor2D<float> & C) {
+    int K = A.dims[1];
+    assert(A.dims[0] == 32);
+    assert(B.dims[1] == 32);
+    assert(B.dims[0] == K);
+    
+    const int C00 = 0, C01 = 1, C10 = 2, C11 = 3, A0 = 4, A1 = 5, B0 = 6, B1 = 7;
+    auto * pA0 = &A(0,0);
+    auto * pA1 = &A(16,0);
+    auto * pB0 = &B(0,0);
+    _tile_zero(C00);
+    _tile_zero(C01);
+    _tile_zero(C10);
+    _tile_zero(C11);
+    _tile_loadd(A0, pA0, 64); pA0 += 16*32;
+    _tile_loadd(A1, pA1, 64); pA1 += 16*32;
+    for(int k = 0; k < K; k+=32) {
+        _tile_loadd(B0, pB0, 64); pB0 += 16*32;
+        _tile_dpbf16ps(C00, A0, B0);
+        _tile_dpbf16ps(C10, A1, B0);
+        //_tile_loadd(B1, pB0, 64);  pB0 += 16*32;
+        _tile_dpbf16ps(C01, A0, B0);
+        _tile_dpbf16ps(C11, A1, B0);
+    }
+    _tile_stored(C00, &C(0,0), C.stride);
+    _tile_stored(C01, &C(0,16), C.stride);
+    _tile_stored(C10, &C(16,0), C.stride);
+    _tile_stored(C11, &C(16,16), C.stride);
+    if(!C.is_normal()) std::cout << ANSIcolor("1;31") << "Error!" << ANSIcolor() << std::endl;
+}
+
+void unittest_Wint8(tensor2D<bfloat16> & A,
+                tensor2D<int8_t> & B,
+                tensor2D<float> & C) {
+    static tensor2D<bfloat16> Bbf16(16*32, 32);
+    int K = A.dims[1];
+    assert(A.dims[0] == 32);
+    assert(B.dims[1] == 32);
+    assert(B.dims[0] == K);
+    const int C00 = 0, C01 = 1, C10 = 2, C11 = 3, A0 = 4, A1 = 5, B0 = 6, B1 = 7;
+
+    // int8
+    // load B using avx and de-quant
+    int Bi8_stride = B.stride;
+
+    float dequant_scale = 0.2f;
+    auto dq_scale = _mm512_set1_ps(dequant_scale);
+
+    auto dequant_16x32 = [&](int8_t * src, bfloat16 * dst) {
+        //_mm_prefetch(src + Bi8_stride*64, _MM_HINT_NTA);
+        for (int k = 0; k < 16; k++) {
+            //_mm_prefetch(src + Bi8_stride*32, _MM_HINT_NTA);
+            auto a = _mm_load_si128((__m128i*)src);
+            auto b = _mm_load_si128((__m128i*)(src + 16));
+            auto a_512 = _mm512_cvtepi8_epi32(a);
+            auto b_512 = _mm512_cvtepi8_epi32(b);
+            auto a_f = _mm512_cvtepi32_ps(a_512);
+            auto b_f = _mm512_cvtepi32_ps(b_512);
+            a_f = _mm512_mul_ps(a_f, dq_scale);
+            b_f = _mm512_mul_ps(b_f, dq_scale);
+            auto reg_out = _mm512_cvtne2ps_pbh(b_f, a_f);
+            _mm512_store_epi32(dst, (__m512i)reg_out);
+            src += Bi8_stride;
+            dst += 32;
+        }
+    };
+
+    auto * pA0 = &A(0,0);
+    auto * pA1 = &A(16,0);
+    auto * pB0 = &B(0,0);
+    auto * pBbf160 = &Bbf16(0, 0);
+    auto * pBbf161 = pBbf160 + 16*32;
+    _tile_zero(C00);
+    _tile_zero(C01);
+    _tile_zero(C10);
+    _tile_zero(C11);
+    _tile_loadd(A0, pA0, 64); pA0 += 16*32;
+    _tile_loadd(A1, pA1, 64); pA1 += 16*32;
+    for(int k = 0; k < K; k+=32) {
+        dequant_16x32(pB0, pBbf160); pB0 += 16*32;
+        _tile_loadd(B0, pBbf160, 64);
+        _tile_dpbf16ps(C00, A0, B0);
+        _tile_dpbf16ps(C10, A1, B0);
+
+        dequant_16x32(pB0, pBbf161); pB0 += 16*32;
+        _tile_loadd(B1, pBbf161, 64);
+        _tile_dpbf16ps(C01, A0, B1);
+        _tile_dpbf16ps(C11, A1, B1);
+    }
+
+    _tile_stored(C00, &C(0,0), C.stride);
+    _tile_stored(C01, &C(0,16), C.stride);
+    _tile_stored(C10, &C(16,0), C.stride);
+    _tile_stored(C11, &C(16,16), C.stride);
+    if(!C.is_normal()) std::cout << ANSIcolor("1;31") << "Error!" << ANSIcolor() << std::endl;
+}
+
+void unittest_WFakeint8(tensor2D<bfloat16> & A,
+                         tensor2D<bfloat16> & B,
+                         tensor2D<float> & C) {
+    static tensor2D<bfloat16> Bbf16(16*32, 32);
+    int K = A.dims[1];
+    assert(A.dims[0] == 32);
+    assert(B.dims[1] == 32);
+    assert(B.dims[0] == K);
+    const int C00 = 0, C01 = 1, C10 = 2, C11 = 3, A0 = 4, A1 = 5, B0 = 6, B1 = 7;
+
+    // int8
+    // load B using avx and de-quant
+    int B_stride = B.stride;
+    float dequant_scale = 0.2f;
+    bfloat16 v0 = B(0,0) * 0.00001f;
+    auto delta = _mm512_set1_epi16(*reinterpret_cast<int16_t*>(&v0));
+
+    auto fake_dequant_i8_16x32 = [&](int8_t * & src, bfloat16 * dst) {
+        for (int k = 0; k < 16; k+=2) {
+            auto a = _mm512_load_si512((__m512i*)src);
+            _mm512_store_si512(dst, a);
+            _mm512_store_si512(dst + 32, a);
+            src += B_stride;
+            dst += 32*2;
+        }
+    };
+
+    auto * pA0 = &A(0,0);
+    auto * pA1 = &A(16,0);
+    auto * pBi8 = reinterpret_cast<int8_t*>(&B(0,0));
+    auto * pBbf160 = &Bbf16(0, 0);
+    auto * pBbf161 = pBbf160 + 16*32;
+    _tile_zero(C00);
+    _tile_zero(C01);
+    _tile_zero(C10);
+    _tile_zero(C11);
+    _tile_loadd(A0, pA0, 64); pA0 += 16*32;
+    _tile_loadd(A1, pA1, 64); pA1 += 16*32;
+    for(int k = 0; k < K; k+=32) {
+        fake_dequant_i8_16x32(pBi8, pBbf160);
+        _tile_loadd(B0, pBbf160, 64);
+        _tile_dpbf16ps(C00, A0, B0);
+        _tile_dpbf16ps(C10, A1, B0);
+
+        fake_dequant_i8_16x32(pBi8, pBbf161);
+        _tile_loadd(B1, pBbf161, 64);
+        _tile_dpbf16ps(C01, A0, B1);
+        _tile_dpbf16ps(C11, A1, B1);
+    }
+
+    _tile_stored(C00, &C(0,0), C.stride);
+    _tile_stored(C01, &C(0,16), C.stride);
+    _tile_stored(C10, &C(16,0), C.stride);
+    _tile_stored(C11, &C(16,16), C.stride);
+    if(!C.is_normal()) std::cout << ANSIcolor("1;31") << "Error!" << ANSIcolor() << std::endl;
+}
+
+
+
+void unittest_WFakeint4(tensor2D<bfloat16> & A,
+                         tensor2D<bfloat16> & B,
+                         tensor2D<float> & C) {
+    static tensor2D<bfloat16> Bbf16(16*32, 32);
+    int K = A.dims[1];
+    assert(A.dims[0] == 32);
+    assert(B.dims[1] == 32);
+    assert(B.dims[0] == K);
+    const int C00 = 0, C01 = 1, C10 = 2, C11 = 3, A0 = 4, A1 = 5, B0 = 6, B1 = 7;
+
+    // int8
+    // load B using avx and de-quant
+    int B_stride = B.stride;
+    float dequant_scale = 0.2f;
+    bfloat16 v0 = B(0,0) * 0.00001f;
+    auto delta = _mm512_set1_epi16(*reinterpret_cast<int16_t*>(&v0));
+
+    auto fake_dequant_i4_16x32 = [&](int8_t * & src, bfloat16 * dst) {
+        for (int k = 0; k < 16; k+=4) {
+            auto a = _mm512_load_si512((__m512i*)src);  // read 32 bf16
+            _mm512_store_si512(dst, a);
+            _mm512_store_si512(dst + 32, a);
+            _mm512_store_si512(dst + 32*2, a);
+            _mm512_store_si512(dst + 32*3, a);
+            src += B_stride;
+            dst += 32*4;
+        }
+    };
+
+    auto * pA0 = &A(0,0);
+    auto * pA1 = &A(16,0);
+    auto * pBi4 = reinterpret_cast<int8_t*>(&B(0,0));
+    auto * pBbf160 = &Bbf16(0, 0);
+    auto * pBbf161 = pBbf160 + 16*32;
+    _tile_zero(C00);
+    _tile_zero(C01);
+    _tile_zero(C10);
+    _tile_zero(C11);
+    _tile_loadd(A0, pA0, 64); pA0 += 16*32;
+    _tile_loadd(A1, pA1, 64); pA1 += 16*32;
+    for(int k = 0; k < K; k+=32) {
+        fake_dequant_i4_16x32(pBi4, pBbf160);
+        _tile_loadd(B0, pBbf160, 64);
+        _tile_dpbf16ps(C00, A0, B0);
+        _tile_dpbf16ps(C10, A1, B0);
+
+        fake_dequant_i4_16x32(pBi4, pBbf161);
+        _tile_loadd(B1, pBbf161, 64);
+        _tile_dpbf16ps(C01, A0, B1);
+        _tile_dpbf16ps(C11, A1, B1);
+    }
+
+    _tile_stored(C00, &C(0,0), C.stride);
+    _tile_stored(C01, &C(0,16), C.stride);
+    _tile_stored(C10, &C(16,0), C.stride);
+    _tile_stored(C11, &C(16,16), C.stride);
+    if(!C.is_normal()) std::cout << ANSIcolor("1;31") << "Error!" << ANSIcolor() << std::endl;
+}
+
+
+void unittest_avx512(tensor2D<bfloat16> & A,
+                            tensor2D<bfloat16> & B,
+                            tensor2D<float> & C) {
+    static tensor2D<bfloat16> Bbf16(16*32, 32);
+    int K = A.dims[1];
+    assert(A.dims[0] == 32);
+    assert(B.dims[1] == 32);
+    assert(B.dims[0] == K);
+    const int C00 = 0, C01 = 1, C10 = 2, C11 = 3, A0 = 4, A1 = 5, B0 = 6, B1 = 7;
+
+    // int8
+    // load B using avx and de-quant
+    int B_stride = B.stride;
+    float dequant_scale = 0.2f;
+    bfloat16 v0 = B(0,0) * 0.00001f;
+    auto delta = _mm512_set1_epi16(*reinterpret_cast<int16_t*>(&v0));
+
+    auto fake_dequant_i4_16x32 = [&](int8_t * & src, bfloat16 * dst) {
+        for (int k = 0; k < 16; k+=4) {
+            auto a = _mm512_load_si512((__m512i*)src);  // read 32 bf16
+            _mm512_store_si512(dst, a);
+            _mm512_store_si512(dst + 32, a);
+            _mm512_store_si512(dst + 32*2, a);
+            _mm512_store_si512(dst + 32*3, a);
+            src += B_stride;
+            dst += 32*4;
+        }
+    };
+
+    auto * pA0 = &A(0,0);
+    auto * pA1 = &A(16,0);
+    auto * pB0 = &B(0,0);
+    auto * pBi4 = reinterpret_cast<int8_t*>(&B(0,0));
+    auto * pBbf160 = &Bbf16(0, 0);
+    auto * pBbf161 = pBbf160 + 16*32;
+    
+    __m512 rC[16];
+    for(int i = 0; i < 16; i++)  rC[i] = _mm512_setzero();
+
+    auto avx512_bf16_dp = [&rC](bfloat16 * srcA, bfloat16 * srcB) {
+        for(int i = 0; i < 16; i++) {
+            // load A, B
+            _mm_prefetch(srcB + (16 + i)*32, _MM_HINT_NTA);
+            auto rA = _mm512_load_si512(srcA);
+            auto rB = _mm512_load_si512(srcB);
+            rC[i] = _mm512_dpbf16_ps(rC[i], (__m512bh)rA, (__m512bh)rB);
+            srcA += 32;
+            srcB += 32;
+        }
+    };
+    for(int k = 0; k < K; k+=32) {
+        // B0 B1 requires 32x32*sizeof(bfloat16) = 2KB
+        // 50% L2 cache: 1MB = 512
+        
+        //fake_dequant_i4_16x32(pBi4, pBbf160);
+        //avx512_bf16_dp(pA0, pBbf160);
+        avx512_bf16_dp(pA0, pB0); pB0 += 16*32;
+        avx512_bf16_dp(pA1, pB0); pB0 += 16*32;
+
+        //fake_dequant_i4_16x32(pBi4, pBbf161);
+        //avx512_bf16_dp(pA1, pBbf161);
+    }
+    for(int i = 0; i < 16; i++)
+        _mm512_store_ps(&C(i,0), rC[i]);
+    if(!C.is_normal()) std::cout << ANSIcolor("1;31") << "Error!" << ANSIcolor() << std::endl;
+}
+
+
+int amx_unit_test_int8(int K) {
+
+    tensor2D<bfloat16> A(32, K);
+    tensor2D<bfloat16> B(K, 32);    // assume in each 32x32 unit, it's already packed as 2x(16x(16x2))
+    tensor2D<int8_t> Bi8(K, 32, true);
+    tensor2D<float> C(32, 32);
+    tileconfig_t tfg(1, 0, 8, 16, 64);
+
+    std::cout << "# K = " << K/32 << "*32 = " << K << ", sizeof(B)=" << double(B.capacity) / 1024/1024 << " MB" << std::endl;
+
+    timer.tag(__func__, "base ")(-1000, [&](){
+        unittest_base(A, B, C);
+    },
+    double(32 * K) * sizeof(bfloat16), // only B memory is accessed
+    18e9, "B/s"
+    );
+
+
+    timer.tag(__func__, "halfB")(-1000, [&](){
+        unittest_halfB(A, B, C);
+    },
+    double(32 * K) * sizeof(int8_t), // only B memory is accessed
+    18e9, "B/s"
+    );
+
+    timer.tag(__func__, "Wint8")(-1000, [&](){
+        unittest_Wint8(A, Bi8, C);
+    },
+    double(32 * K) * sizeof(int8_t), // memory accessed
+    18e9, "B/s"
+    );
+
+    timer.tag(__func__, "WFakeint8")(-1000, [&](){
+        unittest_WFakeint8(A, B, C);
+    },
+    double(32 * K) * sizeof(int8_t), // memory accessed
+    18e9, "B/s"
+    );
+
+
+    timer.tag(__func__, "WFakeint4")(-1000, [&](){
+        unittest_WFakeint4(A, B, C);
+    },
+    double(32 * K) * sizeof(int8_t)/2, // memory accessed
+    18e9, "B/s"
+    );
+
+
+    timer.tag(__func__, "avx512")(-1000, [&](){
+        unittest_avx512(A, B, C);
+    },
+    double(32 * K) * sizeof(bfloat16), // memory accessed
+    18e9, "B/s"
+    );
+
+
+    return 0;
+}
+
+//=====================================================================================================
 int main(int argc, const char *argv[]) {
     timer.set_app(argv[0]);
     //thp.Start();
 
     //test_all_bw(3.0); return 0;
+    //test_parallel_FC();
 
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
     std::cout << ANSIcolor("31") << "omp_get_num_threads() = " << omp_get_num_threads() << std::endl << ANSIcolor();
     std::cout << ANSIcolor("31") << "OMP_NT = " << OMP_NT << std::endl << ANSIcolor();
 
+    // K=12*32, A+B fits L1D, gives 100% HW usage
+    // K=80*32  A+B fits L2, gives 70% HW usage
+    // K=512*32 A+B fits L2, gives 30% HW usage
+    //K = 80*32;
+    //K = 51200*32;
+    amx_unit_test_int8(51200*32);
+    amx_unit_test_int8(80*32);
+    return 0;
     //test_acc();
     //test_perf();
 
     precision = amx_bf16::Matmul::Weight_BF16;
-    amx_FC_acc(32*22 + 31, 10*32 + 17, 256 + 15);
+    amx_FC_acc(2, 10*32 + 17, 256 + 15);
     precision = amx_bf16::Matmul::Weight_INT8;
-    amx_FC_acc(32*22 + 31, 10*32 + 17, 256 + 15);
+    amx_FC_acc(2, 10*32 + 17, 256 + 15);
 
     precision = amx_bf16::Matmul::Weight_BF16;
-    amx_MatmulMT_perf(2, 2560, 10240, false, -1000);
-    amx_MatmulMT_perf(2, 2560, 10240, false, -1000);
+    amx_MatmulMT_perf(32, 2560, 320, false, -10000);
+    amx_MatmulMT_perf(32, 2560, 320, false, -10000);
+
     precision = amx_bf16::Matmul::Weight_INT8;
-    amx_MatmulMT_perf(2, 2560, 10240, false, -1000);
-    amx_MatmulMT_perf(2, 2560, 10240, false, -1000);
+    amx_MatmulMT_perf(32, 2560, 320, false, -10000);
+    amx_MatmulMT_perf(32, 2560, 320, false, -10000);
+
+    return 0;
 
     precision = amx_bf16::Matmul::Weight_BF16;
-    amx_FC_MTML_perf(2, 2560, 10240, 20, -10000);
-    amx_FC_MTML_perf(2, 2560, 10240, 20, -10000);
+    amx_MatmulMT_perf(2, 2560, 10752, false, -1000);
+    amx_MatmulMT_perf(2, 2560, 10752, false, -1000);
+    //amx_MatmulMT_perf(2, 2560, 10752, false, -1000);
     precision = amx_bf16::Matmul::Weight_INT8;
-    amx_FC_MTML_perf(2, 2560, 10240, 20, -10000);
-    amx_FC_MTML_perf(2, 2560, 10240, 20, -10000);
+    amx_MatmulMT_perf(2, 2560, 10752, false, -1000);
+    amx_MatmulMT_perf(2, 2560, 10752, false, -1000);
+
+    precision = amx_bf16::Matmul::Weight_BF16;
+    amx_FC_MTML_perf(2, 2560, 10752, 20, -10000);
+    amx_FC_MTML_perf(2, 2560, 10752, 20, -10000);
+    precision = amx_bf16::Matmul::Weight_INT8;
+    amx_FC_MTML_perf(2, 2560, 10752, 20, -10000);
+    amx_FC_MTML_perf(2, 2560, 10752, 20, -10000);
     return 0;
     // return 0;
 
