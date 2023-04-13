@@ -80,6 +80,33 @@ struct timeit {
         return *this;
     }
 
+    int preset_expect_times_milliseconds;
+    void set_time_ms(int time_ms) {
+        preset_expect_times_milliseconds = time_ms;
+    }
+
+    const char * preset_unit = "";
+    void set_unit(const char * unit) {
+        preset_unit = unit;
+    }
+
+    double preset_peakOpsPerSecond;
+    void set_peak_metric_per_second(double peak_per_second) {
+        preset_peakOpsPerSecond = peak_per_second;
+    }
+
+    template<typename Callable>
+    double operator()(const Callable & c,
+                      double opsPerCall = 0,
+                      double peakOpsPerSecond = 0,
+                      const char * unit = nullptr) {
+        if (peakOpsPerSecond == 0)
+            peakOpsPerSecond = preset_peakOpsPerSecond;
+        if (unit == nullptr)
+            unit = preset_unit;
+        return operator()(preset_expect_times_milliseconds, c, opsPerCall, peakOpsPerSecond, preset_unit);
+    }
+
     template<typename Callable>
     double operator()(
                       int expect_times_milliseconds,

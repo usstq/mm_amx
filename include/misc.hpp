@@ -81,7 +81,7 @@ struct ANSIcolor {
 struct pretty_size {
     double sz;
     std::string txt;
-    pretty_size(double sz) : sz(sz) {
+    pretty_size(double sz, const char * unit = "") : sz(sz) {
         std::stringstream ss;
         ss << std::setprecision(5) << std::setw(5);
         if (sz < 1024)
@@ -92,6 +92,7 @@ struct pretty_size {
             ss << (sz / 1024/1024) << " M";
         else
             ss << (sz / 1024 / 1024/1024) << " G";
+        ss << unit;
         txt = ss.str();
     }
     friend std::ostream& operator<<(std::ostream& os, const pretty_size& ps) {
