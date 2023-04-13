@@ -19,10 +19,23 @@
 #include "test_bw.hpp"
 
 #include <omp.h>
-timeit benchmark;
 
 int OMP_NT = omp_thread_count();
+auto &___x = std::cout << ANSIcolor("31") << "OMP_NT = " << OMP_NT << ANSIcolor() << std::endl; 
+
 static bool initAMX = initXTILE();
+
+// https://raw.githubusercontent.com/intel/perfmon/main/SPR/events/sapphirerapids_core.json
+timeit benchmark(
+    {
+        {PERF_TYPE_RAW, 0x3c, "CPU_CLK_UNHALTED.THREAD"},
+        //{PERF_TYPE_RAW, 0x81d0, "MEM_LOAD_RETIRED.ALL_LOADS"},
+        //{PERF_TYPE_HW_CACHE, 0x10002, "LLC_load_misses"},
+        //{PERF_TYPE_HW_CACHE, 0x2, "LLC_loads"},
+        {PERF_TYPE_RAW, 0x02b1, "UOPS_EXECUTED.CORE"},
+    }
+);
+
 
 // A non-type template parameter pack named as tmm
 template <int... tmm>
@@ -576,10 +589,6 @@ int amx_unit_test_int8(int K)
 int main()
 {
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
-    std::cout << ANSIcolor("31") << "omp_get_num_threads() = " << omp_get_num_threads() << std::endl
-              << ANSIcolor();
-    std::cout << ANSIcolor("31") << "OMP_NT = " << OMP_NT << std::endl
-              << ANSIcolor();
 
     // test 1000 ms
     benchmark.set_time_ms(-1000);

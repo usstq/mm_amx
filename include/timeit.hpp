@@ -3,6 +3,11 @@
 #include <chrono>
 #include <thread>
 #include <iostream>
+#include <memory>
+#include <tuple>
+#include <map>
+#include <vector>
+#include <stdio.h>
 
 uint64_t rdtsc_calibrate(int seconds = 1) {
     uint64_t start_ticks;
@@ -46,12 +51,110 @@ uint64_t second2tsc(double sec) {
     return sec * get_tsc_ticks_per_second();
 }
 
+// performance counter
+#include <linux/perf_event.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+#define HW_PERF_COUNTER
+__attribute__((weak)) int perf_event_open(struct perf_event_attr *attr,
+                                          pid_t pid,
+                                          int cpu,
+                                          int group_fd,
+                                          unsigned long flags)
+{
+    return syscall(__NR_perf_event_open, attr, pid, cpu, group_fd, flags);
+}
+
+struct linux_perf_event {
+    uint32_t type;
+    uint32_t config;
+    int fd;
+    struct perf_event_mmap_page* buf;
+    const char * name;
+
+    linux_perf_event(const linux_perf_event&) = delete;
+    linux_perf_event(linux_perf_event&&) = delete;
+
+    linux_perf_event(uint32_t type, uint32_t config, const char * name)
+        : type(type),
+          config(config),
+          fd(-1),
+          buf(nullptr),
+          name(name) {
+        struct perf_event_attr attr = {};
+        attr.type = type;
+        attr.size = PERF_ATTR_SIZE_VER0;
+        attr.config = config;
+        attr.sample_type = PERF_SAMPLE_READ;
+        attr.exclude_kernel = 1;
+
+        fd = perf_event_open(&attr, 0, -1, -1, 0);
+        if (fd < 0) {
+            perror("perf_event_open");
+            return;
+        }
+        buf = (struct perf_event_mmap_page*)mmap(NULL, sysconf(_SC_PAGESIZE), PROT_READ, MAP_SHARED, fd, 0);
+        if (buf == MAP_FAILED) {
+            perror("mmap");
+            close(fd);
+            fd = -1;
+            return;
+        }
+        std::ios::fmtflags f(std::cout.flags());
+        std::cout << std::hex << "Linux perf event " << name << " (type=" << type << ",config=" << config << ")" << " is opened!" << std::endl;
+        std::cout.flags(f);
+    }
+    ~linux_perf_event() {
+        if (fd > 0) {
+            close(fd);
+            munmap(buf, sysconf(_SC_PAGESIZE));
+        }
+    }
+    uint64_t rdpmc_read() {
+        uint64_t val, offset;
+        uint32_t seq, index;
+
+        do {
+            seq = buf->lock;
+            std::atomic_thread_fence(std::memory_order_acquire);
+            index = buf->index;    //
+            offset = buf->offset;  // used to compensate the initial counter value
+            if (index == 0) {      /* rdpmc not allowed */
+                val = 0;
+                std::cout << "rdpmc" << std::endl;
+                break;
+            }
+            val = _rdpmc(index - 1);
+            std::atomic_thread_fence(std::memory_order_acquire);
+        } while (buf->lock != seq);
+        uint64_t ret = (val + offset) & 0xffffffffffff;
+        return ret;
+    }
+};
+
 // timeit will record best latency for each problem in a csv log file
 // and it will also show hint about whether it's improved or descreased
 // over changes
 struct timeit {
     const char * app_version;
-    timeit() {
+    std::vector<std::shared_ptr<linux_perf_event>> events;
+
+    timeit(const std::vector<std::tuple<uint32_t, uint32_t, const char *>> & type_config_names = {}) {
+        for(auto & tc : type_config_names) {
+            events.emplace_back(new linux_perf_event(std::get<0>(tc), std::get<1>(tc), std::get<2>(tc)));
+        }
+        std::cout << ANSIcolor("0;33") << "   Test name    :   AvgLatency x repeats "
+                  << "  HW usage (measured / theoretical_peak) , PMU0 = value, .... " << ANSIcolor() << std::endl;
+    }
+
+    std::vector<uint64_t> get_perf_counters() {
+        std::vector<uint64_t> ret(events.size(), 0);
+        for(int i = 0; i<events.size(); i++) {
+            ret[i] = events[i]->rdpmc_read();
+        }
+        return ret;
     }
 
     void set_app(const char * _app_version) {
@@ -133,20 +236,29 @@ struct timeit {
         }
         std::cout << "start..." << std::flush;
         // profiling
+        auto perf_counters0 = get_perf_counters();
         auto start = std::chrono::high_resolution_clock::now();
         for(int i = 0; i < times; i++) {
             c();
         }
         auto finish = std::chrono::high_resolution_clock::now();
-        std::cout << "done\r" << std::flush;
+        auto perf_counters1 = get_perf_counters();
+
+        std::cout << "done\r                                \r" << std::flush;
         std::chrono::duration<double> total_latency = finish-start;
         auto avg_latency = total_latency.count()/times;
         std::cout << ANSIcolor("0;33") << _tag << "\t: " << avg_latency*1e6 << " us x " << times;
         if (opsPerCall > 0 && peakOpsPerSecond > 0) {
-            std::cout << "  HW Usage : " << static_cast<int>(100*(opsPerCall/avg_latency)/(peakOpsPerSecond)) << "% ("
+            std::cout << ", " << static_cast<int>(100*(opsPerCall/avg_latency)/(peakOpsPerSecond)) << "% ("
                     << opsPerCall/avg_latency/(1e9) << " G" << unit << " /"
                     << peakOpsPerSecond/1e9 << " G" << unit << ")";
         }
+
+        for(int i = 0; i<perf_counters0.size(); i++) {
+            auto cnt = (perf_counters1[i] - perf_counters0[i])/times;
+            std::cout << ", " << events[i]->name << " = " << cnt;
+        }
+
         std::cout << ANSIcolor() << std::endl;
         return avg_latency;
     }
