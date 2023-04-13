@@ -242,4 +242,27 @@ Note that `unittest_WFakeint4B` uses ping-pong buffer while `unittest_WFakeint4`
 But as memory bandwidth requirement is futher reduced in INT4 cases, if we cannot find an efficient dequantization algorithm to keep extra computations low, it would unlikely to archieve 75% latency reduction.
 
 
+## Why ping-pong buffer is important?
+
+Ping-pong buffer is widely used for algorithm optimizations on DSP where DMA is programed to copy data into one of the buffer and ALU is programed to calculate on another buffer filled by DMA in previous iteration.
+
+On CPU it's seldom used because CPU has powerful/smart HW designed to do the trick for you automatically:
+
+ - Reorder execution engine automatically seeks for parallelism between computation instructions from current iteration and data load instructions from next iterations.
+ - HW prefetcher predict the data being used for next iteration and start prefetch it early before next iteration begins
+
+These HW designed removed the needs for DMA & Ping-pong buffer for most algorithm to archieve reasonable performance, but in this particular case, we found:
+
+ - due to 1KB tile register capacity and the fact that HW prefetcher cannot prefetch across 4KB page boundary, manually issue SW prefetch instructions is very important, it can increase the performance consistently & obviously in 200MB case.
+ - ping-pong buffer works well to solve data dependency issue, so concurrency is increased from 2 to 4:
+    - `Dequantize(B0) => AMX_ALU(B0)`
+    - `Dequantize(B1) => AMX_ALU(B1)`
+
+   to
+    - `Dequantize(B0a)` can start once `AMX_ALU(B0a)` from t-1 is finished
+    - `Dequantize(B1a)` can start once `AMX_ALU(B1a)` from t-1 is finished
+    - `AMX_ALU(B0b)`    can start once `Dequantize(B0b)` from t-1 is finished
+    - `AMX_ALU(B1b)`    can start once `Dequantize(B1b)` from t-1 is finished
+
+
 [^1]: https://arxiv.org/abs/2211.10438
