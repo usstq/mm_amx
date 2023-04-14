@@ -254,7 +254,8 @@ On CPU it's seldom used because CPU has powerful/smart HW designed to do the tri
 These HW designed removed the needs for DMA & Ping-pong buffer for most algorithm to archieve reasonable performance, but in this particular case, we found:
 
  - due to 1KB tile register capacity and the fact that HW prefetcher cannot prefetch across 4KB page boundary, manually issue SW prefetch instructions is very important, it can increase the performance consistently & obviously in 200MB case.
- - ping-pong buffer works well to solve data dependency issue, so concurrency is increased from 2 to 4:
+
+ - as described in manual [^2], TileLoad cannot load from store buffer (although TileStore can store to store-buffer), that's why ping-pong buffer works, it introduced enough distance between `Dequantize`'s store instructions and `AMX_ALU`'s TileLoad instructions:
     - `Dequantize(B0) => AMX_ALU(B0)`
     - `Dequantize(B1) => AMX_ALU(B1)`
 
@@ -266,3 +267,5 @@ These HW designed removed the needs for DMA & Ping-pong buffer for most algorith
 
 
 [^1]: https://arxiv.org/abs/2211.10438
+
+[^2]: `20.14 STORE TO LOAD FORWARDING` from **Intel® 64 and IA-32 Architectures Optimization Reference Manual**

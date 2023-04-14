@@ -9,6 +9,14 @@
 #include <vector>
 #include <stdio.h>
 
+// _rdpmc
+#ifdef _WIN32
+#include <intrin.h>
+#else
+#include <x86intrin.h>
+#endif
+
+
 uint64_t rdtsc_calibrate(int seconds = 1) {
     uint64_t start_ticks;
     start_ticks = __rdtsc();
@@ -234,6 +242,7 @@ struct timeit {
             auto oneshot = __rdtsc() - start;
             times = second2tsc(expect_duration)/oneshot;
         }
+        assert(times > 0);
         std::cout << "start..." << std::flush;
         // profiling
         auto perf_counters0 = get_perf_counters();

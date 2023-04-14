@@ -20,9 +20,12 @@
 
 #include <omp.h>
 
+#include "wcompress.hpp"
+
+
+
 int OMP_NT = omp_thread_count();
 auto &___x = std::cout << ANSIcolor("31") << "OMP_NT = " << OMP_NT << ANSIcolor() << std::endl; 
-
 static bool initAMX = initXTILE();
 
 // https://raw.githubusercontent.com/intel/perfmon/main/SPR/events/sapphirerapids_core.json
@@ -35,111 +38,6 @@ timeit benchmark(
         {PERF_TYPE_RAW, 0x02b1, "UOPS_EXECUTED.CORE"},
     }
 );
-
-
-// A non-type template parameter pack named as tmm
-template <int... tmm>
-void check_tiles()
-{
-    tensor2D<float> C(16, 16);
-    auto check_C = [&](int i)
-    {
-        if (!C.is_normal())
-            std::cout << ANSIcolor("1;31") << "Error!" << ANSIcolor() << std::endl;
-        return 0;
-    };
-    int dummy[sizeof...(tmm)] = {
-        (
-            _tile_stored(tmm, &C[0], C.stride), // store to C
-            check_C(tmm),                       // check C
-            0)...};
-}
-
-template <int... tmm>
-void zero_tiles() { int dummy[sizeof...(tmm)] = {(_tile_zero(tmm), 0)...}; }
-template <int... tmm>
-void load_tiles_with_random_bf16()
-{
-    tensor2D<bfloat16> A(16, 32);
-    int dummy[sizeof...(tmm)] = {(A.fill_rnd(), _tile_loadd(tmm, &A[0], 64), 0)...};
-}
-
-template <int bytes, int advance = 4096>
-void prefetch_bytes(void *src)
-{
-    int8_t *p = reinterpret_cast<int8_t *>(src);
-    int cachelines = bytes / 64;
-    for (int i = 0; i < cachelines; i++)
-        _mm_prefetch(p + i * 64 + advance, _MM_HINT_T0);
-}
-
-static auto dequant_16x32_dq_scale = _mm512_set1_ps(0.2f);
-// 2 bf16 tiles buffer for B matrix dequntized on-the-fly
-
-inline void dequant_16x32(int8_t *&src, bfloat16 *dst)
-{
-    for (int k = 0; k < 16; k++)
-    {
-        auto a = _mm_load_si128((__m128i *)src);        // 16 int8
-        auto b = _mm_load_si128((__m128i *)(src + 16)); // 16 int8
-        auto a_512 = _mm512_cvtepi8_epi32(a);           // 16 int32
-        auto b_512 = _mm512_cvtepi8_epi32(b);           // 16 int32
-        auto a_f = _mm512_cvtepi32_ps(a_512);           // 16 ps
-        auto b_f = _mm512_cvtepi32_ps(b_512);           // 16 ps
-        // a_f = _mm512_mul_ps(a_f, dequant_16x32_dq_scale);   // dequantize
-        // b_f = _mm512_mul_ps(b_f, dequant_16x32_dq_scale);   // dequantize
-        auto reg_out = _mm512_cvtne2ps_pbh(b_f, a_f); // 32 packed bf16
-        _mm512_store_epi32(dst, (__m512i)reg_out);    //
-        src += 32;                                    // 32 int8_t dequantized into 32 bf16
-        dst += 32;
-    }
-};
-
-inline void dequant_i4_16x32(int8_t *&src, bfloat16 *dst)
-{
-    for (int k = 0; k < 16; k++)
-    {
-        auto a = _mm_load_si128((__m128i *)src);        // 16 int8
-        auto b = _mm_load_si128((__m128i *)(src + 16)); // 16 int8
-        auto a_512 = _mm512_cvtepi8_epi32(a);           // 16 int32
-        auto b_512 = _mm512_cvtepi8_epi32(b);           // 16 int32
-        auto a_f = _mm512_cvtepi32_ps(a_512);           // 16 ps
-        auto b_f = _mm512_cvtepi32_ps(b_512);           // 16 ps
-        // a_f = _mm512_mul_ps(a_f, dequant_16x32_dq_scale);   // dequantize
-        // b_f = _mm512_mul_ps(b_f, dequant_16x32_dq_scale);   // dequantize
-
-        auto reg_out = _mm512_cvtne2ps_pbh(b_f, a_f); // 32 packed bf16
-        _mm512_store_epi32(dst, (__m512i)reg_out);    //
-        src += 32;                                    // 32 int8_t dequantized into 32 bf16
-        dst += 32;
-    }
-};
-
-inline void fake_dequant_i8_16x32(int8_t *&src, bfloat16 *dst)
-{
-    for (int k = 0; k < 16; k += 2)
-    {
-        auto a = _mm512_load_si512((__m512i *)src); // read 32 bf16
-        _mm512_store_si512(dst, a);
-        _mm512_store_si512(dst + 32, a);
-        src += 64;
-        dst += 32 * 2;
-    }
-};
-
-inline void fake_dequant_i4_16x32(int8_t *&src, bfloat16 *dst)
-{
-    for (int k = 0; k < 16; k += 4)
-    {
-        auto a = _mm512_load_si512((__m512i *)src); // read 32 bf16
-        _mm512_store_si512(dst, a);
-        _mm512_store_si512(dst + 32, a);
-        _mm512_store_si512(dst + 32 * 2, a);
-        _mm512_store_si512(dst + 32 * 3, a);
-        src += 64;
-        dst += 32 * 4;
-    }
-};
 
 void unittest_base(int K)
 {
@@ -231,14 +129,14 @@ void unittest_Wint8B(int K)
         dequant_16x32(pBint, pB1 + 16*32);
 
         for(int k = 0; k < K; k+=32) {
-            dequant_16x32(pBint, pB0); // 512 bytes int8 => 1KB tile bf16
             prefetch_bytes<512>(pBint); // prefetch tile from next 4KB page
+            dequant_16x32(pBint, pB0); // 512 bytes int8 => 1KB tile bf16
             _tile_loadd(6, pB1, 64);
             _tile_dpbf16ps(0, 4, 6);
             _tile_dpbf16ps(1, 5, 6);
 
-            dequant_16x32(pBint, pB0 + 16*32);
             prefetch_bytes<512>(pBint);
+            dequant_16x32(pBint, pB0 + 16*32);
             _tile_loadd(7, pB1 + 16*32, 64);
             _tile_dpbf16ps(2, 4, 7);
             _tile_dpbf16ps(3, 5, 7);
@@ -250,31 +148,45 @@ void unittest_Wint8B(int K)
 
 void unittest_Wint8C(int K)
 {
-    tensor2D<int8_t> B(K, 32, true);         // assume each tile of B is already packed as 16x(16x2)
-    tensor2D<bfloat16> B4buff(64, 32, true); // assume each tile of B is already packed as 16x(16x2)
+    constexpr int Q = 4;
+    tensor2D<int8_t> B(K + 32, 32, true); // assume each tile of B is already packed as 16x(16x2)
+    tensor2D<bfloat16> B2buff(16 * Q, 32);
 
-    auto *pB0 = &B4buff(0, 0);
-    auto *pB1 = &B4buff(16, 0);
-    auto *pB2 = &B4buff(16 * 2, 0);
-    auto *pB3 = &B4buff(16 * 3, 0);
+    auto *pB = &B2buff(0, 0);
 
     zero_tiles<0, 1, 2, 3>();
     load_tiles_with_random_bf16<4, 5>();
     benchmark.tag(__func__)([&]()
                             {
         auto * pBint = &B[0];
+
+        dequant_Kx32<16*(Q/2)>(pBint, pB);
+        int bread = 0;
+        int bwrite = Q/2;
         for(int k = 0; k < K; k+=32) {
-            dequant_16x32(pBint, pB0); // 512 bytes int8 => 1KB tile bf16
-            dequant_16x32(pBint, pB1);
-            prefetch_bytes<1024, 4096>(pBint);
-
-            _tile_loadd(6, pB0, 64);
+            auto * pBsrc = pB + (16*32)*(bread & (Q-1));
+            auto * pBdst = pB + (16*32)*(bwrite & (Q-1));
+            prefetch_bytes<512>(pBint); // prefetch tile from next 4KB page
+            // 512 bytes int8 => 1KB tile bf16
+            dequant_Kx32<4>(pBint, pBdst);
+            _tile_loadd(6, pBsrc, 64);
+            dequant_Kx32<4>(pBint, pBdst + 4*32);
             _tile_dpbf16ps(0, 4, 6);
+            dequant_Kx32<4>(pBint, pBdst + 8*32);
             _tile_dpbf16ps(1, 5, 6);
+            dequant_Kx32<4>(pBint, pBdst + 12*32);
 
-            _tile_loadd(7, pB1, 64);
+            prefetch_bytes<512>(pBint);
+            dequant_Kx32<4>(pBint, pBdst + (16*32));
+            _tile_loadd(7, pBsrc + 16*32, 64);
+            dequant_Kx32<4>(pBint, pBdst + (16*32) + 4*32);
             _tile_dpbf16ps(2, 4, 7);
+            dequant_Kx32<4>(pBint, pBdst + (16*32) + 8*32);
             _tile_dpbf16ps(3, 5, 7);
+            dequant_Kx32<4>(pBint, pBdst + (16*32) + 12*32);
+
+            bread+=2;
+            bwrite+=2;
         } },
                             1024.0 * K / 32);
     check_tiles<0, 1, 2, 3>();
@@ -586,6 +498,51 @@ int amx_unit_test_int8(int K)
     return 0;
 }
 
+int measure_dequant_tput() {
+    int K = 1600*32;
+    tensor2D<int8_t> Bi8(K, 32, true);
+    tensor2D<bfloat16> Btemp(16*4, 32);
+    tileconfig_t tfg(1, 0, 8, 16, 64);
+
+    zero_tiles<0,1,2,3>();
+    load_tiles_with_random_bf16<4, 5, 6>();
+
+    benchmark.tag(__func__)(
+        [&](){
+            auto * pBi8 = &Bi8[0];
+            auto * pB = &Btemp[0];
+
+            dequant_Kx32<16*3>(pBi8, pB);
+
+            int Bread = 0;
+            int Bwrite = 3;
+            for(int k = 0; k < K; k+=16) {
+                //prefetch_bytes<512>(pBi8); // prefetch tile from next 4KB page, almost has no increase in tput
+                //pBi8 = &Bi8[k & (31)]; // load from same
+
+                auto * pBdst = pB + (Bwrite & 3) * 16*32;
+                auto * pBsrc = pB + (Bread & 3) * 16*32;
+
+                _tile_loadd(6, pBsrc, 64);
+                dequant_Kx32<4>(pBi8, pBdst); // 512 bytes int8 => 1KB tile bf16
+                _tile_dpbf16ps(0, 4, 6);
+                dequant_Kx32<4>(pBi8, pBdst + 4*32);
+                _tile_dpbf16ps(1, 5, 6);
+                dequant_Kx32<4>(pBi8, pBdst + 8*32);
+                _tile_dpbf16ps(2, 4, 6);
+                dequant_Kx32<4>(pBi8, pBdst + 12*32);
+                _tile_dpbf16ps(3, 5, 6);
+
+                Bread++;
+                Bwrite++;
+            }
+        },
+        K/16*512.0, 18e9
+    );
+    check_tiles<0,1,2,3>();
+    return 0;
+}
+
 int main()
 {
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
@@ -594,6 +551,8 @@ int main()
     benchmark.set_time_ms(-1000);
     benchmark.set_unit("B/s");
     benchmark.set_peak_metric_per_second(18e9); // 18 GB/s
+
+    //return measure_dequant_tput();
 
     amx_unit_test_int8(102400 * 32);
     // amx_unit_test_int8(80*32);

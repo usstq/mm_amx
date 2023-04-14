@@ -174,22 +174,27 @@ struct tileconfig_t {
     uint16_t cols[16];
     uint8_t rows[16];
     tileconfig_t() = default;
-    tileconfig_t(int palette, int _startRow, int numTiles, int _rows, int columnsBytes) {
+    tileconfig_t(int palette, int _startRow, const std::vector<int> &_rows, int columnsBytes) {
         palette_id = palette;
         startRow = _startRow;
         for(int i = 0; i < 14; i++) {
             reserved[i] = 0;
         }
-        for(int i = 0; i < numTiles; i++) {
+        for(int i = 0; i < _rows.size(); i++) {
             cols[i] = columnsBytes;
-            rows[i] = _rows;
+            rows[i] = _rows[i];
         }
-        for(int i = numTiles; i < 16; i++) {
+        for(int i = _rows.size(); i < 16; i++) {
             cols[i] = 0;
             rows[i] = 0;
         }
-        load();
+        load();        
     }
+
+    tileconfig_t(int palette, int _startRow, int numTiles, int _rows, int columnsBytes) :
+        tileconfig_t(palette, _startRow, std::vector<int>(numTiles, _rows), columnsBytes) {
+    }
+
     ~tileconfig_t() {
         _tile_release();
     }
