@@ -2,6 +2,8 @@
 
 AMX's high throughput makes matrix multiplication a memory bounded operation. to reduce memory bound, we can use compressed format for weight matrix and decompress it on-the-fly into the cache. the decompression takes additional computations, thus it's a trade-off between cpu & memory bound. Ideally decompression should just use-up the superfluous/extra computational power wasted on waitting on memory sub-system.
 
+# test0.cpp
+
 ## INT8 compression
 
 On cases where weight matrix is overwhelming bigger than activations, one method is that we can use off-line pre-quantized weight matrix, and dequantize it into bfloat16 format on-the-fly before feeding into AMX BF16 ALU, unlike full quantization algorithm like SmoothQuant[^1], this optimization still uses bfloat16 as runtime precision, the quantization/dequantization of weight marix is more like a simple form of compression/decompression algorithm.
@@ -255,7 +257,7 @@ These HW designed removed the needs for DMA & Ping-pong buffer for most algorith
 
  - due to 1KB tile register capacity and the fact that HW prefetcher cannot prefetch across 4KB page boundary, manually issue SW prefetch instructions is very important, it can increase the performance consistently & obviously in 200MB case.
 
- - as described in manual [^2], TileLoad cannot load from store buffer (although TileStore can store to store-buffer), that's why ping-pong buffer works, it introduced enough distance between `Dequantize`'s store instructions and `AMX_ALU`'s TileLoad instructions:
+ - as described in `20.14 STORE TO LOAD FORWARDING` [^2], TileLoad cannot load from store buffer (although TileStore can store to store-buffer), that's why ping-pong buffer works, it introduced enough distance between `Dequantize`'s store instructions and `AMX_ALU`'s TileLoad instructions:
     - `Dequantize(B0) => AMX_ALU(B0)`
     - `Dequantize(B1) => AMX_ALU(B1)`
 
@@ -265,7 +267,68 @@ These HW designed removed the needs for DMA & Ping-pong buffer for most algorith
     - `AMX_ALU(B0b)`    can start once `Dequantize(B0b)` from t-1 is finished
     - `AMX_ALU(B1b)`    can start once `Dequantize(B1b)` from t-1 is finished
 
+## Interleaving AVX instructions with AMX
+
+Optimization described in `20.11.2 INTEL® AMX AND INTEL® AVX-512 INTERLEAVING (SW PIPELINING)`[^2] can further improved the performance:
+
+```cpp
+void unittest_Wint8C(int K) {
+    constexpr int Q = 4;
+    tensor2D<int8_t> B(K + 32, 32, true); // assume each tile of B is already packed as 16x(16x2)
+    tensor2D<bfloat16> B2buff(16 * Q, 32);
+    auto *pB = &B2buff(0, 0);
+
+    zero_tiles<0, 1, 2, 3>();
+    load_tiles_with_random_bf16<4, 5>();
+    benchmark.tag(__func__)([&]() {
+        auto * pBint = &B[0];
+        dequant_Kx32<16*(Q/2)>(pBint, pB);
+        int bread = 0;
+        int bwrite = Q/2;
+        for(int k = 0; k < K; k+=32) {
+            auto * pBsrc = pB + (16*32)*(bread & (Q-1));
+            auto * pBdst = pB + (16*32)*(bwrite & (Q-1));
+            prefetch_bytes<512>(pBint); // prefetch tile from next 4KB page
+            // 512 bytes int8 => 1KB tile bf16
+            dequant_Kx32<4>(pBint, pBdst);
+            _tile_loadd(6, pBsrc, 64);
+            dequant_Kx32<4>(pBint, pBdst + 4*32);
+            _tile_dpbf16ps(0, 4, 6);
+            dequant_Kx32<4>(pBint, pBdst + 8*32);
+            _tile_dpbf16ps(1, 5, 6);
+            dequant_Kx32<4>(pBint, pBdst + 12*32);
+
+            prefetch_bytes<512>(pBint);
+            dequant_Kx32<4>(pBint, pBdst + (16*32));
+            _tile_loadd(7, pBsrc + 16*32, 64);
+            dequant_Kx32<4>(pBint, pBdst + (16*32) + 4*32);
+            _tile_dpbf16ps(2, 4, 7);
+            dequant_Kx32<4>(pBint, pBdst + (16*32) + 8*32);
+            _tile_dpbf16ps(3, 5, 7);
+            dequant_Kx32<4>(pBint, pBdst + (16*32) + 12*32);
+
+            bread+=2;
+            bwrite+=2;
+        } }, 1024.0 * K / 32);
+    check_tiles<0, 1, 2, 3>();
+}
+```
+
+test result:
+
+```bash
+# K = 102400*32 = 3276800, sizeof(B)=  200 MB
+unittest_Wint8  : 6580.87 us x 149, 88% (15.9337 GB/s /18 GB/s), CPU_CLK_UNHALTED.THREAD = 20170895, UOPS_EXECUTED.CORE = 42498271
+unittest_Wint8B : 6104.29 us x 162, 95% (17.1777 GB/s /18 GB/s), CPU_CLK_UNHALTED.THREAD = 18728208, UOPS_EXECUTED.CORE = 42601314
+unittest_Wint8C : 5711.86 us x 174, 101% (18.3579 GB/s /18 GB/s), CPU_CLK_UNHALTED.THREAD = 17519210, UOPS_EXECUTED.CORE = 42805860
+# K = 16*32 = 512, sizeof(B)=   32 KB
+unittest_Wint8  : 0.951309 us x 488531, 95% (17.2226 GB/s /18 GB/s), CPU_CLK_UNHALTED.THREAD = 2947, UOPS_EXECUTED.CORE = 6644
+unittest_Wint8B : 0.739941 us x 753568, 123% (22.1423 GB/s /18 GB/s), CPU_CLK_UNHALTED.THREAD = 2273, UOPS_EXECUTED.CORE = 7045
+unittest_Wint8C : 0.733431 us x 694509, 124% (22.3389 GB/s /18 GB/s), CPU_CLK_UNHALTED.THREAD = 2252, UOPS_EXECUTED.CORE = 7077
+```
+
+the improvement is much bigger in `200MB` case, possibly due to memory access latency causes more disturbance to actual execution order which make the non-SW-pipelined version blocking more frequently.
 
 [^1]: https://arxiv.org/abs/2211.10438
 
-[^2]: `20.14 STORE TO LOAD FORWARDING` from **Intel® 64 and IA-32 Architectures Optimization Reference Manual**
+[^2]: **Intel® 64 and IA-32 Architectures Optimization Reference Manual**
