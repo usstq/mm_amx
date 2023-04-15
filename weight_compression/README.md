@@ -329,6 +329,11 @@ unittest_Wint8C : 0.733431 us x 694509, 124% (22.3389 GB/s /18 GB/s), CPU_CLK_UN
 
 the improvement is much bigger in `200MB` case, possibly due to memory access latency causes more disturbance to actual execution order which make the non-SW-pipelined version blocking more frequently.
 
-[^1]: https://arxiv.org/abs/2211.10438
 
-[^2]: **Intel® 64 and IA-32 Architectures Optimization Reference Manual**
+# fc16m
+
+This is an actual use case of FullyConnect layer with M<=16, 
+
+[^1]: [SmoothQuant: Accurate and Efficient Post-Training Quantization for Large Language Models](https://arxiv.org/abs/2211.10438)
+
+[^2]: [Intel® 64 and IA-32 Architectures Optimization Reference Manual](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html)
