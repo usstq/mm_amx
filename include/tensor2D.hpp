@@ -260,7 +260,7 @@ struct tensor2D {
             out << "[" << i << "," << 0 << "]: ";
             int i1;
             for(i1=0; i1<obj.dims[1] && i1 < 8; i1++) {
-                out << obj(i0,i1) << ",";
+                out << +obj(i0,i1) << ",";
             }
             if (i1 < obj.dims[1]) out << "...";
             out << std::endl;

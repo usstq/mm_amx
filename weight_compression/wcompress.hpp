@@ -43,13 +43,12 @@ void load_tiles_with_random_bf16()
     int dummy[sizeof...(tmm)] = {(A.fill_rnd(), _tile_loadd(tmm, &A[0], 64), 0)...};
 }
 
-template <int bytes, int advance = 4096*12>
+template <int bytes, int sel=_MM_HINT_T1, int advance = 4096*12>
 void prefetch_bytes(void *src)
 {
     int8_t *p = reinterpret_cast<int8_t *>(src);
-    int cachelines = bytes / 64;
-    for (int i = 0; i < cachelines; i++)
-        _mm_prefetch(p + i * 64 + advance, _MM_HINT_T1);
+    for (int i = 0; i < bytes; i+=64)
+        _mm_prefetch(p + i + advance, sel);
 }
 
 static auto dequant_16x32_dq_scale = _mm512_set1_ps(0.2f);
