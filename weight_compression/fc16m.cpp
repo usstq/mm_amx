@@ -68,7 +68,7 @@ tensor2D<T> repackB_1xL(tensor2D<bfloat16> &Bi, float scale=1.0f) {
 
     tensor2D<T> Bo;
     // repacked as (?*16)x32
-    Bo.resize(K*N/32, 32);
+    Bo.resize(K*N/32, 32, true);
     T * dst = &Bo[0];
 
     auto repack_1tile = [&](int k0, int n0) {
@@ -263,9 +263,9 @@ void matmul16m_base(tensor2D<bfloat16> & A,
         for(int k=0; k<K; k+=32) {
             // 1x2
             _tile_loadd(2, pA0, Astride); pA0 += 32;   // tile A Mx32
-            prefetch_bytes<1024, _MM_HINT_T0, 4096>(pB0);
+            prefetch_bytes<1024, _MM_HINT_T1, 4096*48>(pB0);
             _tile_loadd(3, pB0, 64); pB0 += 16*32;     // tile B 16x32
-            prefetch_bytes<1024, _MM_HINT_T0, 4096>(pB0);
+            prefetch_bytes<1024, _MM_HINT_T1, 4096*48>(pB0);
             _tile_loadd(4, pB0, 64); pB0 += 16*32;     // tile B 16x32
             _tile_dpbf16ps(0, 2, 3); // C0 += A*B0
             _tile_dpbf16ps(1, 2, 4); // C1 += A*B1
@@ -448,6 +448,62 @@ void fc16m_test_all(int M, int K, int N) {
 }
 
 
+
+struct mt_context {
+    tensor2D<bfloat16> A;
+    tensor2D<bfloat16> Bpacked1x2;
+    tensor2D<int8_t> Bi8packed1x2;
+    tensor2D<float> C;
+};
+
+// parallel w/o dependency
+void fc16m_test_mt0(int M, int K, int N) {
+    double BmatrixSize = K * N * sizeof(bfloat16);
+    std::cout << "# K = " << K / 32 << "*32 = " << K << ", sizeof(B)=" << pretty_size(BmatrixSize, "B") << std::endl;
+    std::cout << " preparing data ..." << std::flush;
+    prepare_data(M, K, N);
+    std::cout << "\r                 \r" << std::flush;
+
+    std::vector<mt_context> ctx(OMP_NT);
+
+    auto check_results = [&]() {
+        int errors = 0;
+        #pragma omp parallel reduction(+:errors)
+        {
+            int i = omp_get_thread_num();
+            if (C_ref == ctx[i].C) {
+            } else {
+                errors++;
+                //std::cout << C_ref << std::endl;
+                //std::cout << C << std::endl;
+            }
+        }
+        if (errors == 0) {
+            std::cout << ANSIcolor("1;32") << "Match!\n" << ANSIcolor();
+        } else {
+            std::cout << ANSIcolor("1;31") << "Mismatch!\n" << ANSIcolor();
+        }
+    };
+
+    #pragma omp parallel
+    {
+        int i = omp_get_thread_num();
+        ctx[i].A = A.clone();
+        ctx[i].Bpacked1x2 = Bpacked1x2.clone();
+        ctx[i].Bi8packed1x2 = Bi8packed1x2.clone();
+        ctx[i].C = C.clone();
+    }
+
+    benchmark.tag("matmul16m_base", "MT", OMP_NT, M, K, N)([&]() {
+            #pragma omp parallel
+            {
+                int i = omp_get_thread_num();
+                matmul16m_base(ctx[i].A, ctx[i].Bpacked1x2, ctx[i].C);
+            }
+        },
+        Bpacked1x2.capacity * OMP_NT); check_results();
+
+}
 int main()
 {
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
@@ -462,9 +518,11 @@ int main()
 
     // L1D
     fc16m_test_all(2, 80 * 32, 192);
+    fc16m_test_mt0(2, 80 * 32, 192);
 
     // sizeof(B)=50MB    memory bandwidth can reach 24GB(L3)
     // sizeof(B)=100MB+, with prefetch, memory bandwidth can reach 19GB
     // for INT8 weight compression also access ext-DDR, we need 200MB+
     fc16m_test_all(2, 80 * 32, 81920);
+    fc16m_test_mt0(2, 80 * 32, 81920);
 }

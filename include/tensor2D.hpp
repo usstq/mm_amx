@@ -68,7 +68,7 @@ struct tensor2D {
     }
     tensor2D<T> clone() {
         tensor2D<T> ret;
-        ret.resize(dims[0], dims[1]);
+        ret.resize(dims[0], dims[1], force_compact);
         if (ret.stride == stride) {
             memcpy(ret.data.get(), data.get(), dims[0] * stride);
         }else{
@@ -78,7 +78,8 @@ struct tensor2D {
         }
         return ret;
     }
-    void resize(int d0, int d1) {
+    void resize(int d0, int d1, bool _force_compact = false) {
+        force_compact = _force_compact;
         dims[0] = d0;
         dims[1] = d1;
         stride = d1 * sizeof(T);
@@ -178,7 +179,7 @@ struct tensor2D {
         capacity = t2.capacity;
         stride = t2.stride;
         padded_dim1 = t2.padded_dim1;
-
+        force_compact = t2.force_compact;
         t2.capacity = 0;
         t2.data.reset();
     }
@@ -190,7 +191,7 @@ struct tensor2D {
         capacity = t2.capacity;
         stride = t2.stride;
         padded_dim1 = t2.padded_dim1;
-
+        force_compact = t2.force_compact;
         t2.capacity = 0;
         t2.data.reset();
         return *this;
