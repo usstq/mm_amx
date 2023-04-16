@@ -294,8 +294,8 @@ void deq_Kx32(int8_t *&src, bfloat16 *dst)
         auto a_f = _mm512_cvtepi32_ps(a_512);           // 16 ps
         auto b_f = _mm512_cvtepi32_ps(b_512);           // 16 ps
 
-        a_f = _mm512_mul_ps(a_f, deq_packed_dq_scale);   // dequantize
-        b_f = _mm512_mul_ps(b_f, deq_packed_dq_scale);   // dequantize
+        //a_f = _mm512_mul_ps(a_f, deq_packed_dq_scale);   // dequantize
+        //b_f = _mm512_mul_ps(b_f, deq_packed_dq_scale);   // dequantize
         auto reg_out = _mm512_cvtne2ps_pbh(b_f, a_f); // 32 packed bf16
         _mm512_store_epi32(dst, (__m512i)reg_out);    //
         src += 32;                                    // 32 int8_t dequantized into 32 bf16
@@ -313,6 +313,19 @@ inline void fake_deq_Kx32(int8_t *&src, bfloat16 *dst)
         _mm512_store_si512(dst + 32, a);
         src += 64;
         dst += 32 * 2;
+    }
+};
+
+
+void scale_Kx16(int K, void * dst, int stride, __m512 scale)
+{
+    auto * p = reinterpret_cast<int8_t*>(dst);
+    for (int k = 0; k < K; k++)
+    {
+        auto a_f = _mm512_loadu_ps(p);      // 16 float
+        a_f = _mm512_mul_ps(a_f, scale);    // dequantize
+        _mm512_storeu_ps(p, a_f);
+        p += stride;
     }
 };
 
@@ -344,18 +357,21 @@ void matmul16m_Wint8(tensor2D<bfloat16> & A,
             // 1x2
             _tile_loadd(2, pA0, Astride); pA0 += 32;   // tile A Mx32
 
-            prefetch_bytes<1024, _MM_HINT_T0, 4096>(pBint);
+            prefetch_bytes<512, _MM_HINT_T1, 4096*12>(pBint);
             deq_Kx32<16>(pBint, pB);
             _tile_loadd(3, pB, 64);
             _tile_dpbf16ps(0, 2, 3); // C0 += A*B0
 
-            prefetch_bytes<1024, _MM_HINT_T0, 4096>(pBint);
+            prefetch_bytes<512, _MM_HINT_T1, 4096*12>(pBint);
             deq_Kx32<16>(pBint, pB + 16*32);
             _tile_loadd(4, pB + 16*32, 64);
             _tile_dpbf16ps(1, 2, 4); // C1 += A*B1
         }
         _tile_stored(0, pC0 + n0, C.stride);
+        scale_Kx16(M, pC0 + n0, C.stride, deq_packed_dq_scale);
+
         _tile_stored(1, pC0 + n0 + 16, C.stride);
+        scale_Kx16(M, pC0 + n0 + 16, C.stride, deq_packed_dq_scale);        
     }
 }
 
@@ -379,30 +395,37 @@ void matmul16m_Wint8B(tensor2D<bfloat16> & A,
     auto Astride = A.stride;
     auto * pB = &B2buff[0];
     int off = 0;
-    deq_Kx32<32*1>(pBint, pB);
-    auto * pBsrc = pB + (32*32) * (off & 1);
-    auto * pBdst = pB + (32*32) * ((off + 1) & 1);
+    
+    auto * pBsrc = pB + (32*32) * 0;
+    auto * pBdst = pB + (32*32) * 1;
+    deq_Kx32<32*1>(pBint, pBsrc);
 
     for(int n0 = 0; n0 < N; n0 += 2*16) {
         // C:Mx32 = A:Mx32 x B:32x32
         zero_tiles<0, 1>();
         auto * pA0 = &A[0];
-        for(int k=0; k<K; k+=32, off++) {
+        for(int k=0; k<K; k+=32) {
             // 1x2
-            //prefetch_bytes<1024, _MM_HINT_T0, 4096>(pBint);
-            deq_Kx32<16>(pBint, pBdst);
+            prefetch_bytes<512, _MM_HINT_T1, 4096*48>(pBint);
             _tile_loadd(4, pA0, Astride); pA0 += 32;   // tile A Mx32
+
+            deq_Kx32<8>(pBint, pBdst);
             _tile_loadd(5, pBsrc, 64);
+            deq_Kx32<8>(pBint, pBdst + 8*32);
             _tile_dpbf16ps(0, 4, 5); // C0 += A*B0
 
-            //prefetch_bytes<1024, _MM_HINT_T0, 4096>(pBint);
-            deq_Kx32<16>(pBint, pBdst + 16*32);
+            prefetch_bytes<512, _MM_HINT_T1, 4096*48>(pBint);
+            deq_Kx32<8>(pBint, pBdst + 16*32);
             _tile_loadd(6, pBsrc + 16*32, 64);
+            deq_Kx32<8>(pBint, pBdst + 24*32);
             _tile_dpbf16ps(1, 4, 6); // C1 += A*B1
             std::swap(pBsrc, pBdst);
         }
         _tile_stored(0, pC0 + n0, C.stride);
+        scale_Kx16(M, pC0 + n0, C.stride, deq_packed_dq_scale);
+
         _tile_stored(1, pC0 + n0 + 16, C.stride);
+        scale_Kx16(M, pC0 + n0 + 16, C.stride, deq_packed_dq_scale);
     }
 }
 
@@ -435,13 +458,13 @@ int main()
     benchmark.set_peak_metric_per_second(19e9); // 19 GB/s
 
     // accuracy test
-    fc16m_test_all(7, 64, 128);
+    //fc16m_test_all(7, 64, 128);
 
     // L1D
-    //fc16m_test_all(2, 80 * 32, 192);
+    fc16m_test_all(2, 80 * 32, 192);
 
     // sizeof(B)=50MB    memory bandwidth can reach 24GB(L3)
     // sizeof(B)=100MB+, with prefetch, memory bandwidth can reach 19GB
     // for INT8 weight compression also access ext-DDR, we need 200MB+
-    //fc16m_test_all(2, 80 * 32, 81920);
+    fc16m_test_all(2, 80 * 32, 81920);
 }
