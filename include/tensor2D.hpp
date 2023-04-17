@@ -27,7 +27,7 @@ template<typename T>
 struct tensor2D {
     int dims[2];
     std::shared_ptr<T> data;
-    int capacity;
+    int64_t capacity;
     int stride;
     bool force_compact;
     int padded_dim1;

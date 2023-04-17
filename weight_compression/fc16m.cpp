@@ -242,7 +242,7 @@ void fc16m_base_1x4() {
 }
 //===========================================================================================
 void matmul16m_base(tensor2D<bfloat16> & A,
-                    tensor2D<bfloat16> & Bpacked1x2,
+                    tensor2D<bfloat16> & _Bpacked1x2,
                     tensor2D<float> & C) {
     int M = A.dims[0];
     int K = A.dims[1];
@@ -252,7 +252,7 @@ void matmul16m_base(tensor2D<bfloat16> & A,
     // A: 2
     // B: 3,4
     tileconfig_t tfg(1, 0, {M,M,M,16,16}, 64);
-    auto * pB0 = &Bpacked1x2[0];
+    auto * pB0 = &_Bpacked1x2[0];
     auto * pC0 = &C[0];
 
     for(int n0 = 0; n0 < N; n0 += 2*16) {
@@ -294,8 +294,10 @@ void deq_Kx32(int8_t *&src, bfloat16 *dst)
         auto a_f = _mm512_cvtepi32_ps(a_512);           // 16 ps
         auto b_f = _mm512_cvtepi32_ps(b_512);           // 16 ps
 
+        // dequantize, moved to post-process of C matrix
         //a_f = _mm512_mul_ps(a_f, deq_packed_dq_scale);   // dequantize
         //b_f = _mm512_mul_ps(b_f, deq_packed_dq_scale);   // dequantize
+
         auto reg_out = _mm512_cvtne2ps_pbh(b_f, a_f); // 32 packed bf16
         _mm512_store_epi32(dst, (__m512i)reg_out);    //
         src += 32;                                    // 32 int8_t dequantized into 32 bf16
@@ -379,7 +381,7 @@ void matmul16m_Wint8(tensor2D<bfloat16> & A,
 void matmul16m_Wint8B(tensor2D<bfloat16> & A,
                     tensor2D<int8_t> & Bpacked1x2,
                     tensor2D<float> & C) {
-    static tensor2D<bfloat16> B2buff(32*2, 32);
+    static thread_local tensor2D<bfloat16> B2buff(32*2, 32);
 
     int M = A.dims[0];
     int K = A.dims[1];
@@ -447,7 +449,45 @@ void fc16m_test_all(int M, int K, int N) {
     benchmark.tag("matmul16m_Wint8B", M, K, N)([&]() { matmul16m_Wint8B(A, Bi8packed1x2, C);}, Bi8packed1x2.capacity); compare_with_ref();
 }
 
+#if 0
+//================================================================
+// multi-threaded version, split B matrix along N dimensions
+// this has state which stores splitted 
 
+void matmul16m_base_mt(tensor2D<bfloat16> & A,
+                       tensor2D<bfloat16> & _Bpacked1x2,
+                       tensor2D<float> & C) {
+    int M = A.dims[0];
+    int K = A.dims[1];
+    int N = C.dims[1];
+    // tiles allocation
+    // C: 0,1
+    // A: 2
+    // B: 3,4
+    tileconfig_t tfg(1, 0, {M,M,M,16,16}, 64);
+    auto * pB0 = &_Bpacked1x2[0];
+    auto * pC0 = &C[0];
+
+    for(int n0 = 0; n0 < N; n0 += 2*16) {
+        // C:Mx32 = A:Mx32 x B:32x32
+        zero_tiles<0, 1>();
+        auto * pA0 = &A[0];
+        auto Astride = A.stride;
+        for(int k=0; k<K; k+=32) {
+            // 1x2
+            _tile_loadd(2, pA0, Astride); pA0 += 32;   // tile A Mx32
+            prefetch_bytes<1024, _MM_HINT_T1, 4096*48>(pB0);
+            _tile_loadd(3, pB0, 64); pB0 += 16*32;     // tile B 16x32
+            prefetch_bytes<1024, _MM_HINT_T1, 4096*48>(pB0);
+            _tile_loadd(4, pB0, 64); pB0 += 16*32;     // tile B 16x32
+            _tile_dpbf16ps(0, 2, 3); // C0 += A*B0
+            _tile_dpbf16ps(1, 2, 4); // C1 += A*B1
+        }
+        _tile_stored(0, pC0 + n0, C.stride);
+        _tile_stored(1, pC0 + n0 + 16, C.stride);
+    }
+}
+#endif
 
 struct mt_context {
     tensor2D<bfloat16> A;
@@ -494,6 +534,13 @@ void fc16m_test_mt0(int M, int K, int N) {
         ctx[i].C = C.clone();
     }
 
+    //benchmark.set_time_ms(456434);
+    benchmark.tag("matmul16m_base", "ST", OMP_NT, M, K, N)([&]() {
+            int i = omp_get_thread_num();
+            matmul16m_base(ctx[i].A, ctx[i].Bpacked1x2, ctx[i].C);
+        },
+        Bpacked1x2.capacity);
+
     benchmark.tag("matmul16m_base", "MT", OMP_NT, M, K, N)([&]() {
             #pragma omp parallel
             {
@@ -503,13 +550,28 @@ void fc16m_test_mt0(int M, int K, int N) {
         },
         Bpacked1x2.capacity * OMP_NT); check_results();
 
+    benchmark.tag("matmul16m_Wint8B", "ST", OMP_NT, M, K, N)([&]() {
+            int i = omp_get_thread_num();
+            matmul16m_Wint8B(ctx[i].A, ctx[i].Bi8packed1x2, ctx[i].C);
+        },
+        Bi8packed1x2.capacity); check_results();
+
+    benchmark.tag("matmul16m_Wint8B", "MT", OMP_NT, M, K, N)([&]() {
+            #pragma omp parallel
+            {
+                int i = omp_get_thread_num();
+                matmul16m_Wint8B(ctx[i].A, ctx[i].Bi8packed1x2, ctx[i].C);
+            }
+        },
+        Bi8packed1x2.capacity * OMP_NT); check_results();
 }
+
 int main()
 {
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
 
     // test 1000 ms
-    benchmark.set_time_ms(-2000);
+    benchmark.set_time_ms(-10000);
     benchmark.set_unit("B/s");
     benchmark.set_peak_metric_per_second(19e9); // 19 GB/s
 
@@ -517,12 +579,12 @@ int main()
     //fc16m_test_all(7, 64, 128);
 
     // L1D
-    fc16m_test_all(2, 80 * 32, 192);
-    fc16m_test_mt0(2, 80 * 32, 192);
+    //fc16m_test_all(2, 80 * 32, 192);
+    //fc16m_test_mt0(2, 80 * 32, 192);
 
     // sizeof(B)=50MB    memory bandwidth can reach 24GB(L3)
     // sizeof(B)=100MB+, with prefetch, memory bandwidth can reach 19GB
     // for INT8 weight compression also access ext-DDR, we need 200MB+
-    fc16m_test_all(2, 80 * 32, 81920);
+    //fc16m_test_all(2, 80 * 32, 81920);
     fc16m_test_mt0(2, 80 * 32, 81920);
 }
