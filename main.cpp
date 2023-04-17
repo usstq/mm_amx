@@ -592,7 +592,7 @@ void amx_FC_MTML_perf(int M, int K, int N, int repeates, int times = -1000) {
     "Byte/s");
 }
 
-void test_acc() {
+int test_acc() {
     auto do_test_acc = [&](){
         amx_FC_acc(32*22, 10*32, 256);
         amx_FC_acc(32*22 + 1, 10*32, 256 + 1);
@@ -606,6 +606,7 @@ void test_acc() {
     do_test_acc();
     precision = amx_bf16::Matmul::Weight_INT8;
     do_test_acc();
+    return 0;
 }
 
 void test_perf() {
@@ -739,23 +740,13 @@ int main(int argc, const char *argv[]) {
     std::cout << ANSIcolor("31") << "omp_get_num_threads() = " << omp_get_num_threads() << std::endl << ANSIcolor();
     std::cout << ANSIcolor("31") << "OMP_NT = " << OMP_NT << std::endl << ANSIcolor();
 
-    //test_acc();
+    test_acc();
     //test_perf();
 
     precision = amx_bf16::Matmul::Weight_BF16;
     amx_FC_acc(2, 10*32 + 17, 256 + 15);
     precision = amx_bf16::Matmul::Weight_INT8;
     amx_FC_acc(2, 10*32 + 17, 256 + 15);
-
-    precision = amx_bf16::Matmul::Weight_BF16;
-    amx_MatmulMT_perf(32, 2560, 320, false, -10000);
-    amx_MatmulMT_perf(32, 2560, 320, false, -10000);
-
-    precision = amx_bf16::Matmul::Weight_INT8;
-    amx_MatmulMT_perf(32, 2560, 320, false, -10000);
-    amx_MatmulMT_perf(32, 2560, 320, false, -10000);
-
-    return 0;
 
     precision = amx_bf16::Matmul::Weight_BF16;
     amx_MatmulMT_perf(2, 2560, 10752, false, -1000);
@@ -767,10 +758,10 @@ int main(int argc, const char *argv[]) {
 
     precision = amx_bf16::Matmul::Weight_BF16;
     amx_FC_MTML_perf(2, 2560, 10752, 20, -10000);
-    amx_FC_MTML_perf(2, 2560, 10752, 20, -10000);
+    //amx_FC_MTML_perf(2, 2560, 10752, 20, -10000);
     precision = amx_bf16::Matmul::Weight_INT8;
     amx_FC_MTML_perf(2, 2560, 10752, 20, -10000);
-    amx_FC_MTML_perf(2, 2560, 10752, 20, -10000);
+    //amx_FC_MTML_perf(2, 2560, 10752, 20, -10000);
     return 0;
     // return 0;
 

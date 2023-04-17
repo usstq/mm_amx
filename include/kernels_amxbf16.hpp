@@ -226,9 +226,12 @@ struct KpackedB {
         }
     }
 
+    __m512 m512_dq_scale;
+
     void set_scale(float quant, float dequant) {
         quant_scale = quant;
         dequant_scale = dequant;
+        m512_dq_scale = _mm512_set1_ps(dequant_scale);
     }
 
     void operator=(const float & v) {
@@ -258,21 +261,38 @@ struct KpackedB {
         }
     }
 
+    template<int K>
+    void deq_Kx32_full(int8_t *&src, bfloat16 *dst)
+    {
+        for (int k = 0; k < K; k++)
+        {
+            auto a = _mm_load_si128((__m128i *)src);        // 16 int8
+            auto b = _mm_load_si128((__m128i *)(src + 16)); // 16 int8
+            auto a_512 = _mm512_cvtepi8_epi32(a);           // 16 int32
+            auto b_512 = _mm512_cvtepi8_epi32(b);           // 16 int32
+            //auto a_512 = _mm512_loadu_ps((__m512 *)src);
+            //auto b_512 = _mm512_loadu_ps((__m512 *)src + 64);
+
+            auto a_f = _mm512_cvtepi32_ps(a_512);           // 16 ps
+            auto b_f = _mm512_cvtepi32_ps(b_512);           // 16 ps
+
+            // dequantize, moved to post-process of C matrix
+            a_f = _mm512_mul_ps(a_f, m512_dq_scale);   // dequantize
+            b_f = _mm512_mul_ps(b_f, m512_dq_scale);   // dequantize
+
+            auto reg_out = _mm512_cvtne2ps_pbh(b_f, a_f); // 32 packed bf16
+            _mm512_store_epi32(dst, (__m512i)reg_out);    //
+            src += 32;                                    // 32 int8_t dequantized into 32 bf16
+            dst += 32;
+        }
+    };
+
     // dequant one block 16x32 i8->bf16
     // dequant: int8->fp32->bf16
     //  1, dq_scale = max(abs(w)) / 127
     //  2, w = w_i8 * dq_scale
-    void dequant16x32_to(int8_t* src, bfloat16* dst) {
+    void dequant16x32_to(int8_t*& src, bfloat16* dst) {
         auto dq_scale = _mm512_set1_ps(dequant_scale);
-        auto p = src + 1024;
-        _mm_prefetch(p + 64 * 0, _MM_HINT_T0);
-        _mm_prefetch(p + 64 * 1, _MM_HINT_T0);
-        _mm_prefetch(p + 64 * 2, _MM_HINT_T0);
-        _mm_prefetch(p + 64 * 3, _MM_HINT_T0);
-        _mm_prefetch(p + 64 * 4, _MM_HINT_T0);
-        _mm_prefetch(p + 64 * 5, _MM_HINT_T0);
-        _mm_prefetch(p + 64 * 6, _MM_HINT_T0);
-        _mm_prefetch(p + 64 * 7, _MM_HINT_T0);
         for (int k = 0; k < 16; k++) {
             auto a = _mm_load_si128((__m128i*)src);
             auto b = _mm_load_si128((__m128i*)(src + 16));
@@ -793,6 +813,16 @@ namespace PP {
     };
 }
 
+template <int bytes, int sel=_MM_HINT_T0, int advance = 4096>
+void prefetch_bytes(void *src)
+{
+    int8_t *p = reinterpret_cast<int8_t *>(src);
+    for (int i = 0; i < bytes; i+=64)
+        _mm_prefetch(p + i + advance, sel);
+}
+template <int... tmm>
+void zero_tiles() { int dummy[sizeof...(tmm)] = {(_tile_zero(tmm), 0)...}; }
+
 // matmul (FC)
 //
 // constB constrols whether it's FC or not 
@@ -805,7 +835,6 @@ struct Matmul {
     bool constB;
     bool transposeB;
     enum WeightPrecision {
-        Weight_F32,
         Weight_BF16,
         Weight_INT8,
         Weight_INT4
@@ -866,16 +895,89 @@ struct Matmul {
                     int n0, int n1,
                     PP ppkernel) {
         int M = matA.dims[0];
-        int K = matA.dims[1];
+        switch(weight_precision) {
+            case Weight_BF16:
+                if (M <= 16) {
+                    exec_Wbf16_m16(matA, _matB, n0, n1, ppkernel);
+                } else {
+                    exec_Wbf16(matA, _matB, n0, n1, ppkernel);
+                }
+                break;
+            case Weight_INT8:
+                if (M <= 16) {
+                    exec_Wint8_m16(matA, _matB, n0, n1, ppkernel);
+                } else {
+                    exec_Wint8(matA, _matB, n0, n1, ppkernel);
+                }
+                break;
+            default:
+                std::cout << "weight_precision " << weight_precision << " is not supported!" << std::endl;
+                break;
+        }
+    }
 
-        //build sub-matrix B
+    struct _AKtailBuff {
+        tensor2D<bfloat16> buff;    // 32x32
+        __mmask32 ktail_mask;
+        int prepare(int K) {
+            int ktails = K % 32;
+            int Kbody = (K/32)*32;
+            if (ktails > 0) {
+                buff.resize(32, 32);
+            }
+            ktail_mask = _cvtu32_mask32(0xFFFFFFFF >> (32-ktails));
+            return Kbody;
+        }
+        bfloat16 * load(bfloat16 * _src, int stride) {
+            auto * src = reinterpret_cast<uint8_t*>(_src);
+            auto * dst = &buff(0,0);
+            bfloat16 * ret = dst;
+            for(int r = 0; r < 32; r += 4) {
+                auto a0 = _mm512_maskz_loadu_epi16 (ktail_mask, src);
+                auto a1 = _mm512_maskz_loadu_epi16 (ktail_mask, src + stride);
+                auto a2 = _mm512_maskz_loadu_epi16 (ktail_mask, src + 2*stride);
+                auto a3 = _mm512_maskz_loadu_epi16 (ktail_mask, src + 3*stride);
+                _mm512_storeu_epi16(dst, a0);
+                _mm512_storeu_epi16(dst + 32, a1);
+                _mm512_storeu_epi16(dst + 32*2, a2);
+                _mm512_storeu_epi16(dst + 32*3, a3);
+                dst += 32*4;
+                src += 4*stride;
+            }
+            return ret;
+        }
+    
+        bfloat16 * load(bfloat16 * _src, int rows, int stride) {
+            auto * src = reinterpret_cast<uint8_t*>(_src);
+            auto * dst = &buff(0,0);
+            bfloat16 * ret = dst;
+            for(int r = 0; r < rows; r ++) {
+                auto a0 = _mm512_maskz_loadu_epi16 (ktail_mask, src);
+                _mm512_storeu_epi16(dst, a0);
+                dst += 32;
+                src += stride;
+            }
+            return ret;
+        }
+    } AKtailBuff;
+
+    tensor2D<bfloat16> getSubMatB(tensor2D<bfloat16> & _matB, int n0, int n1) {
         int Bd0 = transposeB ? (n1-n0) : _matB.dims[0];
         int Bd1 = transposeB ? _matB.dims[1] : (n1-n0);
         bfloat16 * pbase = transposeB ? (&_matB(n0, 0)):(&_matB(0, n0));
-        tensor2D<bfloat16> matB(Bd0, Bd1, pbase, _matB.stride);
+        return tensor2D<bfloat16>(Bd0, Bd1, pbase, _matB.stride);
+    }
 
-        assert(K == matB.dims[transposeB ? 1 : 0]);
+    template<typename PP>
+    void exec_Wbf16(tensor2D<bfloat16> & matA,
+              tensor2D<bfloat16> & _matB,
+              int n0, int n1,
+              PP ppkernel) {
+        auto matB = getSubMatB(_matB, n0, n1);
+        int M = matA.dims[0];
+        int K = matA.dims[1];
         int N = matB.dims[transposeB ? 0 : 1];
+        assert(K == matB.dims[transposeB ? 1 : 0]);
 
         // determine blocking scheme
         int elesz = sizeof(uint16_t);
@@ -890,12 +992,6 @@ struct Matmul {
         int L1 = 48*1024; // 48K
         int mcL1 = L1/slice_size - 1;
 
-        //std::cout << "mc=" << mc << std::endl;
-        //if (mcL1 > 2) {
-        //mc = 2;
-        //}
-
-
         auto dmax = std::numeric_limits<int>::max();
         BlockIterator::blkloop bloops[] = {{mc,32,0}, {dmax,0,32}, {dmax,mc*32,0}};
         blk_it.reset(bloops, 3, M, N);
@@ -905,28 +1001,7 @@ struct Matmul {
         // for non-constB, internalB is updated every time
         // for constB, internalB is updated once
         if (!constB || (internalB.capacity == 0)) {
-            if (weight_precision == Weight_BF16) {
-                functional::prepareB(internalB, matB, transposeB);
-            } else if (weight_precision == Weight_INT8) {
-                internalB.capacity = 1;
-
-                // this dynamic quantization of weight matrix using minmax
-                // is time-consuming, should be used only for constB
-                if (!constB) {
-                    std::cout << "\t WANING: dynamic quantization of weight matrix for non-constB is time-consuming " << std::endl;
-                }
-                float min, max;
-                amx_bf16::functional::get_min_max(matB, min, max);
-                float q, dq;
-                max = std::max(std::abs(max), std::abs(min));
-                q = 127 / max;
-                dq = max / 127;
-                internalBI8.set_scale(q, dq);
-
-                KpackedB<bfloat16> internalTmpB;
-                functional::prepareB(internalTmpB, matB, transposeB);
-                internalBI8.quant_from(internalTmpB);
-            }
+            functional::prepareB(internalB, matB, transposeB);
         }
 
         // prepare tails buffer
@@ -945,30 +1020,306 @@ struct Matmul {
             }
         }
 
-        tensor2D<bfloat16> & Aktails = scratch2;
-        int ktails = K % 32;
-        int Kbody = (K/32)*32;
-        if (ktails > 0) {
-            Aktails.resize(32, 32);
-        }
-        __mmask32 ktail_mask = _cvtu32_mask32(0xFFFFFFFF >> (32-ktails));
+        int Kbody = AKtailBuff.prepare(K);
+        // main loop
+        tileconfig_t tfg(1, 0, 8, 16, 64);
+        do
+        {
+            int m = blk_it.m;
+            int n = blk_it.n;
+            int valid_m = std::min(M - m, 32);
+            int valid_n = std::min(N - n, 32);
+            auto * pA0 = &matA(m, 0);
+            auto * pA1 = &matA(m + 16, 0);
+            auto strideA = matA.stride;
+            bfloat16 * pB = &internalB(0, n);
 
-        auto load_Aktails = [&](bfloat16 * _src, int stride) {
-            auto * src = reinterpret_cast<uint8_t*>(_src);
-            auto * dst = &Aktails(0,0);
-            for(int r = 0; r < 32; r += 4) {
-                auto a0 = _mm512_maskz_loadu_epi16 (ktail_mask, src);
-                auto a1 = _mm512_maskz_loadu_epi16 (ktail_mask, src + stride);
-                auto a2 = _mm512_maskz_loadu_epi16 (ktail_mask, src + 2*stride);
-                auto a3 = _mm512_maskz_loadu_epi16 (ktail_mask, src + 3*stride);
-                _mm512_storeu_epi16(dst, a0);
-                _mm512_storeu_epi16(dst + 32, a1);
-                _mm512_storeu_epi16(dst + 32*2, a2);
-                _mm512_storeu_epi16(dst + 32*3, a3);
-                dst += 32*4;
-                src += 4*stride;
+            if (valid_m < 32) {
+                // use Atails buffer to prevent memory read segmentfault
+                pA0 = &Atails(0, 0);
+                pA1 = &Atails(16, 0);
+                strideA = Atails.stride;
             }
-        };
+
+            zero_tiles<tC00, tC01, tC10, tC11>();
+            if (valid_m <= 16) {
+                // 1x2 is enough
+                int k;
+                for (k = 0; k < Kbody; k += 32) {
+                    _tile_loadd(tA0, pA0 + k, strideA);
+                    _tile_loadd(tB0, pB, 64); pB += (16*32);
+                    prefetch_bytes<1024>(pB);
+                    _tile_dpbf16ps(tC00, tA0, tB0);
+
+                    _tile_loadd(tB1, pB, 64); pB += (16*32);
+                    prefetch_bytes<1024>(pB);
+                    _tile_dpbf16ps(tC01, tA0, tB1);
+                }
+                // ktail
+                if (k < K) {
+                    auto * src = AKtailBuff.load(pA0 + k, strideA);
+                    _tile_loadd(tA0, src, 64);
+                    _tile_loadd(tB0, pB, 64); pB += (16*32);
+                    _tile_dpbf16ps(tC00, tA0, tB0);
+
+                    _tile_loadd(tB1, pB, 64); pB += (16*32);
+                    _tile_dpbf16ps(tC01, tA0, tB1);
+                }
+                _tile_stored(tC00, &buffC(0,0), buffC.stride);
+                _tile_stored(tC01, &buffC(0,16), buffC.stride);
+            } else {
+                // 2x2
+                _tile_loadd(tA0, pA0 + 0, strideA);
+                int k;
+                for (k = 0; k < Kbody; k += 32) {
+                    _tile_loadd(tB0, pB, 64); pB += (16*32);
+                    prefetch_bytes<1024>(pB);
+                    _tile_dpbf16ps(tC00, tA0, tB0);
+
+                    _tile_loadd(tA1, pA1 + k, strideA);
+                    _tile_dpbf16ps(tC10, tA1, tB0);
+                    _tile_loadd(tB1, pB, 64); pB += (16*32);
+                    prefetch_bytes<1024>(pB);
+                    _tile_dpbf16ps(tC01, tA0, tB1);
+
+                    _tile_loadd(tA0, pA0 + k + 32, strideA);    // balance load & dp. load next
+                    _tile_dpbf16ps(tC11, tA1, tB1);
+                }
+                if (k < K) {
+                    auto * src = AKtailBuff.load(pA0 + k, strideA);
+                    _tile_loadd(tA0, src, 64);
+                    _tile_loadd(tB0, pB, 64); pB += (16*32);
+                    _tile_dpbf16ps(tC00, tA0, tB0);
+
+                    _tile_loadd(tA1, src + (16*32), 64);
+                    _tile_dpbf16ps(tC10, tA1, tB0);
+                    _tile_loadd(tB1, pB, 64); pB += (16*32);
+                    _tile_dpbf16ps(tC01, tA0, tB1);
+                    _tile_dpbf16ps(tC11, tA1, tB1);
+                }
+                _tile_stored(tC00, &buffC(0,0), buffC.stride);
+                _tile_stored(tC01, &buffC(0,16), buffC.stride);
+                _tile_stored(tC10, &buffC(16,0), buffC.stride);
+                _tile_stored(tC11, &buffC(16,16), buffC.stride);
+            }
+            // post processing the accumulator tiles
+            //  - add bias
+            //  - do activations
+            //  - convert into bfloat16
+            //  - store into C matrix
+            (ppkernel)(buffC, m, n + n0, valid_m, valid_n);
+        } while(blk_it.next());
+    }
+
+    // for M < 16, use 1x2 tiles
+    template<typename PP>
+    void exec_Wbf16_m16(tensor2D<bfloat16> & matA,
+              tensor2D<bfloat16> & _matB,
+              int n0, int n1,
+              PP ppkernel) {
+        auto matB = getSubMatB(_matB, n0, n1);
+        int M = matA.dims[0];
+        int K = matA.dims[1];
+        assert(K == matB.dims[transposeB ? 1 : 0]);
+        int N = matB.dims[transposeB ? 0 : 1];
+
+        if (!constB || (internalB.capacity == 0)) {
+            functional::prepareB(internalB, matB, transposeB);
+        }
+
+        // register/cache blocking scheme is simplified when M <= 16
+        // C_MxN: 0,1
+        // A_MxK: 2,
+        // B_KxN: 3, 4
+        tileconfig_t tfg(1, 0, {M,M,M,16,16}, 64);
+        auto * pB0 = internalB.data.get();
+        auto * const pC0 = &buffC[0];
+        int Kbody = AKtailBuff.prepare(K);
+        int k;
+        const auto strideA = matA.stride;
+        for(int n = 0; n < N; n+=32) {
+            zero_tiles<0, 1>();
+            auto * pA0 = &matA[0];
+            for(k=0; k<Kbody; k+=32) {
+                // 1x2
+                _tile_loadd(2, pA0, strideA); pA0 += 32;   // tile A Mx32
+                prefetch_bytes<1024, _MM_HINT_T1, 4096*48>(pB0);
+                _tile_loadd(3, pB0, 64); pB0 += 16*32;     // tile B0 32x16 (16x16x2)
+                prefetch_bytes<1024, _MM_HINT_T1, 4096*48>(pB0);
+                _tile_loadd(4, pB0, 64); pB0 += 16*32;     // tile B1 32x16 (16x16x2)
+                _tile_dpbf16ps(0, 2, 3); // C0 += A*B0
+                _tile_dpbf16ps(1, 2, 4); // C1 += A*B1
+            }
+            // ktail
+            if (k < K) {
+                auto * src = AKtailBuff.load(pA0, M, strideA);
+                _tile_loadd(2, src, 64);
+                prefetch_bytes<1024, _MM_HINT_T1, 4096*48>(pB0);
+                _tile_loadd(3, pB0, 64); pB0 += (16*32);
+                _tile_dpbf16ps(0, 2, 3);
+                prefetch_bytes<1024, _MM_HINT_T1, 4096*48>(pB0);
+                _tile_loadd(4, pB0, 64); pB0 += (16*32);
+                _tile_dpbf16ps(1, 2, 4);
+            }
+            _tile_stored(0, pC0, buffC.stride);
+            _tile_stored(1, pC0 + 16, buffC.stride);
+            int valid_n = std::min(N - n, 32);
+            (ppkernel)(buffC, 0, n + n0, M, valid_n);
+        }
+    }
+
+    // for M < 16, use 1x2 tiles
+    template<typename PP>
+    void exec_Wint8_m16(tensor2D<bfloat16> & matA,
+                        tensor2D<bfloat16> & _matB,
+                        int n0, int n1,
+                        PP ppkernel) {
+        auto matB = getSubMatB(_matB, n0, n1);
+        int M = matA.dims[0];
+        int K = matA.dims[1];
+        assert(K == matB.dims[transposeB ? 1 : 0]);
+        int N = matB.dims[transposeB ? 0 : 1];
+
+        if (!constB || (internalBI8.capacity == 0)) {
+            // this dynamic quantization of weight matrix using minmax
+            // is time-consuming, should be used only for constB
+            if (!constB)
+                std::cout << "\t WANING: dynamic quantization of weight matrix for non-constB is time-consuming " << std::endl;
+
+            float min, max;
+            amx_bf16::functional::get_min_max(_matB, min, max);
+            float q, dq;
+            max = std::max(std::abs(max), std::abs(min));
+            q = 127 / max;
+            dq = max / 127;
+            internalBI8.set_scale(q, dq);
+
+            KpackedB<bfloat16> internalTmpB;
+            functional::prepareB(internalTmpB, matB, transposeB);
+            internalBI8.quant_from(internalTmpB);
+        }
+        // register/cache blocking scheme is simplified when M <= 16
+        // C_MxN: 0,1
+        // A_MxK: 2,
+        // B_KxN: 3, 4
+        auto & B2buff = scratch;
+        B2buff.resize(32, 32);
+        auto * const pB = &B2buff[0];
+
+        tileconfig_t tfg(1, 0, {M,M,M,16,16}, 64);
+        auto * pBint = internalBI8.data.get();
+        auto * const pC0 = &buffC[0];
+        const auto strideA = matA.stride;
+        int Kbody = AKtailBuff.prepare(K);
+        int k;
+        for(int n = 0; n < N; n += 2*16) {
+            // C:Mx32 = A:Mx32 x B:32x32
+            zero_tiles<0, 1>();
+            auto * pA0 = &matA[0];
+            for(k=0; k<Kbody; k+=32) {
+                // 1x2
+                _tile_loadd(2, pA0, strideA); pA0 += 32;   // tile A Mx32
+
+                prefetch_bytes<512, _MM_HINT_T1, 4096*12>(pBint);
+                internalBI8.deq_Kx32_full<16>(pBint, pB);
+                _tile_loadd(3, pB, 64);
+                _tile_dpbf16ps(0, 2, 3); // C0 += A*B0
+
+                prefetch_bytes<512, _MM_HINT_T1, 4096*12>(pBint);
+                internalBI8.deq_Kx32_full<16>(pBint, pB + 16*32);
+                _tile_loadd(4, pB + 16*32, 64);
+                _tile_dpbf16ps(1, 2, 4); // C1 += A*B1
+            }
+            // ktail
+            if (k < K) {
+                auto * src = AKtailBuff.load(pA0, M, strideA);
+                _tile_loadd(2, src, 64);
+
+                prefetch_bytes<512, _MM_HINT_T1, 4096*12>(pBint);
+                internalBI8.deq_Kx32_full<16>(pBint, pB);
+                _tile_loadd(3, pB, 64);
+                _tile_dpbf16ps(0, 2, 3);
+
+                prefetch_bytes<512, _MM_HINT_T1, 4096*12>(pBint);
+                internalBI8.deq_Kx32_full<16>(pBint, pB + 16*32);
+                _tile_loadd(4, pB + 16*32, 64);
+                _tile_dpbf16ps(1, 2, 4);
+            }
+            _tile_stored(0, pC0, buffC.stride);
+            _tile_stored(1, pC0 + 16, buffC.stride);
+            int valid_n = std::min(N - n, 32);
+            (ppkernel)(buffC, 0, n + n0, M, valid_n);
+        }
+    }
+
+    template<typename PP>
+    void exec_Wint8(tensor2D<bfloat16> & matA,
+              tensor2D<bfloat16> & _matB,
+              int n0, int n1,
+              PP ppkernel) {
+        auto matB = getSubMatB(_matB, n0, n1);
+        int M = matA.dims[0];
+        int K = matA.dims[1];
+        int N = matB.dims[transposeB ? 0 : 1];
+        assert(K == matB.dims[transposeB ? 1 : 0]);
+
+        // determine blocking scheme
+        int elesz = sizeof(uint16_t);
+        int L2 = 2048*1024; // 2MB
+        int slice_size = 32*rndup(K, 32)*elesz;
+        int mc = L2/slice_size - 1;
+        
+        // if 1 32xK slice cannot fit L2, use 1 slice at least
+        if (mc == 0)
+            mc = 1;
+
+        int L1 = 48*1024; // 48K
+        int mcL1 = L1/slice_size - 1;
+
+        auto dmax = std::numeric_limits<int>::max();
+        BlockIterator::blkloop bloops[] = {{mc,32,0}, {dmax,0,32}, {dmax,mc*32,0}};
+        blk_it.reset(bloops, 3, M, N);
+
+        // for non-constB, internalB is updated every time
+        // for constB, internalB is updated once
+        if (!constB || (internalB.capacity == 0)) {
+            internalB.capacity = 1;
+
+            // this dynamic quantization of weight matrix using minmax
+            // is time-consuming, should be used only for constB
+            if (!constB) {
+                std::cout << "\t WANING: dynamic quantization of weight matrix for non-constB is time-consuming " << std::endl;
+            }
+            float min, max;
+            amx_bf16::functional::get_min_max(_matB, min, max);
+            float q, dq;
+            max = std::max(std::abs(max), std::abs(min));
+            q = 127 / max;
+            dq = max / 127;
+            internalBI8.set_scale(q, dq);
+
+            KpackedB<bfloat16> internalTmpB;
+            functional::prepareB(internalTmpB, matB, transposeB);
+            internalBI8.quant_from(internalTmpB);
+        }
+
+        // prepare tails buffer
+        tensor2D<bfloat16> & Atails = scratch;
+        int mtails = M % 32;
+        if (mtails > 0) {
+            Atails.resize(32, rndup(K, 32));
+            // copy tails into Atails (in unit of 32x32)
+            for (int m = 0; m < mtails; m++) {
+                memcpy(&Atails(m, 0), &matA(M - mtails + m, 0), matA.stride);
+                if (Atails.stride > matA.stride) {
+                    memset(reinterpret_cast<int8_t*>(&Atails(m, 0)) + matA.stride,
+                            0,
+                            Atails.stride - matA.stride);
+                }
+            }
+        }
+
+        int Kbody = AKtailBuff.prepare(K);
 
         // main loop
         tileconfig_t tfg(1, 0, 8, 16, 64);
@@ -981,15 +1332,13 @@ struct Matmul {
             auto * pA0 = &matA(m, 0);
             auto * pA1 = &matA(m + 16, 0);
             auto strideA = matA.stride;
-            bfloat16 * pB;
-            int8_t *pBI8;
-            if (weight_precision == Weight_INT8) {
-                pBI8 = &internalBI8(0, n);
-                pB = reinterpret_cast<bfloat16*>(&buffC(0,0));
-                internalBI8.dequant16x32_to(pBI8, pB);
-            } else {
-                pB = &internalB(0, n);
-            }
+
+            int8_t *pBI8 = &internalBI8(0, n);
+            // 4 tiles buffC is reused as decompressed bf16 weights 
+            bfloat16 * pBa = reinterpret_cast<bfloat16*>(&buffC(0,0));
+            bfloat16 * pBb = pBa + (16*32)*2;
+            bfloat16 * pB = pBa;
+
             if (valid_m < 32) {
                 // use Atails buffer to prevent memory read segmentfault
                 pA0 = &Atails(0, 0);
@@ -997,110 +1346,77 @@ struct Matmul {
                 strideA = Atails.stride;
             }
 
-            _tile_zero(tC00);
-            _tile_zero(tC01);
-            _tile_zero(tC10);
-            _tile_zero(tC11);
+            internalBI8.dequant16x32_to(pBI8, pBb);
+            prefetch_bytes<512>(pBI8);
+            internalBI8.dequant16x32_to(pBI8, pBb + 16*32);
+            prefetch_bytes<512>(pBI8);
+
+            zero_tiles<tC00, tC01, tC10, tC11>();
             if (valid_m <= 16) {
                 // 1x2 is enough
                 int k;
                 for (k = 0; k < Kbody; k += 32) {
-                    _tile_loadd(tA0, pA0 + k, strideA);
-                    _tile_loadd(tB0, pB, 64);
-                    _tile_dpbf16ps(tC00, tA0, tB0);
-                    if (weight_precision == Weight_INT8) {
-                        pBI8 += (16*32);
-                        internalBI8.dequant16x32_to(pBI8, pB);
-                    } else {
-                        pB += (16*32);
-                    }
+                    internalBI8.dequant16x32_to(pBI8, pBa);
+                    prefetch_bytes<512>(pBI8);
 
-                    _tile_loadd(tB1, pB, 64);
+                    _tile_loadd(tA0, pA0 + k, strideA);
+                    _tile_loadd(tB0, pBb, 64);
+                    _tile_dpbf16ps(tC00, tA0, tB0);
+
+                    internalBI8.dequant16x32_to(pBI8, pBa + 16*32);
+                    prefetch_bytes<512>(pBI8);
+
+                    _tile_loadd(tB1, pBb + 16*32, 64);
                     _tile_dpbf16ps(tC01, tA0, tB1);
-                    if (weight_precision == Weight_INT8) {
-                        pBI8 += (16*32);
-                        internalBI8.dequant16x32_to(pBI8, pB);
-                    } else {
-                        pB += (16*32);
-                    }
+
+                    std::swap(pBa, pBb);
                 }
+
                 // ktail
                 if (k < K) {
-                    load_Aktails(pA0 + k, strideA);
-                    auto * src = &Aktails(0,0);
+                    auto * src = AKtailBuff.load(pA0 + k, strideA);
                     _tile_loadd(tA0, src, 64);
-                    _tile_loadd(tB0, pB, 64);
+                    _tile_loadd(tB0, pBb, 64);
                     _tile_dpbf16ps(tC00, tA0, tB0);
-                    if (weight_precision == Weight_INT8) {
-                        pBI8 += (16*32);
-                        internalBI8.dequant16x32_to(pBI8, pB);
-                    } else {
-                        pB += (16*32);
-                    }
 
-                    _tile_loadd(tB1, pB, 64);
+                    _tile_loadd(tB1, pBb + 16*32, 64);
                     _tile_dpbf16ps(tC01, tA0, tB1);
-                    if (weight_precision == Weight_INT8) {
-                        pBI8 += (16*32);
-                        internalBI8.dequant16x32_to(pBI8, pB);
-                    } else {
-                        pB += (16*32);
-                    }
                 }
                 _tile_stored(tC00, &buffC(0,0), buffC.stride);
                 _tile_stored(tC01, &buffC(0,16), buffC.stride);
             } else {
                 // 2x2
-                _tile_loadd(tA0, pA0 + 0, strideA);
                 int k;
                 for (k = 0; k < Kbody; k += 32) {
-                    _tile_loadd(tB0, pB, 64);
+                    internalBI8.dequant16x32_to(pBI8, pBa);
+                    prefetch_bytes<512>(pBI8);
+
+                    _tile_loadd(tA0, pA0 + k, strideA);
+                    _tile_loadd(tB0, pBb, 64);
                     _tile_dpbf16ps(tC00, tA0, tB0);
-                    if (weight_precision == Weight_INT8) {
-                        pBI8 += (16*32);
-                        internalBI8.dequant16x32_to(pBI8, pB);
-                    } else {
-                        pB += (16*32);
-                    }
 
                     _tile_loadd(tA1, pA1 + k, strideA);
                     _tile_dpbf16ps(tC10, tA1, tB0);
-                    _tile_loadd(tB1, pB, 64);
-                    _tile_dpbf16ps(tC01, tA0, tB1);
-                    if (weight_precision == Weight_INT8) {
-                        pBI8 += (16*32);
-                        internalBI8.dequant16x32_to(pBI8, pB);
-                    } else {
-                        pB += (16*32);
-                    }
 
-                    _tile_loadd(tA0, pA0 + k + 32, strideA);    // balance load & dp. load next
+                    internalBI8.dequant16x32_to(pBI8, pBa + 16*32);
+                    prefetch_bytes<512>(pBI8);
+
+                    _tile_loadd(tB1, pBb + 16*32, 64);
+                    _tile_dpbf16ps(tC01, tA0, tB1);
                     _tile_dpbf16ps(tC11, tA1, tB1);
+
+                    std::swap(pBa, pBb);
                 }
                 if (k < K) {
-                    load_Aktails(pA0 + k, strideA);
-                    auto * src = &Aktails(0,0);
+                    auto * src = AKtailBuff.load(pA0 + k, strideA);
                     _tile_loadd(tA0, src, 64);
-                    _tile_loadd(tB0, pB, 64);
+                    _tile_loadd(tB0, pBb, 64);
                     _tile_dpbf16ps(tC00, tA0, tB0);
-                    if (weight_precision == Weight_INT8) {
-                        pBI8 += (16*32);
-                        internalBI8.dequant16x32_to(pBI8, pB);
-                    } else {
-                        pB += (16*32);
-                    }
 
                     _tile_loadd(tA1, src + (16*32), 64);
                     _tile_dpbf16ps(tC10, tA1, tB0);
-                    _tile_loadd(tB1, pB, 64);
+                    _tile_loadd(tB1, pBb + 16*32, 64);
                     _tile_dpbf16ps(tC01, tA0, tB1);
-                    if (weight_precision == Weight_INT8) {
-                        pBI8 += (16*32);
-                        internalBI8.dequant16x32_to(pBI8, pB);
-                    } else {
-                        pB += (16*32);
-                    }
-
                     _tile_dpbf16ps(tC11, tA1, tB1);
                 }
                 _tile_stored(tC00, &buffC(0,0), buffC.stride);
@@ -1120,7 +1436,6 @@ struct Matmul {
 
 std::ostream & operator<<(std::ostream & os, Matmul::WeightPrecision & prec) {
     static const char* names_prec[] = {
-    "f32",
     "bf16",
     "int8",
     "int4"
