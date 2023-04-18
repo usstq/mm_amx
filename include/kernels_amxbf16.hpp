@@ -734,13 +734,10 @@ namespace PP {
     struct Dequantizable {
         float deq_scale;
         bool do_deq = false;
-        __m512 m512_deq_scale;
-
         void set_deq_scale(float scale = 1.0f) {
             assert (support_deq);
             deq_scale = scale;
             do_deq = (deq_scale != 1.0f);
-            m512_deq_scale = _mm512_set1_ps(deq_scale);
         }
     };
 
@@ -763,6 +760,7 @@ namespace PP {
             int8_t * pdst = reinterpret_cast<int8_t*>(&(C(m, n)));
             int stride = C.stride;
             __mmask32 k = _cvtu32_mask32(0xFFFFFFFF >> (32-valid_n));
+            auto m512_deq_scale = _mm512_set1_ps(deq_scale);
             for(int i = 0; i < valid_m; i ++) {
                 auto r0 = _mm512_loadu_ps(psrc);
                 auto r1 = _mm512_loadu_ps(psrc + 16);
@@ -804,16 +802,9 @@ namespace PP {
         }
     };
 
-    struct Addbias_Gelu_Store2bf16 {
+    struct Addbias_Gelu_Store2bf16 : Dequantizable<true> {
         tensor2D<bfloat16> & C;
         float * bias;
-
-        float deq_scale;
-        bool do_deq = false;
-        void set_deq_scale(float scale = 1.0f) {
-            deq_scale = scale;
-            do_deq = (deq_scale != 1.0f);
-        }
 
         Addbias_Gelu_Store2bf16(tensor2D<bfloat16> & C, float * bias) : C(C), bias(bias) {}
 

@@ -691,6 +691,7 @@ void fc16m_test_mt2(int M, int K, int N, int L) {
     prepare_data(M, K, N);
     std::cout << "\r                 \r" << std::flush;
 
+    for(int i=0;i<2;i++)
     {
         std::vector<std::shared_ptr<MultiThreaded<bfloat16>>> mmmt;
         for(int l=0; l<L; l++) mmmt.emplace_back(new MultiThreaded<bfloat16>(B));
@@ -700,6 +701,7 @@ void fc16m_test_mt2(int M, int K, int N, int L) {
         },
         Bpacked1x2.capacity * L);
     }
+    for(int i=0;i<2;i++)
     {
         std::vector<std::shared_ptr<MultiThreaded<int8_t>>> mmmt;
         for(int l=0; l<L; l++) mmmt.emplace_back(new MultiThreaded<int8_t>(B, quantize_i8_scale));
@@ -709,6 +711,7 @@ void fc16m_test_mt2(int M, int K, int N, int L) {
         },
         Bi8packed1x2.capacity * L);
     }
+    for(int i=0;i<2;i++)
     {
         std::vector<std::shared_ptr<MultiThreaded<int8_t>>> mmmt;
         for(int l=0; l<L; l++) mmmt.emplace_back(new MultiThreaded<int8_t>(B, quantize_i8_scale));
@@ -718,6 +721,7 @@ void fc16m_test_mt2(int M, int K, int N, int L) {
         },
         Bi8packed1x2.capacity * L);
     }
+    for(int i=0;i<2;i++)
     {
         std::vector<std::shared_ptr<MultiThreaded<int8_t>>> mmmt;
         for(int l=0; l<L; l++) mmmt.emplace_back(new MultiThreaded<int8_t>(B, quantize_i8_scale));
