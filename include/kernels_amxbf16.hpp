@@ -270,16 +270,33 @@ struct KpackedB {
             auto b = _mm_load_si128((__m128i *)(src + 16)); // 16 int8
             auto a_512 = _mm512_cvtepi8_epi32(a);           // 16 int32
             auto b_512 = _mm512_cvtepi8_epi32(b);           // 16 int32
-            //auto a_512 = _mm512_loadu_ps((__m512 *)src);
-            //auto b_512 = _mm512_loadu_ps((__m512 *)src + 64);
-
             auto a_f = _mm512_cvtepi32_ps(a_512);           // 16 ps
             auto b_f = _mm512_cvtepi32_ps(b_512);           // 16 ps
 
-            // dequantize, moved to post-process of C matrix
+            // dequantize, can be moved to post-process of C matrix
             a_f = _mm512_mul_ps(a_f, m512_dq_scale);   // dequantize
             b_f = _mm512_mul_ps(b_f, m512_dq_scale);   // dequantize
 
+            auto reg_out = _mm512_cvtne2ps_pbh(b_f, a_f); // 32 packed bf16
+            _mm512_store_epi32(dst, (__m512i)reg_out);    //
+            src += 32;                                    // 32 int8_t dequantized into 32 bf16
+            dst += 32;
+        }
+    };
+
+
+    // dequantize is moved to post-process of C matrix
+    template<int K>
+    void i8_to_bf16_Kx32(int8_t *&src, bfloat16 *dst)
+    {
+        for (int k = 0; k < K; k++)
+        {
+            auto a = _mm_load_si128((__m128i *)src);        // 16 int8
+            auto b = _mm_load_si128((__m128i *)(src + 16)); // 16 int8
+            auto a_512 = _mm512_cvtepi8_epi32(a);           // 16 int32
+            auto b_512 = _mm512_cvtepi8_epi32(b);           // 16 int32
+            auto a_f = _mm512_cvtepi32_ps(a_512);           // 16 ps
+            auto b_f = _mm512_cvtepi32_ps(b_512);           // 16 ps
             auto reg_out = _mm512_cvtne2ps_pbh(b_f, a_f); // 32 packed bf16
             _mm512_store_epi32(dst, (__m512i)reg_out);    //
             src += 32;                                    // 32 int8_t dequantized into 32 bf16
@@ -713,10 +730,35 @@ namespace PP {
     // implementation.
 
     // a helper callable for most frequenctly used pp kernels
-    struct Store2bf16 {
+    template<bool support_deq>
+    struct Dequantizable {
+        float deq_scale;
+        bool do_deq = false;
+        __m512 m512_deq_scale;
+
+        void set_deq_scale(float scale = 1.0f) {
+            assert (support_deq);
+            deq_scale = scale;
+            do_deq = (deq_scale != 1.0f);
+            m512_deq_scale = _mm512_set1_ps(deq_scale);
+        }
+    };
+
+    struct Store2bf16 : Dequantizable<true> {
         tensor2D<bfloat16> & C;
+
         Store2bf16(tensor2D<bfloat16> & C) : C(C) {}
+
         void operator()(tensor2D<float> & buffC, int m, int n, int valid_m, int valid_n) {
+            // fast dynamic dispatch to polymorphic implementations
+            if (do_deq)
+                exec<true>(buffC, m, n, valid_m, valid_n);
+            else
+                exec<false>(buffC, m, n, valid_m, valid_n);
+        }
+
+        template<bool deq>
+        void exec(tensor2D<float> & buffC, int m, int n, int valid_m, int valid_n) {
             auto * psrc = &buffC(0,0);
             int8_t * pdst = reinterpret_cast<int8_t*>(&(C(m, n)));
             int stride = C.stride;
@@ -724,6 +766,10 @@ namespace PP {
             for(int i = 0; i < valid_m; i ++) {
                 auto r0 = _mm512_loadu_ps(psrc);
                 auto r1 = _mm512_loadu_ps(psrc + 16);
+                if (deq) {
+                    r0 = _mm512_mul_ps(r0, m512_deq_scale);   // dequantize
+                    r1 = _mm512_mul_ps(r1, m512_deq_scale);   // dequantize
+                }
                 auto c = _mm512_cvtne2ps_pbh(r1, r0);
                 _mm512_mask_storeu_epi16(pdst, k, c);   // 32 bf16
                 pdst += stride;
@@ -733,10 +779,11 @@ namespace PP {
         }
     };
 
-    struct Addbias_Store2bf16 {
+    struct Addbias_Store2bf16 : Dequantizable<false> {
         tensor2D<bfloat16> & C;
         float * bias;
         Addbias_Store2bf16(tensor2D<bfloat16> & C, float * bias) : C(C), bias(bias) {}
+
         void operator()(tensor2D<float> & buffC, int m, int n, int valid_m, int valid_n) {
             auto * psrc = &buffC(0,0);
             int8_t * pdst = reinterpret_cast<int8_t*>(&(C(m, n)));
@@ -747,34 +794,53 @@ namespace PP {
             for(int i = 0; i < valid_m; i ++) {
                 auto r0 = _mm512_loadu_ps(psrc);
                 auto r1 = _mm512_loadu_ps(psrc + 16);
-                // add bias
-                r0 = _mm512_add_ps(r0, bias0);
-                r1 = _mm512_add_ps(r1, bias1);
-                // cvt2 bf16
-                auto c = _mm512_cvtne2ps_pbh(r1, r0);
-                //store
-                _mm512_mask_storeu_epi16(pdst, k, c);   // 32 bf16
+                r0 = _mm512_add_ps(r0, bias0);          // add bias
+                r1 = _mm512_add_ps(r1, bias1);          // add bias
+                auto c = _mm512_cvtne2ps_pbh(r1, r0);   // cvt2 bf16
+                _mm512_mask_storeu_epi16(pdst, k, c);   // store 32 x bf16
                 pdst += stride;
                 psrc += 32;
             }
         }
     };
 
-
     struct Addbias_Gelu_Store2bf16 {
         tensor2D<bfloat16> & C;
         float * bias;
+
+        float deq_scale;
+        bool do_deq = false;
+        void set_deq_scale(float scale = 1.0f) {
+            deq_scale = scale;
+            do_deq = (deq_scale != 1.0f);
+        }
+
         Addbias_Gelu_Store2bf16(tensor2D<bfloat16> & C, float * bias) : C(C), bias(bias) {}
+
         void operator()(tensor2D<float> & buffC, int m, int n, int valid_m, int valid_n) {
+            // fast dynamic dispatch to polymorphic implementations
+            if (do_deq)
+                exec<true>(buffC, m, n, valid_m, valid_n);
+            else
+                exec<false>(buffC, m, n, valid_m, valid_n);
+        }
+
+        template<bool deq>
+        void exec(tensor2D<float> & buffC, int m, int n, int valid_m, int valid_n) {
             auto * psrc = &buffC(0,0);
             int8_t * pdst = reinterpret_cast<int8_t*>(&(C(m, n)));
             int stride = C.stride;
             auto bias0 = _mm512_loadu_ps(bias + n);
             auto bias1 = _mm512_loadu_ps(bias + n + 16);
             __mmask32 k = _cvtu32_mask32(0xFFFFFFFF >> (32-valid_n));
+            auto m512_deq_scale = _mm512_set1_ps(deq_scale);
             for(int i = 0; i < valid_m; i ++) {
                 auto r0 = _mm512_loadu_ps(psrc);
                 auto r1 = _mm512_loadu_ps(psrc + 16);
+                if (deq) {
+                    r0 = _mm512_mul_ps(r0, m512_deq_scale);   // dequantize
+                    r1 = _mm512_mul_ps(r1, m512_deq_scale);   // dequantize
+                }
                 // add bias
                 r0 = _mm512_add_ps(r0, bias0);
                 r1 = _mm512_add_ps(r1, bias1);
@@ -790,7 +856,7 @@ namespace PP {
         }
     };
 
-    struct Store2float {
+    struct Store2float : Dequantizable<false> {
         tensor2D<float> & C;
         Store2float(tensor2D<float> & C) : C(C) {}
         void operator()(tensor2D<float> & buffC, int m, int n, int valid_m, int valid_n) {
@@ -1198,35 +1264,79 @@ struct Matmul {
             functional::prepareB(internalTmpB, matB, transposeB);
             internalBI8.quant_from(internalTmpB);
         }
+
+        // dequantize scale is moved into ppkernel
+        ppkernel.set_deq_scale(internalBI8.dequant_scale);
+
         // register/cache blocking scheme is simplified when M <= 16
         // C_MxN: 0,1
         // A_MxK: 2,
         // B_KxN: 3, 4
-        auto & B2buff = scratch;
-        B2buff.resize(32, 32);
-        auto * const pB = &B2buff[0];
-
-        tileconfig_t tfg(1, 0, {M,M,M,16,16}, 64);
         auto * pBint = internalBI8.data.get();
+        auto & B2buff = scratch;
+        B2buff.resize(32*2, 32);
+        auto * const pB = &B2buff[0];
+        auto * pBsrc = pB + (32*32) * 0;
+        auto * pBdst = pB + (32*32) * 1;
+        internalBI8.i8_to_bf16_Kx32<32>(pBint, pBsrc);
+
+        tileconfig_t tfg(1, 0, {M,M,M,16, 16, 16}, 64);
         auto * const pC0 = &buffC[0];
         const auto strideA = matA.stride;
         int Kbody = AKtailBuff.prepare(K);
         int k;
+        constexpr int prefetch_ahead = 32*1024;
         for(int n = 0; n < N; n += 2*16) {
             // C:Mx32 = A:Mx32 x B:32x32
             zero_tiles<0, 1>();
             auto * pA0 = &matA[0];
+#if 1
+            for(k=0; k<Kbody; k+=32) {
+                // 1x2
+                //_tile_loadd(5, pBint + 4096*12, 64); // as prefetch
+                _tile_loadd(2, pA0, strideA); pA0 += 32;   // tile A Mx32
+                prefetch_bytes<512, _MM_HINT_T1, prefetch_ahead>(pBint);
+
+                internalBI8.i8_to_bf16_Kx32<8>(pBint, pBdst);
+                _tile_loadd(3, pBsrc, 64);
+                internalBI8.i8_to_bf16_Kx32<8>(pBint, pBdst + 8*32);
+                _tile_dpbf16ps(0, 2, 3); // C0 += A*B0
+
+                prefetch_bytes<512, _MM_HINT_T1, prefetch_ahead>(pBint);
+                internalBI8.i8_to_bf16_Kx32<8>(pBint, pBdst + 16*32);
+                _tile_loadd(4, pBsrc + 16*32, 64);
+                internalBI8.i8_to_bf16_Kx32<8>(pBint, pBdst + 24*32);
+                _tile_dpbf16ps(1, 2, 4); // C1 += A*B1
+                std::swap(pBsrc, pBdst);
+            }
+            // ktail
+            if (k < K) {
+                auto * src = AKtailBuff.load(pA0, M, strideA);
+                _tile_loadd(2, src, 64);
+
+                prefetch_bytes<512, _MM_HINT_T1, prefetch_ahead>(pBint);
+                internalBI8.i8_to_bf16_Kx32<16>(pBint, pBdst);
+                _tile_loadd(3, pBsrc, 64);
+                _tile_dpbf16ps(0, 2, 3);
+
+                prefetch_bytes<512, _MM_HINT_T1, prefetch_ahead>(pBint);
+                internalBI8.i8_to_bf16_Kx32<16>(pBint, pBdst + 16*32);
+                _tile_loadd(4, pBsrc + 16*32, 64);
+                _tile_dpbf16ps(1, 2, 4);
+                std::swap(pBsrc, pBdst);
+            }
+#else
             for(k=0; k<Kbody; k+=32) {
                 // 1x2
                 _tile_loadd(2, pA0, strideA); pA0 += 32;   // tile A Mx32
 
                 prefetch_bytes<512, _MM_HINT_T1, 4096*12>(pBint);
-                internalBI8.deq_Kx32_full<16>(pBint, pB);
+                internalBI8.i8_to_bf16_Kx32<16>(pBint, pB);
                 _tile_loadd(3, pB, 64);
                 _tile_dpbf16ps(0, 2, 3); // C0 += A*B0
 
                 prefetch_bytes<512, _MM_HINT_T1, 4096*12>(pBint);
-                internalBI8.deq_Kx32_full<16>(pBint, pB + 16*32);
+                internalBI8.i8_to_bf16_Kx32<16>(pBint, pB + 16*32);
                 _tile_loadd(4, pB + 16*32, 64);
                 _tile_dpbf16ps(1, 2, 4); // C1 += A*B1
             }
@@ -1236,15 +1346,16 @@ struct Matmul {
                 _tile_loadd(2, src, 64);
 
                 prefetch_bytes<512, _MM_HINT_T1, 4096*12>(pBint);
-                internalBI8.deq_Kx32_full<16>(pBint, pB);
+                internalBI8.i8_to_bf16_Kx32<16>(pBint, pB);
                 _tile_loadd(3, pB, 64);
                 _tile_dpbf16ps(0, 2, 3);
 
                 prefetch_bytes<512, _MM_HINT_T1, 4096*12>(pBint);
-                internalBI8.deq_Kx32_full<16>(pBint, pB + 16*32);
+                internalBI8.i8_to_bf16_Kx32<16>(pBint, pB + 16*32);
                 _tile_loadd(4, pB + 16*32, 64);
                 _tile_dpbf16ps(1, 2, 4);
             }
+#endif
             _tile_stored(0, pC0, buffC.stride);
             _tile_stored(1, pC0 + 16, buffC.stride);
             int valid_n = std::min(N - n, 32);

@@ -756,12 +756,14 @@ int main(int argc, const char *argv[]) {
     amx_MatmulMT_perf(2, 2560, 10752, false, -1000);
     amx_MatmulMT_perf(2, 2560, 10752, false, -1000);
 
-    precision = amx_bf16::Matmul::Weight_BF16;
-    amx_FC_MTML_perf(2, 2560, 10752, 20, -10000);
-    //amx_FC_MTML_perf(2, 2560, 10752, 20, -10000);
-    precision = amx_bf16::Matmul::Weight_INT8;
-    amx_FC_MTML_perf(2, 2560, 10752, 20, -10000);
-    //amx_FC_MTML_perf(2, 2560, 10752, 20, -10000);
+    for(int i=0;i<10;i++) {
+        precision = amx_bf16::Matmul::Weight_BF16;
+        amx_FC_MTML_perf(2, 2560, 10752, 20, -10000);
+        amx_FC_MTML_perf(2, 2560, 10752, 20, -10000);
+        precision = amx_bf16::Matmul::Weight_INT8;
+        amx_FC_MTML_perf(2, 2560, 10752, 20, -10000);
+        amx_FC_MTML_perf(2, 2560, 10752, 20, -10000);
+    }
     return 0;
     // return 0;
 
