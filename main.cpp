@@ -594,6 +594,8 @@ void amx_FC_MTML_perf(int M, int K, int N, int repeates, int times = -1000) {
 
 int test_acc() {
     auto do_test_acc = [&](){
+        amx_FC_acc(2, 2560, 10752);
+        amx_FC_acc(22, 2560, 10752);
         amx_FC_acc(32*22, 10*32, 256);
         amx_FC_acc(32*22 + 1, 10*32, 256 + 1);
         amx_FC_acc(32*22 + 16, 10*32, 256 + 17);
@@ -611,6 +613,8 @@ int test_acc() {
 
 void test_perf() {
     auto do_test_perf = [&](){
+        amx_FC_perf(2, 2560, 10752);
+        amx_FC_perf(22, 2560, 10752);
         amx_FC_perf(32*28, 32*80, 10240);
         amx_FC_perf(32*28 + 1, 32*80, 10240);
         amx_FC_perf(32*28 + 16, 32*80, 10240);
@@ -741,7 +745,8 @@ int main(int argc, const char *argv[]) {
     std::cout << ANSIcolor("31") << "OMP_NT = " << OMP_NT << std::endl << ANSIcolor();
 
     test_acc();
-    //test_perf();
+    test_perf();
+    return 0;
 
     precision = amx_bf16::Matmul::Weight_BF16;
     amx_FC_acc(2, 10*32 + 17, 256 + 15);

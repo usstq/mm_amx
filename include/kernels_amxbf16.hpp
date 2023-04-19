@@ -891,6 +891,8 @@ struct Matmul {
     BlockIterator blk_it;
     bool constB;
     bool transposeB;
+
+    // store precision for weight compression, only for BF16 AMX
     enum WeightPrecision {
         Weight_BF16,
         Weight_INT8,
@@ -951,21 +953,12 @@ struct Matmul {
                     tensor2D<bfloat16> & _matB,
                     int n0, int n1,
                     PP ppkernel) {
-        int M = matA.dims[0];
         switch(weight_precision) {
             case Weight_BF16:
-                if (M <= 16) {
-                    exec_Wbf16_m16(matA, _matB, n0, n1, ppkernel);
-                } else {
-                    exec_Wbf16(matA, _matB, n0, n1, ppkernel);
-                }
+                exec_Wbf16(matA, _matB, n0, n1, ppkernel);
                 break;
             case Weight_INT8:
-                if (M <= 16) {
-                    exec_Wint8_m16(matA, _matB, n0, n1, ppkernel);
-                } else {
-                    exec_Wint8(matA, _matB, n0, n1, ppkernel);
-                }
+                exec_Wint8(matA, _matB, n0, n1, ppkernel);
                 break;
             default:
                 std::cout << "weight_precision " << weight_precision << " is not supported!" << std::endl;
@@ -1025,6 +1018,55 @@ struct Matmul {
         return tensor2D<bfloat16>(Bd0, Bd1, pbase, _matB.stride);
     }
 
+
+    template<int bN, class F>
+    void loop2D_no_bM(int M, int N, F f) {
+        for(int n=0; n<N; n += bN) {
+            int valid_n = std::min(N - n, bN);
+            f(0, n, M, valid_n);
+        }
+        return;
+    }
+
+    template<int bM, int bN, class F>
+    void loop2D(int M, int N, int mc, F f) {
+        for(int m0=0; m0<M; m0 += mc*bM) {
+            for(int n=0; n<N; n += bN) {
+                int valid_n = std::min(N - n, bN);
+                int mcnt = std::min(mc, ((M - m0) + bM - 1)/bM);
+                for(int m1=0; m1<mcnt; m1++) {
+                    int m = m0 + m1*bM;
+                    int valid_m = std::min(M - m, bM);
+                    f(m, n, valid_m, valid_n);
+                }
+            }
+        }
+    }
+
+    // avoid M tails by shift last tile window up
+    // a little, with some overlapped/redundant computation
+    // but it works only when (M >= bM)
+    template<int bM, int bN, class F>
+    void loop2D_opt_Mtail(int M, int N, int mc, F f) {
+        int tailM = (M % (mc*bM)) % bM;
+        assert(M > bM);
+        for(int m0=0; m0<M; m0 += mc*bM) {
+            for(int n=0; n<N; n += bN) {
+                int valid_n = std::min(N - n, bN);
+                int mcnt = std::min(mc, ((M - m0) + bM - 1)/bM);
+                for(int m1=0; m1<mcnt; m1++) {
+                    int m = m0 + m1*bM;
+                    if (M - m < bM) {
+                        // shift kernel window up to make valid_m still in whole bM,
+                        // avoid tail window with (valid_m < bM)
+                        m = M - bM;
+                    }
+                    f(m, n, bM, valid_n);
+                }
+            }
+        }
+    }
+
     template<typename PP>
     void exec_Wbf16(tensor2D<bfloat16> & matA,
               tensor2D<bfloat16> & _matB,
@@ -1036,195 +1078,117 @@ struct Matmul {
         int N = matB.dims[transposeB ? 0 : 1];
         assert(K == matB.dims[transposeB ? 1 : 0]);
 
-        // determine blocking scheme
-        int elesz = sizeof(uint16_t);
-        int L2 = 2048*1024; // 2MB
-        int slice_size = 32*rndup(K, 32)*elesz;
-        int mc = L2/slice_size - 1;
-        
-        // if 1 32xK slice cannot fit L2, use 1 slice at least
-        if (mc == 0)
-            mc = 1;
-
-        int L1 = 48*1024; // 48K
-        int mcL1 = L1/slice_size - 1;
-
-        auto dmax = std::numeric_limits<int>::max();
-        BlockIterator::blkloop bloops[] = {{mc,32,0}, {dmax,0,32}, {dmax,mc*32,0}};
-        blk_it.reset(bloops, 3, M, N);
-        //BlockIterator::blkloop bloops[] = {{2,32,0}, {2,0,32}, {dmax, 64, 0}, {dmax, 0, 64}};
-        //blk_it.reset(bloops, 4, M, N);
-
         // for non-constB, internalB is updated every time
         // for constB, internalB is updated once
         if (!constB || (internalB.capacity == 0)) {
             functional::prepareB(internalB, matB, transposeB);
         }
 
-        // prepare tails buffer
-        tensor2D<bfloat16> & Atails = scratch;
-        int mtails = M % 32;
-        if (mtails > 0) {
-            Atails.resize(32, rndup(K, 32));
-            // copy tails into Atails (in unit of 32x32)
-            for (int m = 0; m < mtails; m++) {
-                memcpy(&Atails(m, 0), &matA(M - mtails + m, 0), matA.stride);
-                if (Atails.stride > matA.stride) {
-                    memset(reinterpret_cast<int8_t*>(&Atails(m, 0)) + matA.stride,
-                            0,
-                            Atails.stride - matA.stride);
+        if (M <= 16) {
+            // register/cache blocking scheme is simplified when M <= 16
+            // C_MxN: 0,1
+            // A_MxK: 2,
+            // B_KxN: 3, 4
+            tileconfig_t tfg(1, 0, {M,M,M,16,16}, 64);
+            auto * pB0 = internalB.data.get();
+            auto * const pC0 = &buffC[0];
+            int Kbody = AKtailBuff.prepare(K);
+            int k;
+            const auto strideA = matA.stride;
+            loop2D_no_bM<32>(M, N, [&](int m, int n, int valid_m, int valid_n) {
+                zero_tiles<0, 1>();
+                auto * pA0 = &matA[0];
+                for(k=0; k<K; k+=32) {
+                    _tile_loadd(2, pA0, strideA); pA0 += 32;   // tile A Mx32
+                    prefetch_bytes<1024, _MM_HINT_T1, 4096*48>(pB0);
+                    _tile_loadd(3, pB0, 64); pB0 += 16*32;     // tile B0 32x16 (16x16x2)
+                    prefetch_bytes<1024, _MM_HINT_T1, 4096*48>(pB0);
+                    _tile_loadd(4, pB0, 64); pB0 += 16*32;     // tile B1 32x16 (16x16x2)
+                    _tile_dpbf16ps(0, 2, 3); // C0 += A*B0
+                    _tile_dpbf16ps(1, 2, 4); // C1 += A*B1
                 }
-            }
+                _tile_stored(0, pC0, buffC.stride);
+                _tile_stored(1, pC0 + 16, buffC.stride);
+                //int valid_n = std::min(N - n, 32);
+                (ppkernel)(buffC, 0, n + n0, M, valid_n);
+            });
+            return;
         }
 
-        int Kbody = AKtailBuff.prepare(K);
-        // main loop
+        if (M <= 32 && M >16) {
+            // 2x2 tile, C:0/1/2/3 A:4/5 B:6/7 no blocking along M dimension
+            tileconfig_t tfg(1, 0, {16,16,M-16,M-16,16,M-16,16,16}, 64);
+            loop2D_no_bM<32>(M, N, [&](int m, int n, int valid_m, int valid_n) {
+                auto * pA0 = &matA(m, 0);
+                auto * pA1 = &matA(m + 16, 0);
+                auto strideA = matA.stride;
+                bfloat16 * pB = &internalB(0, n);
+                zero_tiles<0, 1, 2, 3>();
+                int k;
+                // 2x2
+                for (k = 0; k < K; k += 32) {
+                    _tile_loadd(4, pA0 + k, strideA);
+                    _tile_loadd(6, pB, 64); pB += (16*32);
+                    prefetch_bytes<1024>(pB);
+                    _tile_dpbf16ps(0, 4, 6);
+
+                    _tile_loadd(5, pA1 + k, strideA);
+                    _tile_dpbf16ps(2, 5, 6);
+                    _tile_loadd(7, pB, 64); pB += (16*32);
+                    prefetch_bytes<1024>(pB);
+                    _tile_dpbf16ps(1, 4, 7);
+
+                    //_tile_loadd(tA0, pA0 + k + 32, strideA);    // balance load & dp. load next
+                    _tile_dpbf16ps(3, 5, 7);
+                }
+                _tile_stored(0, &buffC(0,0), buffC.stride);
+                _tile_stored(1, &buffC(0,16), buffC.stride);
+                _tile_stored(2, &buffC(16,0), buffC.stride);
+                _tile_stored(3, &buffC(16,16), buffC.stride);
+                (ppkernel)(buffC, m, n + n0, valid_m, valid_n);
+            });
+            return;
+        }
+
+        // generic input shapes with M > 32
+        // determine cache blocking scheme
+        int elesz = sizeof(uint16_t);
+        int L2 = 2048*1024; // 2MB
+        int slice_size = 32*rndup(K, 32)*elesz;
+        int mc = std::max(1, L2/slice_size - 1);
+
+        // M > bM
         tileconfig_t tfg(1, 0, 8, 16, 64);
-        do
-        {
-            int m = blk_it.m;
-            int n = blk_it.n;
-            int valid_m = std::min(M - m, 32);
-            int valid_n = std::min(N - n, 32);
+        loop2D_opt_Mtail<32, 32>(M, N, mc, [&](int m, int n, int valid_m, int valid_n) {
             auto * pA0 = &matA(m, 0);
             auto * pA1 = &matA(m + 16, 0);
             auto strideA = matA.stride;
             bfloat16 * pB = &internalB(0, n);
-
-            if (valid_m < 32) {
-                // use Atails buffer to prevent memory read segmentfault
-                pA0 = &Atails(0, 0);
-                pA1 = &Atails(16, 0);
-                strideA = Atails.stride;
-            }
-
             zero_tiles<tC00, tC01, tC10, tC11>();
-            if (valid_m <= 16) {
-                // 1x2 is enough
-                int k;
-                for (k = 0; k < Kbody; k += 32) {
-                    _tile_loadd(tA0, pA0 + k, strideA);
-                    _tile_loadd(tB0, pB, 64); pB += (16*32);
-                    prefetch_bytes<1024>(pB);
-                    _tile_dpbf16ps(tC00, tA0, tB0);
+            _tile_loadd(tA0, pA0 + 0, strideA);
+            int k;
+            for (k = 0; k < K; k += 32) {
+                _tile_loadd(tB0, pB, 64); pB += (16*32);
+                prefetch_bytes<1024>(pB);
+                _tile_dpbf16ps(tC00, tA0, tB0);
 
-                    _tile_loadd(tB1, pB, 64); pB += (16*32);
-                    prefetch_bytes<1024>(pB);
-                    _tile_dpbf16ps(tC01, tA0, tB1);
-                }
-                // ktail
-                if (k < K) {
-                    auto * src = AKtailBuff.load(pA0 + k, strideA);
-                    _tile_loadd(tA0, src, 64);
-                    _tile_loadd(tB0, pB, 64); pB += (16*32);
-                    _tile_dpbf16ps(tC00, tA0, tB0);
+                _tile_loadd(tA1, pA1 + k, strideA);
+                _tile_dpbf16ps(tC10, tA1, tB0);
+                _tile_loadd(tB1, pB, 64); pB += (16*32);
+                prefetch_bytes<1024>(pB);
+                _tile_dpbf16ps(tC01, tA0, tB1);
 
-                    _tile_loadd(tB1, pB, 64); pB += (16*32);
-                    _tile_dpbf16ps(tC01, tA0, tB1);
-                }
-                _tile_stored(tC00, &buffC(0,0), buffC.stride);
-                _tile_stored(tC01, &buffC(0,16), buffC.stride);
-            } else {
-                // 2x2
-                _tile_loadd(tA0, pA0 + 0, strideA);
-                int k;
-                for (k = 0; k < Kbody; k += 32) {
-                    _tile_loadd(tB0, pB, 64); pB += (16*32);
-                    prefetch_bytes<1024>(pB);
-                    _tile_dpbf16ps(tC00, tA0, tB0);
-
-                    _tile_loadd(tA1, pA1 + k, strideA);
-                    _tile_dpbf16ps(tC10, tA1, tB0);
-                    _tile_loadd(tB1, pB, 64); pB += (16*32);
-                    prefetch_bytes<1024>(pB);
-                    _tile_dpbf16ps(tC01, tA0, tB1);
-
-                    _tile_loadd(tA0, pA0 + k + 32, strideA);    // balance load & dp. load next
-                    _tile_dpbf16ps(tC11, tA1, tB1);
-                }
-                if (k < K) {
-                    auto * src = AKtailBuff.load(pA0 + k, strideA);
-                    _tile_loadd(tA0, src, 64);
-                    _tile_loadd(tB0, pB, 64); pB += (16*32);
-                    _tile_dpbf16ps(tC00, tA0, tB0);
-
-                    _tile_loadd(tA1, src + (16*32), 64);
-                    _tile_dpbf16ps(tC10, tA1, tB0);
-                    _tile_loadd(tB1, pB, 64); pB += (16*32);
-                    _tile_dpbf16ps(tC01, tA0, tB1);
-                    _tile_dpbf16ps(tC11, tA1, tB1);
-                }
-                _tile_stored(tC00, &buffC(0,0), buffC.stride);
-                _tile_stored(tC01, &buffC(0,16), buffC.stride);
-                _tile_stored(tC10, &buffC(16,0), buffC.stride);
-                _tile_stored(tC11, &buffC(16,16), buffC.stride);
+                _tile_loadd(tA0, pA0 + k + 32, strideA);    // balance load & dp. load next
+                _tile_dpbf16ps(tC11, tA1, tB1);
             }
-            // post processing the accumulator tiles
-            //  - add bias
-            //  - do activations
-            //  - convert into bfloat16
-            //  - store into C matrix
+            _tile_stored(tC00, &buffC(0,0), buffC.stride);
+            _tile_stored(tC01, &buffC(0,16), buffC.stride);
+            _tile_stored(tC10, &buffC(16,0), buffC.stride);
+            _tile_stored(tC11, &buffC(16,16), buffC.stride);
             (ppkernel)(buffC, m, n + n0, valid_m, valid_n);
-        } while(blk_it.next());
+        });
     }
-
-    // for M < 16, use 1x2 tiles
-    template<typename PP>
-    void exec_Wbf16_m16(tensor2D<bfloat16> & matA,
-              tensor2D<bfloat16> & _matB,
-              int n0, int n1,
-              PP ppkernel) {
-        auto matB = getSubMatB(_matB, n0, n1);
-        int M = matA.dims[0];
-        int K = matA.dims[1];
-        assert(K == matB.dims[transposeB ? 1 : 0]);
-        int N = matB.dims[transposeB ? 0 : 1];
-
-        if (!constB || (internalB.capacity == 0)) {
-            functional::prepareB(internalB, matB, transposeB);
-        }
-
-        // register/cache blocking scheme is simplified when M <= 16
-        // C_MxN: 0,1
-        // A_MxK: 2,
-        // B_KxN: 3, 4
-        tileconfig_t tfg(1, 0, {M,M,M,16,16}, 64);
-        auto * pB0 = internalB.data.get();
-        auto * const pC0 = &buffC[0];
-        int Kbody = AKtailBuff.prepare(K);
-        int k;
-        const auto strideA = matA.stride;
-        for(int n = 0; n < N; n+=32) {
-            zero_tiles<0, 1>();
-            auto * pA0 = &matA[0];
-            for(k=0; k<Kbody; k+=32) {
-                // 1x2
-                _tile_loadd(2, pA0, strideA); pA0 += 32;   // tile A Mx32
-                prefetch_bytes<1024, _MM_HINT_T1, 4096*48>(pB0);
-                _tile_loadd(3, pB0, 64); pB0 += 16*32;     // tile B0 32x16 (16x16x2)
-                prefetch_bytes<1024, _MM_HINT_T1, 4096*48>(pB0);
-                _tile_loadd(4, pB0, 64); pB0 += 16*32;     // tile B1 32x16 (16x16x2)
-                _tile_dpbf16ps(0, 2, 3); // C0 += A*B0
-                _tile_dpbf16ps(1, 2, 4); // C1 += A*B1
-            }
-            // ktail
-            if (k < K) {
-                auto * src = AKtailBuff.load(pA0, M, strideA);
-                _tile_loadd(2, src, 64);
-                prefetch_bytes<1024, _MM_HINT_T1, 4096*48>(pB0);
-                _tile_loadd(3, pB0, 64); pB0 += (16*32);
-                _tile_dpbf16ps(0, 2, 3);
-                prefetch_bytes<1024, _MM_HINT_T1, 4096*48>(pB0);
-                _tile_loadd(4, pB0, 64); pB0 += (16*32);
-                _tile_dpbf16ps(1, 2, 4);
-            }
-            _tile_stored(0, pC0, buffC.stride);
-            _tile_stored(1, pC0 + 16, buffC.stride);
-            int valid_n = std::min(N - n, 32);
-            (ppkernel)(buffC, 0, n + n0, M, valid_n);
-        }
-    }
-
+#if 0
     // for M < 16, use 1x2 tiles
     template<typename PP>
     void exec_Wint8_m16(tensor2D<bfloat16> & matA,
@@ -1276,24 +1240,54 @@ struct Matmul {
         const auto strideA = matA.stride;
         int Kbody = AKtailBuff.prepare(K);
         int k;
-        constexpr int prefetch_ahead = 32*1024;
+        constexpr int prefetch_ahead = 64*1024;
+/*
+        B2buff.resize((N + 31)/32*Kbody, 32);
+        auto * pBcache = &B2buff[0];
+        pBsrc = pBdst = pBcache;
+        loop2D_no_bM(M, N, [&](int m, int n, int valid_m, int valid_n){
+            for(k=0; k<Kbody; k+=64) {
+                //prefetch_bytes<1024, _MM_HINT_T1, prefetch_ahead>(pBint);
+                internalBI8.i8_to_bf16_Kx32<32>(pBint, pBdst);
+
+                prefetch_bytes<1024, _MM_HINT_T1, prefetch_ahead>(pBint);
+                internalBI8.i8_to_bf16_Kx32<32>(pBint, pBdst + 32*32);
+            }
+        });
+        return;
+*/
         for(int n = 0; n < N; n += 2*16) {
             // C:Mx32 = A:Mx32 x B:32x32
             zero_tiles<0, 1>();
             auto * pA0 = &matA[0];
+#if 0
+            for(k=0; k<Kbody; k+=32) {
+                // 1x2
+                _tile_loadd(2, pA0, strideA); pA0 += 32;   // tile A Mx32
+                prefetch_bytes<512, _MM_HINT_T0, 4096>(pBsrc);
+
+                _tile_loadd(3, pBsrc, 64);
+                _tile_dpbf16ps(0, 2, 3); // C0 += A*B0
+
+                prefetch_bytes<512, _MM_HINT_T0, 4096>(pBsrc);
+                _tile_loadd(4, pBsrc + 16*32, 64);
+                _tile_dpbf16ps(1, 2, 4); // C1 += A*B1
+                pBsrc += 32*32;
+            }
+#endif
 #if 1
             for(k=0; k<Kbody; k+=32) {
                 // 1x2
                 //_tile_loadd(5, pBint + 4096*12, 64); // as prefetch
                 _tile_loadd(2, pA0, strideA); pA0 += 32;   // tile A Mx32
-                prefetch_bytes<512, _MM_HINT_T1, prefetch_ahead>(pBint);
+                prefetch_bytes<1024, _MM_HINT_T1, prefetch_ahead>(pBint);
 
                 internalBI8.i8_to_bf16_Kx32<8>(pBint, pBdst);
                 _tile_loadd(3, pBsrc, 64);
                 internalBI8.i8_to_bf16_Kx32<8>(pBint, pBdst + 8*32);
                 _tile_dpbf16ps(0, 2, 3); // C0 += A*B0
 
-                prefetch_bytes<512, _MM_HINT_T1, prefetch_ahead>(pBint);
+                prefetch_bytes<1024, _MM_HINT_T1, prefetch_ahead>(pBint);
                 internalBI8.i8_to_bf16_Kx32<8>(pBint, pBdst + 16*32);
                 _tile_loadd(4, pBsrc + 16*32, 64);
                 internalBI8.i8_to_bf16_Kx32<8>(pBint, pBdst + 24*32);
@@ -1305,18 +1299,19 @@ struct Matmul {
                 auto * src = AKtailBuff.load(pA0, M, strideA);
                 _tile_loadd(2, src, 64);
 
-                prefetch_bytes<512, _MM_HINT_T1, prefetch_ahead>(pBint);
+                prefetch_bytes<1024, _MM_HINT_T1, prefetch_ahead>(pBint);
                 internalBI8.i8_to_bf16_Kx32<16>(pBint, pBdst);
                 _tile_loadd(3, pBsrc, 64);
                 _tile_dpbf16ps(0, 2, 3);
 
-                prefetch_bytes<512, _MM_HINT_T1, prefetch_ahead>(pBint);
+                prefetch_bytes<1024, _MM_HINT_T1, prefetch_ahead>(pBint);
                 internalBI8.i8_to_bf16_Kx32<16>(pBint, pBdst + 16*32);
                 _tile_loadd(4, pBsrc + 16*32, 64);
                 _tile_dpbf16ps(1, 2, 4);
                 std::swap(pBsrc, pBdst);
             }
-#else
+#endif
+#if 0
             for(k=0; k<Kbody; k+=32) {
                 // 1x2
                 _tile_loadd(2, pA0, strideA); pA0 += 32;   // tile A Mx32
@@ -1347,13 +1342,15 @@ struct Matmul {
                 _tile_dpbf16ps(1, 2, 4);
             }
 #endif
+            //prefetch_bytes<2048, _MM_HINT_T1, prefetch_ahead>(pBint);
             _tile_stored(0, pC0, buffC.stride);
             _tile_stored(1, pC0 + 16, buffC.stride);
+            //prefetch_bytes<2048, _MM_HINT_T1, prefetch_ahead>(pBint + 2048);
             int valid_n = std::min(N - n, 32);
             (ppkernel)(buffC, 0, n + n0, M, valid_n);
         }
     }
-
+#endif
     template<typename PP>
     void exec_Wint8(tensor2D<bfloat16> & matA,
               tensor2D<bfloat16> & _matB,
@@ -1369,18 +1366,7 @@ struct Matmul {
         int elesz = sizeof(uint16_t);
         int L2 = 2048*1024; // 2MB
         int slice_size = 32*rndup(K, 32)*elesz;
-        int mc = L2/slice_size - 1;
-        
-        // if 1 32xK slice cannot fit L2, use 1 slice at least
-        if (mc == 0)
-            mc = 1;
-
-        int L1 = 48*1024; // 48K
-        int mcL1 = L1/slice_size - 1;
-
-        auto dmax = std::numeric_limits<int>::max();
-        BlockIterator::blkloop bloops[] = {{mc,32,0}, {dmax,0,32}, {dmax,mc*32,0}};
-        blk_it.reset(bloops, 3, M, N);
+        int mc = std::max(1, L2/slice_size - 1); // if 1 32xK slice cannot fit L2, use 1 slice at least
 
         // for non-constB, internalB is updated every time
         // for constB, internalB is updated once
@@ -1421,16 +1407,60 @@ struct Matmul {
             }
         }
 
+        if (M <= 16) {
+            // C:0/1  A:2  B:3/4
+            // dequantize scale is moved into ppkernel
+            ppkernel.set_deq_scale(internalBI8.dequant_scale);
+
+            tileconfig_t tfg(1, 0, {M,M,M,16,16}, 64);
+            auto * pBint = internalBI8.data.get();
+            auto & B2buff = scratch;
+            B2buff.resize(32*2, 32);
+            auto * const pB = &B2buff[0];
+            auto * pBsrc = pB + (32*32) * 0;
+            auto * pBdst = pB + (32*32) * 1;
+            internalBI8.i8_to_bf16_Kx32<32>(pBint, pBsrc);
+
+            auto * const pC0 = &buffC[0];
+            const auto strideA = matA.stride;
+            int k;
+            constexpr int prefetch_ahead = 64*1024;
+            loop2D_no_bM<32>(M, N, [&](int m, int n, int valid_m, int valid_n) {
+                // C:Mx32 = A:Mx32 x B:32x32
+                zero_tiles<0, 1>();
+                auto * pA0 = &matA[0];
+                for(k=0; k<K; k+=32) {
+                    // 1x2
+                    _tile_loadd(2, pA0, strideA); pA0 += 32;   // tile A Mx32
+                    prefetch_bytes<1024, _MM_HINT_T1, prefetch_ahead>(pBint);
+
+                    internalBI8.i8_to_bf16_Kx32<8>(pBint, pBdst);
+                    _tile_loadd(3, pBsrc, 64);
+                    internalBI8.i8_to_bf16_Kx32<8>(pBint, pBdst + 8*32);
+                    _tile_dpbf16ps(0, 2, 3); // C0 += A*B0
+
+                    prefetch_bytes<1024, _MM_HINT_T1, prefetch_ahead>(pBint);
+                    internalBI8.i8_to_bf16_Kx32<8>(pBint, pBdst + 16*32);
+                    _tile_loadd(4, pBsrc + 16*32, 64);
+                    internalBI8.i8_to_bf16_Kx32<8>(pBint, pBdst + 24*32);
+                    _tile_dpbf16ps(1, 2, 4); // C1 += A*B1
+                    std::swap(pBsrc, pBdst);
+                }
+                //prefetch_bytes<2048, _MM_HINT_T1, prefetch_ahead>(pBint);
+                _tile_stored(0, pC0, buffC.stride);
+                _tile_stored(1, pC0 + 16, buffC.stride);
+                //prefetch_bytes<2048, _MM_HINT_T1, prefetch_ahead>(pBint + 2048);
+                //int valid_n = std::min(N - n, 32);
+                (ppkernel)(buffC, 0, n + n0, M, valid_n);
+            });
+            return;
+        }
+
         int Kbody = AKtailBuff.prepare(K);
 
         // main loop
         tileconfig_t tfg(1, 0, 8, 16, 64);
-        do
-        {
-            int m = blk_it.m;
-            int n = blk_it.n;
-            int valid_m = std::min(M - m, 32);
-            int valid_n = std::min(N - n, 32);
+        loop2D<32, 32>(M, N, mc, [&](int m, int n, int valid_m, int valid_n) {
             auto * pA0 = &matA(m, 0);
             auto * pA1 = &matA(m + 16, 0);
             auto strideA = matA.stride;
@@ -1532,7 +1562,7 @@ struct Matmul {
             //  - convert into bfloat16
             //  - store into C matrix
             (ppkernel)(buffC, m, n + n0, valid_m, valid_n);
-        } while(blk_it.next());
+        });
     }
 };
 

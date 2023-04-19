@@ -197,7 +197,7 @@ struct tensor2D {
         return *this;
     }
 
-    bool operator==(const tensor2D<T> & rhs) {
+    bool operator==(const tensor2D<T> & rhs) const {
         if (dims[0] != rhs.dims[0] || dims[1] != rhs.dims[1])
             return false;
         for(int i0=0; i0<dims[0]; i0++)
