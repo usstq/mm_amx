@@ -1053,7 +1053,67 @@ struct Matmul {
     struct configs<int8_t> {
         static constexpr int kStep = 64;
     };
-    
+
+#define TILE_DP(T, dst, a, b) \
+    if (std::is_same<T, bfloat16>::value) _tile_dpbf16ps(dst, a, b); \
+    if (std::is_same<T, int8_t>::value) _tile_dpbssd(dst, a, b);
+
+    template<int tmmN, typename T, typename Ctype, typename PP>
+    void kernel_slimB(int M, int N,
+                    tensor2D<T> & A,
+                    void * B,
+                    tensor2D<Ctype> & buffC,
+                    PP ppkernel) {
+
+        auto * pB0 = reinterpret_cast<int8_t*>(B);
+        auto * pC0 = &buffC[0];
+        int8_t * pA0 = reinterpret_cast<int8_t*>(&A[0]);
+        int strideA = A.stride;
+        // load B tiles outside of loop
+        if (tmmN > 0) _tile_loadd(2, pB0, 64); pB0 += 1024;
+        if (tmmN > 1) _tile_loadd(3, pB0, 64); pB0 += 1024;
+        if (tmmN > 2) _tile_loadd(4, pB0, 64); pB0 += 1024;
+        if (tmmN > 3) _tile_loadd(5, pB0, 64); pB0 += 1024;
+        if (tmmN > 4) _tile_loadd(6, pB0, 64); pB0 += 1024;
+        if (tmmN > 5) _tile_loadd(7, pB0, 64); pB0 += 1024;
+
+        for(int m0 = 0; m0 < M; m0+=16) {
+            int m = m0;
+            pA0 += 16*A.stride;
+            if (M - m0 < 16) {
+                // shift up to prevent M-tails
+                pA0 -= (M - m0)*A.stride;
+                m = M - 16;
+            }
+            auto * pA = pA0;
+            if (tmmN > 0) {
+                _tile_loadd(1, pA, strideA); pA += 64;
+                TILE_DP(T, 0, 1, 2);
+            }
+            if (tmmN > 1) {
+                _tile_loadd(1, pA, strideA); pA += 64;
+                TILE_DP(T, 0, 1, 3);
+            }
+            if (tmmN > 2) {
+                _tile_loadd(1, pA, strideA); pA += 64;
+                TILE_DP(T, 0, 1, 4);
+            }
+            if (tmmN > 3) {
+                _tile_loadd(1, pA, strideA); pA += 64;
+                TILE_DP(T, 0, 1, 5);
+            }
+            if (tmmN > 4) {
+                _tile_loadd(1, pA, strideA); pA += 64;
+                TILE_DP(T, 0, 1, 6);
+            }
+            if (tmmN > 5) {
+                _tile_loadd(1, pA, strideA); pA += 64;
+                TILE_DP(T, 0, 1, 7);
+            }
+            _tile_stored(0, pC0, buffC.stride);
+            (ppkernel)(buffC, m, 0, 16, N);
+        }
+    }
 
     template<typename T, typename PP>
     void exec(tensor2D<T> & matA,
@@ -1072,7 +1132,10 @@ struct Matmul {
             functional::prepareB(internalB, matB, transposeB);
         }
 
+        // AMX bf16 & int8 has same M(=16) in A,C tile and same N(=16) in B tile
+        // but only different K(32 vs 64) in A,C & B tiles
         constexpr int kStep = configs<T>::kStep;
+
         // Due to the fact that we load a full tile at tails of K dimension
         // we may access memory address beyond the limit of A matrix
         // we do an preliminary check to ensure this will not cause segmentfalut.
@@ -1094,9 +1157,28 @@ struct Matmul {
         // I cannot find a way to call TDP intrinsic polymophically using overload or template.
         // have to use old-macro-tricks, hopefully these compile-time checks can be optimized
         // by compiler.
-#define TILE_DP(dst, a, b) \
-    if (std::is_same<T, bfloat16>::value) _tile_dpbf16ps(dst, a, b); \
-    if (std::is_same<T, int8_t>::value) _tile_dpbssd(dst, a, b);
+
+        // special case when whole B matrix can fit in 6 tiles
+        // we can load B only once
+        if (M >= 16 && N <= 16 && K <= 6*kStep) {
+            // B is zero-padded
+            // C:0
+            // A:1
+            // B:2,3,4,5,6,7
+            auto * pB0 = reinterpret_cast<int8_t*>(internalB.data.get());
+            tileconfig_t tfg(1, 0, 8, 16, 64);
+            switch((K + kStep - 1)/kStep) {
+                case 1: kernel_slimB<1>(M, N, matA, pB0, buffC, ppkernel); break;
+                case 2: kernel_slimB<2>(M, N, matA, pB0, buffC, ppkernel); break;
+                case 3: kernel_slimB<3>(M, N, matA, pB0, buffC, ppkernel); break;
+                case 4: kernel_slimB<4>(M, N, matA, pB0, buffC, ppkernel); break;
+                case 5: kernel_slimB<5>(M, N, matA, pB0, buffC, ppkernel); break;
+                case 6: kernel_slimB<6>(M, N, matA, pB0, buffC, ppkernel); break;
+                default:
+                    assert(false); // impossible since (K <= 6*kStep)
+            }
+            return;
+        }
 
         if (M <= 16) {
             // register/cache blocking scheme is simplified when M <= 16
@@ -1118,8 +1200,8 @@ struct Matmul {
                     _tile_loadd(3, pB0, 64); pB0 += 1024;     // tile B0 32x16(16x16x2)/64x16(16x16x4) is always 1KB
                     prefetch_bytes<1024, _MM_HINT_T1, 4096*48>(pB0);
                     _tile_loadd(4, pB0, 64); pB0 += 1024;     // tile B1 32x16(16x16x2)/64x16(16x16x4) is always 1KB
-                    TILE_DP(0, 2, 3); // C0 += A*B0
-                    TILE_DP(1, 2, 4); // C1 += A*B1
+                    TILE_DP(T, 0, 2, 3); // C0 += A*B0
+                    TILE_DP(T, 1, 2, 4); // C1 += A*B1
                 }
                 _tile_stored(0, pC0, buffC.stride);
                 _tile_stored(1, pC0 + 16, buffC.stride);
@@ -1140,15 +1222,15 @@ struct Matmul {
                 _tile_loadd(4, pA0, strideA); pA0 += 64;
                 _tile_loadd(6, pB, 64); pB += 1024;
                 prefetch_bytes<1024>(pB);
-                TILE_DP(0, 4, 6);
+                TILE_DP(T, 0, 4, 6);
 
                 _tile_loadd(5, pA1, strideA); pA1 += 64;
-                TILE_DP(2, 5, 6);
+                TILE_DP(T, 2, 5, 6);
                 _tile_loadd(7, pB, 64); pB += 1024;
                 prefetch_bytes<1024>(pB);
-                TILE_DP(1, 4, 7);
+                TILE_DP(T, 1, 4, 7);
 
-                TILE_DP(3, 5, 7);
+                TILE_DP(T, 3, 5, 7);
             }
             _tile_stored(0, &buffC(0,0), buffC.stride);
             _tile_stored(1, &buffC(0,16), buffC.stride);
