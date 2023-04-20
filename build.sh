@@ -19,7 +19,7 @@ target=a.out
 
 # g++ ./test.cpp -O2 -lpthread -march=native -lstdc++
 
-COMMON_OPTS="-DENABLE_NUMA -I$SCRIPT_DIR/include -lpthread -march=native -lstdc++ -lnuma -qopenmp"
+COMMON_OPTS="-DENABLE_NUMA -I$SCRIPT_DIR/include -lpthread -march=native -std=c++14 -lstdc++ -lnuma -qopenmp"
 
 icx $source -O2 $COMMON_OPTS -S -masm=intel -fverbose-asm  -o _main.s &&
 cat _main.s | c++filt > main.s &&

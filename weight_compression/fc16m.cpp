@@ -746,15 +746,15 @@ int main()
     //fc16m_test_all(7, 64, 128);
 
     // L1D
-    //fc16m_test_all(2, 80 * 32, 192);
-    //fc16m_test_mt0(2, 80 * 32, 192);
+    fc16m_test_all(2, 80 * 32, 192);
+    fc16m_test_mt0(2, 80 * 32, 192);
 
     // sizeof(B)=50MB    memory bandwidth can reach 24GB(L3)
     // sizeof(B)=100MB+, with prefetch, memory bandwidth can reach 19GB
     // for INT8 weight compression also access ext-DDR, we need 200MB+
-    //fc16m_test_all(2, 80 * 32, 81920);
-    //fc16m_test_mt0(2, 80 * 32, 81920);
+    fc16m_test_all(2, 80 * 32, 81920);
+    fc16m_test_mt0(2, 80 * 32, 81920);
 
-    //fc16m_test_mt1(2, 80*32, 81920);
+    fc16m_test_mt1(2, 80*32, 81920);
     fc16m_test_mt2(2, 80*32, 10752, 40);
 }

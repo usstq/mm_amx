@@ -912,29 +912,32 @@ struct Matmul {
     // 2x2 C tiles buffer
     // most usecase requires post-processing with AVX, thus buffC
     // is used to transfer data to AVX register
-    tensor2D<float> buffC;
+    tensor2D<float> buffC_f32;
+    tensor2D<int32_t> buffC_i32;
 
     Matmul(bool constB = false, bool transposeB = false, WeightPrecision weight_precision = Weight_BF16) : 
-        constB(constB), transposeB(transposeB), weight_precision(weight_precision), buffC(32, 32) {}
+        constB(constB), transposeB(transposeB), weight_precision(weight_precision), buffC_f32(32, 32), buffC_i32(32, 32) {}
 
-    // empty PP (for test purpose only, uncommon in real use case)
-    void operator()(tensor2D<bfloat16> & matA,
-                    tensor2D<bfloat16> & matB,
-                    tensor2D<bfloat16> & matC) {
-        PP::Store2bf16 ppkernel(matC);
-        (*this)(matA, matB, ppkernel);
+    template<class T = void>
+    struct acc_type {};
+    template<>
+    struct acc_type <bfloat16> { typedef float type; };
+    template<>
+    struct acc_type <int8_t> { typedef int32_t type; };
+
+    template<typename T, typename ACC = typename acc_type<T>::type, typename std::enable_if<std::is_same<T, bfloat16>::value, bool>::type = true>
+    tensor2D<ACC> & getBuffC() {
+        return buffC_f32;
     }
 
-    void operator()(tensor2D<bfloat16> & matA,
-                    tensor2D<bfloat16> & matB,
-                    tensor2D<float> & matC) {
-        PP::Store2float ppkernel(matC);
-        (*this)(matA, matB, ppkernel);
+    template<typename T, typename ACC = typename acc_type<T>::type, typename std::enable_if<std::is_same<T, int8_t>::value, bool>::type = true>
+    tensor2D<ACC> & getBuffC() {
+        return buffC_i32;
     }
 
-    template<typename PP>
-    void operator()(tensor2D<bfloat16> & matA,
-                    tensor2D<bfloat16> & matB,
+    template<typename T, typename PP>
+    void operator()(tensor2D<T> & matA,
+                    tensor2D<T> & matB,
                     PP ppkernel) {
         int N = matB.dims[transposeB ? 0 : 1];
         (*this)(matA, matB, 0, N, ppkernel);
@@ -965,7 +968,7 @@ struct Matmul {
                     PP ppkernel) {
         switch(weight_precision) {
             case Weight_BF16:
-                exec_Wbf16(matA, _matB, n0, n1, ppkernel);
+                exec<bfloat16>(matA, _matB, n0, n1, ppkernel);
                 break;
             case Weight_INT8:
                 exec_Wint8(matA, _matB, n0, n1, ppkernel);
@@ -976,11 +979,20 @@ struct Matmul {
         }
     }
 
-    tensor2D<bfloat16> getSubMatB(tensor2D<bfloat16> & _matB, int n0, int n1) {
+    template<typename PP>
+    void operator()(tensor2D<int8_t> & matA,
+                    tensor2D<int8_t> & _matB,
+                    int n0, int n1,
+                    PP ppkernel) {
+        exec<int8_t>(matA, _matB, n0, n1, ppkernel);
+    }
+
+    template<typename T>
+    tensor2D<T> getSubMatB(tensor2D<T> & _matB, int n0, int n1) {
         int Bd0 = transposeB ? (n1-n0) : _matB.dims[0];
         int Bd1 = transposeB ? _matB.dims[1] : (n1-n0);
-        bfloat16 * pbase = transposeB ? (&_matB(n0, 0)):(&_matB(0, n0));
-        return tensor2D<bfloat16>(Bd0, Bd1, pbase, _matB.stride);
+        T * pbase = transposeB ? (&_matB(n0, 0)):(&_matB(0, n0));
+        return tensor2D<T>(Bd0, Bd1, pbase, _matB.stride);
     }
 
     template<int bN, class F>
@@ -1030,33 +1042,22 @@ struct Matmul {
             }
         }
     }
-#if 0
-    // s8s8s32 -> PP
-    template<typename PP>
-    void operator()(tensor2D<int8_t> & matA,
-                    tensor2D<int8_t> & _matB,
-                    int n0, int n1,
-                    PP ppkernel) {
-        auto matB = getSubMatB(_matB, n0, n1);
-        int M = matA.dims[0];
-        int K = matA.dims[1];
-        int N = matB.dims[transposeB ? 0 : 1];
-        assert(K == matB.dims[transposeB ? 1 : 0]);
 
-        // for constB, internalB is updated once
-        // for non-constB, internalB is updated every time
-        // right now it was done in a separate step, not interleaving with AMX
-        //
-        if (!constB || (internalBI8.capacity == 0)) {
-            functional::prepareB(internalBI8, matB, transposeB);
-        }
+    template<typename T>
+    struct configs {};
+    template<>
+    struct configs<bfloat16> {
+        static constexpr int kStep = 32;
+    };
+    template<>
+    struct configs<int8_t> {
+        static constexpr int kStep = 64;
+    };
+    
 
-        // 
-    }
-#endif
-    template<typename PP>
-    void exec_Wbf16(tensor2D<bfloat16> & matA,
-              tensor2D<bfloat16> & _matB,
+    template<typename T, typename PP>
+    void exec(tensor2D<T> & matA,
+              tensor2D<T> & _matB,
               int n0, int n1,
               PP ppkernel) {
         auto matB = getSubMatB(_matB, n0, n1);
@@ -1071,21 +1072,31 @@ struct Matmul {
             functional::prepareB(internalB, matB, transposeB);
         }
 
+        constexpr int kStep = configs<T>::kStep;
         // Due to the fact that we load a full tile at tails of K dimension
         // we may access memory address beyond the limit of A matrix
         // we do an preliminary check to ensure this will not cause segmentfalut.
-        int Ktails = K % 32;
+        int Ktails = K % kStep;
         if (Ktails) {
             // the last tileload will load 64 bytes with only Ktails*sizeof(bfloat16) bytes
             // are inside A matrix, the rest is going to exceed A's range, if that's inside
             // the same page, it's OK, otherwise, we requires next page following it is valid
             // to access.
             auto * pAlast = reinterpret_cast<int8_t*>(&matA(M-1, K-1));
-            auto * plast = pAlast - Ktails * sizeof(bfloat16) + 64;
+            auto * plast = pAlast - Ktails * sizeof(T) + 64;
             if ((reinterpret_cast<uintptr_t>(plast) & (~4095)) != (reinterpret_cast<uintptr_t>(pAlast) & (~4095))) {
                 assert(is_pointer_valid(plast)); // we cannot over-access A, implementation fails.
             }
         }
+
+        auto & buffC = getBuffC<T>();
+
+        // I cannot find a way to call TDP intrinsic polymophically using overload or template.
+        // have to use old-macro-tricks, hopefully these compile-time checks can be optimized
+        // by compiler.
+#define TILE_DP(dst, a, b) \
+    if (std::is_same<T, bfloat16>::value) _tile_dpbf16ps(dst, a, b); \
+    if (std::is_same<T, int8_t>::value) _tile_dpbssd(dst, a, b);
 
         if (M <= 16) {
             // register/cache blocking scheme is simplified when M <= 16
@@ -1093,21 +1104,22 @@ struct Matmul {
             // A_MxK: 2,
             // B_KxN: 3, 4
             tileconfig_t tfg(1, 0, {M,M,M,16,16}, 64);
-            auto * pB0 = internalB.data.get();
+            auto * pB0 = reinterpret_cast<int8_t*>(internalB.data.get());
             auto * const pC0 = &buffC[0];
             int k;
             const auto strideA = matA.stride;
+
             loop2D_no_bM<32>(M, N, [&](int m, int n, int valid_m, int valid_n) {
                 zero_tiles<0, 1>();
-                auto * pA0 = &matA[0];
-                for(k=0; k<K; k+=32) {
-                    _tile_loadd(2, pA0, strideA); pA0 += 32;   // tile A Mx32
+                int8_t * pA0 = reinterpret_cast<int8_t*>(&matA[0]);
+                for(k=0; k<K; k+=kStep) {
+                    _tile_loadd(2, pA0, strideA); pA0 += 64;  // tile A Mx32/Mx64, cols is always 64
                     prefetch_bytes<1024, _MM_HINT_T1, 4096*48>(pB0);
-                    _tile_loadd(3, pB0, 64); pB0 += 16*32;     // tile B0 32x16 (16x16x2)
+                    _tile_loadd(3, pB0, 64); pB0 += 1024;     // tile B0 32x16(16x16x2)/64x16(16x16x4) is always 1KB
                     prefetch_bytes<1024, _MM_HINT_T1, 4096*48>(pB0);
-                    _tile_loadd(4, pB0, 64); pB0 += 16*32;     // tile B1 32x16 (16x16x2)
-                    _tile_dpbf16ps(0, 2, 3); // C0 += A*B0
-                    _tile_dpbf16ps(1, 2, 4); // C1 += A*B1
+                    _tile_loadd(4, pB0, 64); pB0 += 1024;     // tile B1 32x16(16x16x2)/64x16(16x16x4) is always 1KB
+                    TILE_DP(0, 2, 3); // C0 += A*B0
+                    TILE_DP(1, 2, 4); // C1 += A*B1
                 }
                 _tile_stored(0, pC0, buffC.stride);
                 _tile_stored(1, pC0 + 16, buffC.stride);
@@ -1118,25 +1130,25 @@ struct Matmul {
         }
 
         auto kernel_2x2 = [&](int m, int n, int valid_m, int valid_n) {
-            auto * pA0 = &matA(m, 0);
-            auto * pA1 = &matA(m + 16, 0);
+            auto * pA0 = reinterpret_cast<int8_t*>(&matA(m, 0));
+            auto * pA1 = reinterpret_cast<int8_t*>(&matA(m + 16, 0));
             auto strideA = matA.stride;
-            bfloat16 * pB = &internalB(0, n);
+            auto * pB = reinterpret_cast<int8_t*>(&internalB(0, n));
             zero_tiles<0, 1, 2, 3>();
             // 2x2
-            for (int k = 0; k < K; k += 32) {
-                _tile_loadd(4, pA0, strideA); pA0 += 32;
-                _tile_loadd(6, pB, 64); pB += (16*32);
+            for (int k = 0; k < K; k += kStep) {
+                _tile_loadd(4, pA0, strideA); pA0 += 64;
+                _tile_loadd(6, pB, 64); pB += 1024;
                 prefetch_bytes<1024>(pB);
-                _tile_dpbf16ps(0, 4, 6);
+                TILE_DP(0, 4, 6);
 
-                _tile_loadd(5, pA1, strideA); pA1 += 32;
-                _tile_dpbf16ps(2, 5, 6);
-                _tile_loadd(7, pB, 64); pB += (16*32);
+                _tile_loadd(5, pA1, strideA); pA1 += 64;
+                TILE_DP(2, 5, 6);
+                _tile_loadd(7, pB, 64); pB += 1024;
                 prefetch_bytes<1024>(pB);
-                _tile_dpbf16ps(1, 4, 7);
+                TILE_DP(1, 4, 7);
 
-                _tile_dpbf16ps(3, 5, 7);
+                TILE_DP(3, 5, 7);
             }
             _tile_stored(0, &buffC(0,0), buffC.stride);
             _tile_stored(1, &buffC(0,16), buffC.stride);
@@ -1154,7 +1166,7 @@ struct Matmul {
 
         // generic input shapes with M > 32
         // determine cache blocking scheme
-        int elesz = sizeof(uint16_t);
+        int elesz = sizeof(T);
         int L2 = 2048*1024; // 2MB
         int slice_size = 32*rndup(K, 32)*elesz;
         int mc = std::max(1, L2/slice_size - 1);
@@ -1361,6 +1373,8 @@ struct Matmul {
         }
 
         ppkernel.set_deq_scale(internalBI8.dequant_scale);
+
+        auto & buffC = buffC_f32;
 
         if (M <= 16) {
             // C:0/1  A:2  B:3/4

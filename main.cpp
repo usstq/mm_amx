@@ -175,7 +175,8 @@ void amx_FC_acc(int M, int K, int N) {
     tensor2D<bfloat16> C(M, N);
     tensor2D<bfloat16> C0(M, N);
     amx_bf16::Matmul fc(true, false, precision);
-    fc(A, B, C);
+    amx_bf16::PP::Store2bf16 pp(C);
+    fc(A, B, pp);
 
     C0=0;
     matmul(A, B, C0);
@@ -194,9 +195,9 @@ void amx_FC_perf(int M, int K, int N, int times = -1000) {
     tensor2D<bfloat16> B(K, N);
     tensor2D<bfloat16> C(M, N);
     amx_bf16::Matmul mm(true, false, precision);
-
+    amx_bf16::PP::Store2bf16 pp(C);
     timer.tag(__func__, M, K, N, precision)(times, [&](){
-        mm(A, B, C);
+        mm(A, B, pp);
     },
     double(M * N) * K * 2,
     AMXBf16PeakGops2PerCore * 1e9);
@@ -209,12 +210,12 @@ void amx_Matmul_perf(int M, int K, int N, bool transB, int times = -1000) {
     tensor2D<bfloat16> C(M, N);
     tensor2D<bfloat16> C0(M, N);
     amx_bf16::Matmul mm(false, transB);
-
+    amx_bf16::PP::Store2bf16 pp(C);
     std::cout << __func__ << " [" << M << "," << K << "," << N << "] ";
 
     C0=0;
     matmul(A, B, C0);
-    mm(A, transB?BT:B, C);
+    mm(A, transB?BT:B, pp);
     if (C0 == C) {
         std::cout << ANSIcolor("1;32") << "Match!\n" << ANSIcolor();
         //std::cout << C << std::endl;
@@ -226,7 +227,7 @@ void amx_Matmul_perf(int M, int K, int N, bool transB, int times = -1000) {
     std::cout << C0 << std::endl;
     std::cout << C << std::endl;
     timer(times, [&](){
-        mm(A, transB?BT:B, C);
+        mm(A, transB?BT:B, pp);
     },
     double(M * N) * K * 2,
     AMXBf16PeakGops2PerCore * 1e9);
@@ -744,9 +745,7 @@ int main(int argc, const char *argv[]) {
     std::cout << ANSIcolor("31") << "omp_get_num_threads() = " << omp_get_num_threads() << std::endl << ANSIcolor();
     std::cout << ANSIcolor("31") << "OMP_NT = " << OMP_NT << std::endl << ANSIcolor();
 
-    test_acc();
-    test_perf();
-    return 0;
+    test_acc();    test_perf();    return 0;
 
     precision = amx_bf16::Matmul::Weight_BF16;
     amx_FC_acc(2, 10*32 + 17, 256 + 15);
