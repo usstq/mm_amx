@@ -155,6 +155,9 @@ bool is_pointer_valid(void *p) {
     return msync(base, page_size, MS_ASYNC) == 0;
 }
 
+//#define FORCE_INLINE inline __attribute__((always_inline))
+#define FORCE_INLINE 
+
 using ov::bfloat16;
 
 namespace amx_bf16 {
@@ -758,7 +761,7 @@ namespace PP {
 
         Store2bf16(tensor2D<bfloat16> & C) : C(C) {}
 
-        void operator()(tensor2D<float> & buffC, int m, int n, int valid_m, int valid_n) {
+        FORCE_INLINE void operator()(tensor2D<float> & buffC, int m, int n, int valid_m, int valid_n) {
             // fast dynamic dispatch to polymorphic implementations
             if (do_deq)
                 exec<true>(buffC, m, n, valid_m, valid_n);
@@ -767,7 +770,7 @@ namespace PP {
         }
 
         template<bool deq>
-        void exec(tensor2D<float> & buffC, int m, int n, int valid_m, int valid_n) {
+        FORCE_INLINE void exec(tensor2D<float> & buffC, int m, int n, int valid_m, int valid_n) {
             auto * psrc = &buffC(0,0);
             int8_t * pdst = reinterpret_cast<int8_t*>(&(C(m, n)));
             int stride = C.stride;
@@ -794,7 +797,7 @@ namespace PP {
         float * bias;
         Addbias_Store2bf16(tensor2D<bfloat16> & C, float * bias) : C(C), bias(bias) {}
 
-        void operator()(tensor2D<float> & buffC, int m, int n, int valid_m, int valid_n) {
+        FORCE_INLINE void operator()(tensor2D<float> & buffC, int m, int n, int valid_m, int valid_n) {
             auto * psrc = &buffC(0,0);
             int8_t * pdst = reinterpret_cast<int8_t*>(&(C(m, n)));
             int stride = C.stride;
@@ -820,7 +823,7 @@ namespace PP {
 
         Addbias_Gelu_Store2bf16(tensor2D<bfloat16> & C, float * bias) : C(C), bias(bias) {}
 
-        void operator()(tensor2D<float> & buffC, int m, int n, int valid_m, int valid_n) {
+        FORCE_INLINE void operator()(tensor2D<float> & buffC, int m, int n, int valid_m, int valid_n) {
             // fast dynamic dispatch to polymorphic implementations
             if (do_deq)
                 exec<true>(buffC, m, n, valid_m, valid_n);
@@ -829,7 +832,7 @@ namespace PP {
         }
 
         template<bool deq>
-        void exec(tensor2D<float> & buffC, int m, int n, int valid_m, int valid_n) {
+        FORCE_INLINE void exec(tensor2D<float> & buffC, int m, int n, int valid_m, int valid_n) {
             auto * psrc = &buffC(0,0);
             int8_t * pdst = reinterpret_cast<int8_t*>(&(C(m, n)));
             int stride = C.stride;
@@ -862,7 +865,7 @@ namespace PP {
     struct Store2float : Dequantizable<false> {
         tensor2D<float> & C;
         Store2float(tensor2D<float> & C) : C(C) {}
-        void operator()(tensor2D<float> & buffC, int m, int n, int valid_m, int valid_n) {
+        FORCE_INLINE void operator()(tensor2D<float> & buffC, int m, int n, int valid_m, int valid_n) {
             auto * psrc = &buffC(0,0);
             int8_t * pdst = reinterpret_cast<int8_t*>(&(C(m, n)));
             int stride = C.stride;
@@ -1076,7 +1079,7 @@ struct Matmul {
         if (tmmN > 3) _tile_loadd(5, pB0, 64); pB0 += 1024;
         if (tmmN > 4) _tile_loadd(6, pB0, 64); pB0 += 1024;
         if (tmmN > 5) _tile_loadd(7, pB0, 64); pB0 += 1024;
-
+        asm("int3");
         for(int m0 = 0; m0 < M; m0+=16) {
             int m = m0;
             pA0 += 16*A.stride;
