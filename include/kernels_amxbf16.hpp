@@ -1030,7 +1030,30 @@ struct Matmul {
             }
         }
     }
+#if 0
+    // s8s8s32 -> PP
+    template<typename PP>
+    void operator()(tensor2D<int8_t> & matA,
+                    tensor2D<int8_t> & _matB,
+                    int n0, int n1,
+                    PP ppkernel) {
+        auto matB = getSubMatB(_matB, n0, n1);
+        int M = matA.dims[0];
+        int K = matA.dims[1];
+        int N = matB.dims[transposeB ? 0 : 1];
+        assert(K == matB.dims[transposeB ? 1 : 0]);
 
+        // for constB, internalB is updated once
+        // for non-constB, internalB is updated every time
+        // right now it was done in a separate step, not interleaving with AMX
+        //
+        if (!constB || (internalBI8.capacity == 0)) {
+            functional::prepareB(internalBI8, matB, transposeB);
+        }
+
+        // 
+    }
+#endif
     template<typename PP>
     void exec_Wbf16(tensor2D<bfloat16> & matA,
               tensor2D<bfloat16> & _matB,
@@ -1314,12 +1337,6 @@ struct Matmul {
         int N = matB.dims[transposeB ? 0 : 1];
         assert(K == matB.dims[transposeB ? 1 : 0]);
 
-        // determine blocking scheme
-        int elesz = sizeof(uint16_t);
-        int L2 = 2048*1024; // 2MB
-        int slice_size = 32*rndup(K, 32)*elesz;
-        int mc = std::max(1, L2/slice_size - 1); // if 1 32xK slice cannot fit L2, use 1 slice at least
-
         // for non-constB, internalB is updated every time
         // for constB, internalB is updated once
         if (!constB || (internalB.capacity == 0)) {
@@ -1344,8 +1361,6 @@ struct Matmul {
         }
 
         ppkernel.set_deq_scale(internalBI8.dequant_scale);
-
-        
 
         if (M <= 16) {
             // C:0/1  A:2  B:3/4
@@ -1437,6 +1452,12 @@ struct Matmul {
             loop2D_no_bM<32>(M, N, kernel_2x2);
             return;
         }
+
+        // determine blocking scheme
+        int elesz = sizeof(uint16_t);
+        int L2 = 2048*1024; // 2MB
+        int slice_size = 32*rndup(K, 32)*elesz;
+        int mc = std::max(1, L2/slice_size - 1); // if 1 32xK slice cannot fit L2, use 1 slice at least
 
         // main loop
         tileconfig_t tfg(1, 0, 8, 16, 64);
