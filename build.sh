@@ -1,8 +1,4 @@
-if ! which icx > /dev/null; then
-echo "please execute following command to initialize IntelCompiler env"
-echo source ~/intel/oneapi/setvars.sh
-exit 1
-fi
+source ~/intel/oneapi/setvars.sh
 
 source=$1
 
