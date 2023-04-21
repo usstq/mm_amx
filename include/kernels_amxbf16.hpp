@@ -898,53 +898,102 @@ void zero_tiles() { int dummy[sizeof...(tmm)] = {(_tile_zero(tmm), 0)...}; }
 // matmul (FC)
 //
 // constB constrols whether it's FC or not 
+// store precision for weight compression, only for BF16 AMX
+
+template<typename T>
+tensor2D<T> getSubMatB(tensor2D<T> & _matB, int n0, int n1, bool transposeB) {
+    int Bd0 = transposeB ? (n1-n0) : _matB.dims[0];
+    int Bd1 = transposeB ? _matB.dims[1] : (n1-n0);
+    T * pbase = transposeB ? (&_matB(n0, 0)):(&_matB(0, n0));
+    return tensor2D<T>(Bd0, Bd1, pbase, _matB.stride);
+}
+
+template<int bN, class F>
+void loop2D_no_bM(int M, int N, F f) {
+    for(int n=0; n<N; n += bN) {
+        int valid_n = std::min(N - n, bN);
+        f(0, n, M, valid_n);
+    }
+    return;
+}
+
+template<int bM, int bN, class F>
+void loop2D(int M, int N, int mc, F f) {
+    for(int m0=0; m0<M; m0 += mc*bM) {
+        for(int n=0; n<N; n += bN) {
+            int valid_n = std::min(N - n, bN);
+            int mcnt = std::min(mc, ((M - m0) + bM - 1)/bM);
+            for(int m1=0; m1<mcnt; m1++) {
+                int m = m0 + m1*bM;
+                int valid_m = std::min(M - m, bM);
+                f(m, n, valid_m, valid_n);
+            }
+        }
+    }
+}
+
+// avoid M tails by shift last tile window up
+// a little, with some overlapped/redundant computation
+// but it works only when (M >= bM)
+template<int bM, int bN, class F>
+void loop2D_opt_Mtail(int M, int N, int mc, F f) {
+    int tailM = (M % (mc*bM)) % bM;
+    assert(M > bM);
+    for(int m0=0; m0<M; m0 += mc*bM) {
+        for(int n=0; n<N; n += bN) {
+            int valid_n = std::min(N - n, bN);
+            int mcnt = std::min(mc, ((M - m0) + bM - 1)/bM);
+            for(int m1=0; m1<mcnt; m1++) {
+                int m = m0 + m1*bM;
+                if (M - m < bM) {
+                    // shift kernel window up to make valid_m still in whole bM,
+                    // avoid tail window with (valid_m < bM)
+                    m = M - bM;
+                }
+                f(m, n, bM, valid_n);
+            }
+        }
+    }
+}
+
+template<class T = void>
+struct acc_type {};
+template<>
+struct acc_type <bfloat16> { typedef float type; };
+template<>
+struct acc_type <int8_t> { typedef int32_t type; };
+template<>
+struct acc_type <uint8_t> { typedef int32_t type; };
+
+template<typename TA, typename TB, typename TC = typename acc_type<TA>::type>
 struct Matmul {
-    KpackedB<bfloat16> internalB;
-    KpackedB<int8_t> internalBI8;
-    tensor2D<bfloat16> scratch;
+    // B matrix is orgnized as tensor2D of shape axb where a=round_up_div(N, 32), b=round_up(K,32/64)*32
+    // so b is size of submatrix of Kx32 composed of two columns of B0/B1 tiles.
+    //tensor2D<TB> internalB;
+    KpackedB<TB> internalB;
+
     bool constB;
     bool transposeB;
 
-    // store precision for weight compression, only for BF16 AMX
-    enum WeightPrecision {
-        Weight_BF16,
-        Weight_INT8,
-        Weight_INT4
-    };
-    WeightPrecision weight_precision;
+    constexpr static bool is_bf16s8 = std::is_same<TA,bfloat16>::value && std::is_same<TB,int8_t>::value;
+    constexpr static bool is_bf16bf16 = std::is_same<TA,bfloat16>::value && std::is_same<TB,bfloat16>::value;
+    constexpr static bool is_s8s8 = std::is_same<TA,int8_t>::value && std::is_same<TB,int8_t>::value;
+    constexpr static bool is_s8u8 = std::is_same<TA,int8_t>::value && std::is_same<TB,uint8_t>::value;
+    constexpr static bool is_u8s8 = std::is_same<TA,uint8_t>::value && std::is_same<TB,int8_t>::value;
+    constexpr static bool is_u8u8 = std::is_same<TA,uint8_t>::value && std::is_same<TB,uint8_t>::value;
+    constexpr static bool is_i8_mode = is_s8s8 || is_s8u8 || is_u8s8 || is_u8u8;
+
+    // AMX bf16 & int8 has same M(=16) in A,C tile and same N(=16) in B tile
+    // but only different K(32 vs 64) in A,C & B tiles
+    constexpr static int kStep = is_i8_mode ? 64 : 32;
+
     // 2x2 C tiles buffer
     // most usecase requires post-processing with AVX, thus buffC
     // is used to transfer data to AVX register
-    tensor2D<float> buffC_f32;
-    tensor2D<int32_t> buffC_i32;
+    tensor2D<TC> buffC;
 
-    Matmul(bool constB = false, bool transposeB = false, WeightPrecision weight_precision = Weight_BF16) : 
-        constB(constB), transposeB(transposeB), weight_precision(weight_precision), buffC_f32(32, 32), buffC_i32(32, 32) {}
-
-    template<class T = void>
-    struct acc_type {};
-    template<>
-    struct acc_type <bfloat16> { typedef float type; };
-    template<>
-    struct acc_type <int8_t> { typedef int32_t type; };
-
-    template<typename T, typename ACC = typename acc_type<T>::type, typename std::enable_if<std::is_same<T, bfloat16>::value, bool>::type = true>
-    tensor2D<ACC> & getBuffC() {
-        return buffC_f32;
-    }
-
-    template<typename T, typename ACC = typename acc_type<T>::type, typename std::enable_if<std::is_same<T, int8_t>::value, bool>::type = true>
-    tensor2D<ACC> & getBuffC() {
-        return buffC_i32;
-    }
-
-    template<typename T, typename PP>
-    void operator()(tensor2D<T> & matA,
-                    tensor2D<T> & matB,
-                    PP ppkernel) {
-        int N = matB.dims[transposeB ? 0 : 1];
-        (*this)(matA, matB, 0, N, ppkernel);
-    }
+    Matmul(bool constB = false, bool transposeB = false) : 
+        constB(constB), transposeB(transposeB), buffC(32, 32) {}
 
     // ppkernel is a callable which captures the runtime args
     // by itself, so no need to pass in any post-process related
@@ -964,110 +1013,23 @@ struct Matmul {
     //
     // ppkernels are simple to write, further wrapping or structurelize only
     // makes the design more complex, so we stop doing that.
-    template<typename PP>
-    void operator()(tensor2D<bfloat16> & matA,
-                    tensor2D<bfloat16> & _matB,
-                    int n0, int n1,
-                    PP ppkernel) {
-        switch(weight_precision) {
-            case Weight_BF16:
-                exec<bfloat16>(matA, _matB, n0, n1, ppkernel);
-                break;
-            case Weight_INT8:
-                exec_Wint8(matA, _matB, n0, n1, ppkernel);
-                break;
-            default:
-                std::cout << "weight_precision " << weight_precision << " is not supported!" << std::endl;
-                break;
-        }
-    }
 
-    template<typename PP>
-    void operator()(tensor2D<int8_t> & matA,
-                    tensor2D<int8_t> & _matB,
-                    int n0, int n1,
-                    PP ppkernel) {
-        exec<int8_t>(matA, _matB, n0, n1, ppkernel);
-    }
+    // I cannot find a way to call TDP intrinsic polymophically using overload or template.
+    // have to use old-macro-tricks, hopefully these compile-time checks can be optimized
+    // by compiler.
+#define TILE_DP(dst, a, b) \
+    if (is_bf16bf16) _tile_dpbf16ps(dst, a, b); \
+    if (is_s8s8) _tile_dpbssd(dst, a, b); \
+    if (is_s8u8) _tile_dpbsud(dst, a, b); \
+    if (is_u8s8) _tile_dpbusd(dst, a, b); \
+    if (is_u8u8) _tile_dpbuud(dst, a, b);
 
-    template<typename T>
-    tensor2D<T> getSubMatB(tensor2D<T> & _matB, int n0, int n1) {
-        int Bd0 = transposeB ? (n1-n0) : _matB.dims[0];
-        int Bd1 = transposeB ? _matB.dims[1] : (n1-n0);
-        T * pbase = transposeB ? (&_matB(n0, 0)):(&_matB(0, n0));
-        return tensor2D<T>(Bd0, Bd1, pbase, _matB.stride);
-    }
-
-    template<int bN, class F>
-    void loop2D_no_bM(int M, int N, F f) {
-        for(int n=0; n<N; n += bN) {
-            int valid_n = std::min(N - n, bN);
-            f(0, n, M, valid_n);
-        }
-        return;
-    }
-
-    template<int bM, int bN, class F>
-    void loop2D(int M, int N, int mc, F f) {
-        for(int m0=0; m0<M; m0 += mc*bM) {
-            for(int n=0; n<N; n += bN) {
-                int valid_n = std::min(N - n, bN);
-                int mcnt = std::min(mc, ((M - m0) + bM - 1)/bM);
-                for(int m1=0; m1<mcnt; m1++) {
-                    int m = m0 + m1*bM;
-                    int valid_m = std::min(M - m, bM);
-                    f(m, n, valid_m, valid_n);
-                }
-            }
-        }
-    }
-
-    // avoid M tails by shift last tile window up
-    // a little, with some overlapped/redundant computation
-    // but it works only when (M >= bM)
-    template<int bM, int bN, class F>
-    void loop2D_opt_Mtail(int M, int N, int mc, F f) {
-        int tailM = (M % (mc*bM)) % bM;
-        assert(M > bM);
-        for(int m0=0; m0<M; m0 += mc*bM) {
-            for(int n=0; n<N; n += bN) {
-                int valid_n = std::min(N - n, bN);
-                int mcnt = std::min(mc, ((M - m0) + bM - 1)/bM);
-                for(int m1=0; m1<mcnt; m1++) {
-                    int m = m0 + m1*bM;
-                    if (M - m < bM) {
-                        // shift kernel window up to make valid_m still in whole bM,
-                        // avoid tail window with (valid_m < bM)
-                        m = M - bM;
-                    }
-                    f(m, n, bM, valid_n);
-                }
-            }
-        }
-    }
-
-    template<typename T>
-    struct configs {};
-    template<>
-    struct configs<bfloat16> {
-        static constexpr int kStep = 32;
-    };
-    template<>
-    struct configs<int8_t> {
-        static constexpr int kStep = 64;
-    };
-
-#define TILE_DP(T, dst, a, b) \
-    if (std::is_same<T, bfloat16>::value) _tile_dpbf16ps(dst, a, b); \
-    if (std::is_same<T, int8_t>::value) _tile_dpbssd(dst, a, b);
-
-    template<int tmmN, typename T, typename Ctype, typename PP>
+    template<int tmmN, typename PP>
     void kernel_slimB(int M, int N,
-                    tensor2D<T> & A,
+                    tensor2D<TA> & A,
                     void * B,
-                    tensor2D<Ctype> & buffC,
+                    tensor2D<TC> & buffC,
                     PP ppkernel) {
-
         auto * pB0 = reinterpret_cast<int8_t*>(B);
         auto * pC0 = &buffC[0];
         int8_t * pA0 = reinterpret_cast<int8_t*>(&A[0]);
@@ -1079,7 +1041,7 @@ struct Matmul {
         if (tmmN > 3) _tile_loadd(5, pB0, 64); pB0 += 1024;
         if (tmmN > 4) _tile_loadd(6, pB0, 64); pB0 += 1024;
         if (tmmN > 5) _tile_loadd(7, pB0, 64); pB0 += 1024;
-        asm("int3");
+        //asm("int3");
         for(int m0 = 0; m0 < M; m0+=16) {
             int m = m0;
             pA0 += 16*A.stride;
@@ -1091,39 +1053,39 @@ struct Matmul {
             auto * pA = pA0;
             if (tmmN > 0) {
                 _tile_loadd(1, pA, strideA); pA += 64;
-                TILE_DP(T, 0, 1, 2);
+                TILE_DP(0, 1, 2);
             }
             if (tmmN > 1) {
                 _tile_loadd(1, pA, strideA); pA += 64;
-                TILE_DP(T, 0, 1, 3);
+                TILE_DP(0, 1, 3);
             }
             if (tmmN > 2) {
                 _tile_loadd(1, pA, strideA); pA += 64;
-                TILE_DP(T, 0, 1, 4);
+                TILE_DP(0, 1, 4);
             }
             if (tmmN > 3) {
                 _tile_loadd(1, pA, strideA); pA += 64;
-                TILE_DP(T, 0, 1, 5);
+                TILE_DP(0, 1, 5);
             }
             if (tmmN > 4) {
                 _tile_loadd(1, pA, strideA); pA += 64;
-                TILE_DP(T, 0, 1, 6);
+                TILE_DP(0, 1, 6);
             }
             if (tmmN > 5) {
                 _tile_loadd(1, pA, strideA); pA += 64;
-                TILE_DP(T, 0, 1, 7);
+                TILE_DP(0, 1, 7);
             }
             _tile_stored(0, pC0, buffC.stride);
             (ppkernel)(buffC, m, 0, 16, N);
         }
     }
 
-    template<typename T, typename PP>
-    void exec(tensor2D<T> & matA,
-              tensor2D<T> & _matB,
-              int n0, int n1,
-              PP ppkernel) {
-        auto matB = getSubMatB(_matB, n0, n1);
+    template<typename PP>
+    void operator()(tensor2D<TA> & matA,
+                    tensor2D<TB> & _matB,
+                    int n0, int n1,
+                    PP ppkernel) {
+        auto matB = getSubMatB(_matB, n0, n1, transposeB);
         int M = matA.dims[0];
         int K = matA.dims[1];
         int N = matB.dims[transposeB ? 0 : 1];
@@ -1135,10 +1097,6 @@ struct Matmul {
             functional::prepareB(internalB, matB, transposeB);
         }
 
-        // AMX bf16 & int8 has same M(=16) in A,C tile and same N(=16) in B tile
-        // but only different K(32 vs 64) in A,C & B tiles
-        constexpr int kStep = configs<T>::kStep;
-
         // Due to the fact that we load a full tile at tails of K dimension
         // we may access memory address beyond the limit of A matrix
         // we do an preliminary check to ensure this will not cause segmentfalut.
@@ -1149,17 +1107,11 @@ struct Matmul {
             // the same page, it's OK, otherwise, we requires next page following it is valid
             // to access.
             auto * pAlast = reinterpret_cast<int8_t*>(&matA(M-1, K-1));
-            auto * plast = pAlast - Ktails * sizeof(T) + 64;
+            auto * plast = pAlast - Ktails * sizeof(TA) + 64;
             if ((reinterpret_cast<uintptr_t>(plast) & (~4095)) != (reinterpret_cast<uintptr_t>(pAlast) & (~4095))) {
                 assert(is_pointer_valid(plast)); // we cannot over-access A, implementation fails.
             }
         }
-
-        auto & buffC = getBuffC<T>();
-
-        // I cannot find a way to call TDP intrinsic polymophically using overload or template.
-        // have to use old-macro-tricks, hopefully these compile-time checks can be optimized
-        // by compiler.
 
         // special case when whole B matrix can fit in 6 tiles
         // we can load B only once
@@ -1203,8 +1155,8 @@ struct Matmul {
                     _tile_loadd(3, pB0, 64); pB0 += 1024;     // tile B0 32x16(16x16x2)/64x16(16x16x4) is always 1KB
                     prefetch_bytes<1024, _MM_HINT_T1, 4096*48>(pB0);
                     _tile_loadd(4, pB0, 64); pB0 += 1024;     // tile B1 32x16(16x16x2)/64x16(16x16x4) is always 1KB
-                    TILE_DP(T, 0, 2, 3); // C0 += A*B0
-                    TILE_DP(T, 1, 2, 4); // C1 += A*B1
+                    TILE_DP(0, 2, 3); // C0 += A*B0
+                    TILE_DP(1, 2, 4); // C1 += A*B1
                 }
                 _tile_stored(0, pC0, buffC.stride);
                 _tile_stored(1, pC0 + 16, buffC.stride);
@@ -1225,15 +1177,15 @@ struct Matmul {
                 _tile_loadd(4, pA0, strideA); pA0 += 64;
                 _tile_loadd(6, pB, 64); pB += 1024;
                 prefetch_bytes<1024>(pB);
-                TILE_DP(T, 0, 4, 6);
+                TILE_DP(0, 4, 6);
 
                 _tile_loadd(5, pA1, strideA); pA1 += 64;
-                TILE_DP(T, 2, 5, 6);
+                TILE_DP(2, 5, 6);
                 _tile_loadd(7, pB, 64); pB += 1024;
                 prefetch_bytes<1024>(pB);
-                TILE_DP(T, 1, 4, 7);
+                TILE_DP(1, 4, 7);
 
-                TILE_DP(T, 3, 5, 7);
+                TILE_DP(3, 5, 7);
             }
             _tile_stored(0, &buffC(0,0), buffC.stride);
             _tile_stored(1, &buffC(0,16), buffC.stride);
@@ -1251,7 +1203,7 @@ struct Matmul {
 
         // generic input shapes with M > 32
         // determine cache blocking scheme
-        int elesz = sizeof(T);
+        int elesz = sizeof(TA);
         int L2 = 2048*1024; // 2MB
         int slice_size = 32*rndup(K, 32)*elesz;
         int mc = std::max(1, L2/slice_size - 1);
@@ -1423,12 +1375,36 @@ struct Matmul {
         }
     }
 #endif
+};
+
+// specialization:
+//  TA is bfloat16 and TB is int8_t, decompressed on the fly into bfloat16 by simply convert
+template<>
+struct Matmul<bfloat16, int8_t, float> {
+    KpackedB<int8_t> internalBI8;
+
+    // wei_buff is ping-pong buffer containing bfloat16 weights decompressed on the fly.
+    tensor2D<bfloat16> weiBuff;
+
+    bool constB;
+    bool transposeB;
+
+    constexpr static int kStep = 32;
+
+    // 2x2 C tiles buffer
+    // most usecase requires post-processing with AVX, thus buffC
+    // is used to transfer data to AVX register
+    tensor2D<float> buffC;
+
+    Matmul(bool constB = false, bool transposeB = false) : 
+        constB(constB), transposeB(transposeB), buffC(32, 32) {}
+
     template<typename PP>
-    void exec_Wint8(tensor2D<bfloat16> & matA,
-              tensor2D<bfloat16> & _matB,
-              int n0, int n1,
-              PP ppkernel) {
-        auto matB = getSubMatB(_matB, n0, n1);
+    void operator()(tensor2D<bfloat16> & matA,
+                    tensor2D<bfloat16> & _matB,
+                    int n0, int n1,
+                    PP ppkernel) {
+        auto matB = getSubMatB(_matB, n0, n1, transposeB);
         int M = matA.dims[0];
         int K = matA.dims[1];
         int N = matB.dims[transposeB ? 0 : 1];
@@ -1436,9 +1412,7 @@ struct Matmul {
 
         // for non-constB, internalB is updated every time
         // for constB, internalB is updated once
-        if (!constB || (internalB.capacity == 0)) {
-            internalB.capacity = 1;
-
+        if (!constB || (internalBI8.capacity == 0)) {
             // this dynamic quantization of weight matrix using minmax
             // is time-consuming, should be used only for constB
             if (!constB) {
@@ -1459,15 +1433,13 @@ struct Matmul {
 
         ppkernel.set_deq_scale(internalBI8.dequant_scale);
 
-        auto & buffC = buffC_f32;
-
         if (M <= 16) {
             // C:0/1  A:2  B:3/4
             // dequantize scale is moved into ppkernel
             constexpr int prefetch_ahead = 64*1024;
             tileconfig_t tfg(1, 0, {M,M,M,16,16}, 64);
             auto * pBint = internalBI8.data.get();
-            auto & B2buff = scratch;
+            auto & B2buff = weiBuff;
             B2buff.resize(32*2, 32);
             auto * const pB = &B2buff[0];
             auto * pBsrc = pB + (32*32) * 0;
@@ -1563,16 +1535,6 @@ struct Matmul {
         loop2D_opt_Mtail<32, 32>(M, N, mc, kernel_2x2);
     }
 };
-
-std::ostream & operator<<(std::ostream & os, Matmul::WeightPrecision & prec) {
-    static const char* names_prec[] = {
-    "bf16",
-    "int8",
-    "int4"
-    };
-    os << names_prec[(int)prec];
-    return os;
-}
 
 #if 0
 // using only 1 tile in C matrix:

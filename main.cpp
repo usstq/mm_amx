@@ -26,7 +26,55 @@ timeit timer;
 // initialize AMX
 static bool initAMX = initXTILE();
 
-static amx_bf16::Matmul::WeightPrecision precision = amx_bf16::Matmul::Weight_BF16;
+struct Matmul {
+    enum WeightPrecision {
+        Weight_BF16,
+        Weight_INT8,
+        Weight_INT4
+    };
+    amx_bf16::Matmul<bfloat16, bfloat16> mbf16bf16;
+    amx_bf16::Matmul<bfloat16, int8_t> mbf16s8;
+    tensor2D<int8_t> compressedB;
+    WeightPrecision wei_prec;
+    bool transposeB;
+
+    Matmul(bool constB = false, bool transposeB = false, WeightPrecision wei_prec = Weight_BF16) :
+        mbf16bf16(constB, transposeB), mbf16s8(constB, transposeB), transposeB(transposeB), wei_prec(wei_prec) {
+    }
+    template<typename PP>
+    void operator()(tensor2D<bfloat16> & A,
+                    tensor2D<bfloat16> & B,
+                    PP ppkernel) {
+        int N = B.dims[transposeB?0:1];
+        (*this)(A, B, 0, N, ppkernel);    
+    }
+    template<typename PP>
+    void operator()(tensor2D<bfloat16> & A,
+                    tensor2D<bfloat16> & B,
+                    int n0, int n1,
+                    PP ppkernel) {
+        if (wei_prec == Weight_BF16)
+            mbf16bf16(A, B, n0, n1, ppkernel);
+        if (wei_prec == Weight_INT8) {
+            // dynamically quantize weight B matrix into int8_t before pass to
+            // mbf16s8
+            mbf16s8(A, B, n0, n1, ppkernel);
+        }
+    }
+};
+
+
+std::ostream & operator<<(std::ostream & os, Matmul::WeightPrecision & prec) {
+    static const char* names_prec[] = {
+    "org",
+    "int8",
+    "int4"
+    };
+    os << names_prec[(int)prec];
+    return os;
+}
+
+static Matmul::WeightPrecision precision = Matmul::Weight_BF16;
 
 //================================================================================
 int amx_unit_test_perf() {
@@ -174,7 +222,7 @@ void amx_FC_acc(int M, int K, int N) {
     tensor2D<bfloat16> B(K, N);
     tensor2D<bfloat16> C(M, N);
     tensor2D<bfloat16> C0(M, N);
-    amx_bf16::Matmul fc(true, false, precision);
+    Matmul fc(true, false, precision);
     amx_bf16::PP::Store2bf16 pp(C);
     fc(A, B, pp);
 
@@ -194,7 +242,7 @@ void amx_FC_perf(int M, int K, int N, int times = -1000) {
     tensor2D<bfloat16> A(M, K);
     tensor2D<bfloat16> B(K, N);
     tensor2D<bfloat16> C(M, N);
-    amx_bf16::Matmul mm(true, false, precision);
+    Matmul mm(true, false, precision);
     amx_bf16::PP::Store2bf16 pp(C);
     timer.tag(__func__, M, K, N, precision)(times, [&](){
         mm(A, B, pp);
@@ -209,7 +257,7 @@ void amx_Matmul_perf(int M, int K, int N, bool transB, int times = -1000) {
     tensor2D<bfloat16> BT = B.Tr();
     tensor2D<bfloat16> C(M, N);
     tensor2D<bfloat16> C0(M, N);
-    amx_bf16::Matmul mm(false, transB);
+    Matmul mm(false, transB);
     amx_bf16::PP::Store2bf16 pp(C);
     std::cout << __func__ << " [" << M << "," << K << "," << N << "] ";
 
@@ -299,14 +347,14 @@ ThreadPool thp;
 
 // multi-threaded matmul
 struct MatmulMT {
-    amx_bf16::Matmul::WeightPrecision rt_precision;
-    std::vector<std::shared_ptr<amx_bf16::Matmul>> ops;
+    Matmul::WeightPrecision rt_precision;
+    std::vector<std::shared_ptr<Matmul>> ops;
     bool transposeB;
     MatmulMT(bool constB = false,
              bool transposeB = false,
-             amx_bf16::Matmul::WeightPrecision precision=amx_bf16::Matmul::Weight_BF16) : transposeB(transposeB), rt_precision(precision) {
+             Matmul::WeightPrecision precision=Matmul::Weight_BF16) : transposeB(transposeB), rt_precision(precision) {
         for(int i = 0; i < thp.num_threads; i++)
-            ops.push_back(std::make_shared<amx_bf16::Matmul>(constB, transposeB));
+            ops.push_back(std::make_shared<Matmul>(constB, transposeB));
     }
 
     template<typename P>
@@ -337,14 +385,14 @@ struct MatmulMT {
 int OMP_NT = omp_thread_count();
 
 struct MatmulMTOMP {
-    amx_bf16::Matmul::WeightPrecision rt_precision;
-    std::vector<std::shared_ptr<amx_bf16::Matmul>> ops;
+    Matmul::WeightPrecision rt_precision;
+    std::vector<std::shared_ptr<Matmul>> ops;
     bool transposeB;
     MatmulMTOMP(bool constB = false,
                 bool transposeB = false,
-                amx_bf16::Matmul::WeightPrecision precision=amx_bf16::Matmul::Weight_BF16) : transposeB(transposeB), rt_precision(precision) {
+                Matmul::WeightPrecision precision=Matmul::Weight_BF16) : transposeB(transposeB), rt_precision(precision) {
         for(int i = 0; i < OMP_NT; i++)
-            ops.push_back(std::make_shared<amx_bf16::Matmul>(constB, transposeB, rt_precision));
+            ops.push_back(std::make_shared<Matmul>(constB, transposeB, rt_precision));
     }
 
     template<typename P>
@@ -381,7 +429,7 @@ void amx_MatmulMT_perf(int M, int K, int N, bool transB, int times = -1000) {
     tensor2D<bfloat16> BT = B.Tr();
     tensor2D<bfloat16> C(M, N);
     tensor2D<bfloat16> C0(M, N);
-    amx_bf16::Matmul mm(true, transB, precision);
+    Matmul mm(true, transB, precision);
     MatmulMTOMP      mmMT(true, transB, precision);
     //amx_bf16::PP::Store2bf16 pp0(C0);
     //amx_bf16::PP::Store2bf16 pp(C);
@@ -423,7 +471,7 @@ void amx_MatmulMT_BiasGelu_acc(int M, int K, int N, bool transB) {
     tensor2D<bfloat16> C(M, N);
     tensor2D<bfloat16> C0(M, N);
     tensor2D<float> Bias(1, N);
-    amx_bf16::Matmul mm(true, transB);
+    Matmul mm(true, transB);
     amx_bf16::PP::Addbias_Gelu_Store2bf16 pp0(C, &Bias(0,0));
 
     std::cout << __func__ << " [" << M << "," << K << "," << N << "] ";
@@ -451,7 +499,7 @@ void amx_MatmulMT_BiasGelu_perf(int M, int K, int N, bool transB, int times = -1
     tensor2D<bfloat16> C(M, N);
     tensor2D<bfloat16> C0(M, N);
     tensor2D<float> Bias(1, N);
-    amx_bf16::Matmul mm(true, transB);
+    Matmul mm(true, transB);
     MatmulMTOMP      mmMT(true, transB);
     amx_bf16::PP::Addbias_Gelu_Store2bf16 pp0(C0, &Bias(0,0));
     amx_bf16::PP::Addbias_Gelu_Store2bf16 pp(C, &Bias(0,0));
@@ -576,7 +624,7 @@ void amx_FC_MTML_perf(int M, int K, int N, int repeates, int times = -1000) {
         FC2.emplace_back(true, false, precision);
     }
 
-    double elesize = (precision == amx_bf16::Matmul::Weight_BF16)? sizeof(bfloat16) : sizeof(int8_t);
+    double elesize = (precision == Matmul::Weight_BF16)? sizeof(bfloat16) : sizeof(int8_t);
 
     timer.tag(__func__, M, K, N, precision, repeates)(times, [&](){
         for(int i = 0; i<repeates; i++) {
@@ -605,9 +653,9 @@ int test_acc() {
         amx_FC_acc(32*22 + 31, 10*32 + 17, 256 + 15);
         amx_FC_acc(2, 10*32, 256);
     };
-    precision = amx_bf16::Matmul::Weight_BF16;
+    precision = Matmul::Weight_BF16;
     do_test_acc();
-    precision = amx_bf16::Matmul::Weight_INT8;
+    precision = Matmul::Weight_INT8;
     do_test_acc();
     return 0;
 }
@@ -630,9 +678,9 @@ void test_perf() {
         amx_FC_perf(896, 256, 1024, 10000);
         amx_FC_perf(896, 256, 1024, 10000);
     };
-    precision = amx_bf16::Matmul::Weight_BF16;
+    precision = Matmul::Weight_BF16;
     do_test_perf();
-    precision = amx_bf16::Matmul::Weight_INT8;
+    precision = Matmul::Weight_INT8;
     do_test_perf();
 }
 
@@ -653,7 +701,7 @@ void test_parallel_FC(int L, int M, int K, int N, int times = -5000) {
         tensor2D<bfloat16> C;
         tensor2D<float> Bias;
         int _N;
-        std::shared_ptr<amx_bf16::Matmul> mm;
+        std::shared_ptr<Matmul> mm;
         void create(tensor2D<bfloat16> & Atemplate,
                     tensor2D<bfloat16> & Btemplate,
                     tensor2D<bfloat16> & Ctemplate,
@@ -663,7 +711,7 @@ void test_parallel_FC(int L, int M, int K, int N, int times = -5000) {
             C = Ctemplate.clone();
             Bias = BiasTemplate.clone();
             _N = B.dims[1];
-            mm.reset(new amx_bf16::Matmul(true, false, precision));
+            mm.reset(new Matmul(true, false, precision));
         }
         void run() {
             // post-ops do nothing
@@ -700,7 +748,7 @@ void test_parallel_FC(int L, int M, int K, int N, int times = -5000) {
         mms[i].create(L, A0, B0, C0, Bias0);
     }
 
-    double elesize = (precision == amx_bf16::Matmul::Weight_BF16)? sizeof(bfloat16) : sizeof(int8_t);
+    double elesize = (precision == Matmul::Weight_BF16)? sizeof(bfloat16) : sizeof(int8_t);
     timer.tag(__func__, L, M, K, N, precision)(times, [&](){
         #pragma omp parallel
         {
@@ -714,7 +762,7 @@ void test_parallel_FC(int L, int M, int K, int N, int times = -5000) {
 }
 
 void test_parallel_FC() {
-    precision = amx_bf16::Matmul::Weight_BF16;
+    precision = Matmul::Weight_BF16;
     // K*N is same, but K is bigger, bandwidth usage is high & more stable
     while(1) {
         std::cout << "=========================\n";
@@ -737,7 +785,6 @@ void test_parallel_FC() {
 int main(int argc, const char *argv[]) {
     timer.set_app(argv[0]);
     //thp.Start();
-
     //test_all_bw(3.0); return 0;
     //test_parallel_FC();
 
@@ -745,26 +792,26 @@ int main(int argc, const char *argv[]) {
     std::cout << ANSIcolor("31") << "omp_get_num_threads() = " << omp_get_num_threads() << std::endl << ANSIcolor();
     std::cout << ANSIcolor("31") << "OMP_NT = " << OMP_NT << std::endl << ANSIcolor();
 
-    test_acc();    test_perf();    return 0;
+    //test_acc();    test_perf();    return 0;
 
-    precision = amx_bf16::Matmul::Weight_BF16;
+    precision = Matmul::Weight_BF16;
     amx_FC_acc(2, 10*32 + 17, 256 + 15);
-    precision = amx_bf16::Matmul::Weight_INT8;
+    precision = Matmul::Weight_INT8;
     amx_FC_acc(2, 10*32 + 17, 256 + 15);
 
-    precision = amx_bf16::Matmul::Weight_BF16;
+    precision = Matmul::Weight_BF16;
     amx_MatmulMT_perf(2, 2560, 10752, false, -1000);
     amx_MatmulMT_perf(2, 2560, 10752, false, -1000);
     //amx_MatmulMT_perf(2, 2560, 10752, false, -1000);
-    precision = amx_bf16::Matmul::Weight_INT8;
+    precision = Matmul::Weight_INT8;
     amx_MatmulMT_perf(2, 2560, 10752, false, -1000);
     amx_MatmulMT_perf(2, 2560, 10752, false, -1000);
 
     for(int i=0;i<10;i++) {
-        precision = amx_bf16::Matmul::Weight_BF16;
+        precision = Matmul::Weight_BF16;
         amx_FC_MTML_perf(2, 2560, 10752, 20, -10000);
         amx_FC_MTML_perf(2, 2560, 10752, 20, -10000);
-        precision = amx_bf16::Matmul::Weight_INT8;
+        precision = Matmul::Weight_INT8;
         amx_FC_MTML_perf(2, 2560, 10752, 20, -10000);
         amx_FC_MTML_perf(2, 2560, 10752, 20, -10000);
     }
