@@ -1,4 +1,6 @@
+if ! which icx > /dev/null; then
 source ~/intel/oneapi/setvars.sh
+fi
 
 source=$1
 
