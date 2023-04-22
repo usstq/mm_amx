@@ -956,6 +956,64 @@ void loop2D_opt_Mtail(int M, int N, int mc, F f) {
     }
 }
 
+// L = 1 ... 4
+// Bi : input matrix of shape KxN (transpose=false) or NxK (transpose=true)
+// transpose : transpose before repack
+//
+// Bo is layout as axb where a=(N_padded/32) b=(K_padded*32)
+//
+template<class T>
+tensor2D<T> repackB_1x2(const tensor2D<T> &Bi, bool transpose) {
+    tensor2D<T> Bo;
+    int K = Bi.dims[transpose?1:0];
+    int N = Bi.dims[transpose?0:1];
+
+    // K_padded : round up to multiple of 32/64
+    int kStep = 64 / sizeof(T);
+    int K_padded = (K + kStep - 1)/kStep * kStep;
+    
+    // N_padded : round up to multiple of (2*16)
+    int N_unit = 2*16;
+    int N_padded = (N + N_unit - 1)/N_unit * N_unit;
+
+    // Bo(ni, 0) is a vector flattened from a slice of shape [K_padded x N_unit]
+    Bo.resize(N_padded/N_unit, K_padded * N_unit);
+
+    if (transpose) {
+        for(int n = 0; n < N; n += N_unit) {
+            // a K_padded x N_unit submatrix layouted in B0/B1... and put sequentially
+            auto * dst = reinterpret_cast<int8_t *>(&Bo(n/N_unit, 0));
+            auto * src0 = reinterpret_cast<const int8_t *>(&Bi(n, 0));
+            int k;
+            for(k = 0; (k + kStep) <= K; k += kStep) {
+                // B0 (16x32) => transpose+repack as 32x16(16x16x2) or 64x16(16x16x4)
+                functional::transpose_epi32_16x16(dst, src0 + 0*16*Bi.stride + k*sizeof(T), Bi.stride);
+                dst += 1024;
+                functional::transpose_epi32_16x16(dst, src0 + 1*16*Bi.stride + k*sizeof(T), Bi.stride);
+                dst += 1024;
+            }
+            if (k < K) {
+                functional::transpose_epi32_16xN(dst, src0 + 0*16*Bi.stride + k*sizeof(T), Bi.stride, K-k);
+                dst += 1024;
+                functional::transpose_epi32_16xN(dst, src0 + 1*16*Bi.stride + k*sizeof(T), Bi.stride, K-k);
+                dst += 1024;
+            }
+        }
+    } else {
+        // pack & layout sequentially
+        for(int n = 0; n < N; n += N_unit) {
+            auto * dst = reinterpret_cast<int8_t *>(&Bo(n/N_unit, 0));
+            for(int k = 0; k < K; k+=kStep) {
+                // B0 B1 32x(16+16) => repack as two 16x16x2
+                int src_rows = std::min(K - k, 32);
+                functional::kpack_tile_B0B1(dst, dst + (1024), &Bi(k, n), Bi.stride, src_rows);
+                dst += 2048;
+            }
+        }
+    }
+    return Bo;
+}
+
 template<class T = void>
 struct acc_type {};
 template<>
@@ -970,7 +1028,8 @@ struct Matmul {
     // B matrix is orgnized as tensor2D of shape axb where a=round_up_div(N, 32), b=round_up(K,32/64)*32
     // so b is size of submatrix of Kx32 composed of two columns of B0/B1 tiles.
     //tensor2D<TB> internalB;
-    KpackedB<TB> internalB;
+    //KpackedB<TB> internalB;
+    tensor2D<TB> internalB;
 
     bool constB;
     bool transposeB;
@@ -1094,7 +1153,8 @@ struct Matmul {
         // for non-constB, internalB is updated every time
         // for constB, internalB is updated once
         if (!constB || (internalB.capacity == 0)) {
-            functional::prepareB(internalB, matB, transposeB);
+            internalB = repackB_1x2(matB, transposeB);
+            //functional::prepareB(internalB, matB, transposeB);
         }
 
         // Due to the fact that we load a full tile at tails of K dimension
@@ -1120,7 +1180,7 @@ struct Matmul {
             // C:0
             // A:1
             // B:2,3,4,5,6,7
-            auto * pB0 = reinterpret_cast<int8_t*>(internalB.data.get());
+            auto * pB0 = reinterpret_cast<int8_t*>(&internalB[0]);
             tileconfig_t tfg(1, 0, 8, 16, 64);
             switch((K + kStep - 1)/kStep) {
                 case 1: kernel_slimB<1>(M, N, matA, pB0, buffC, ppkernel); break;
@@ -1141,7 +1201,7 @@ struct Matmul {
             // A_MxK: 2,
             // B_KxN: 3, 4
             tileconfig_t tfg(1, 0, {M,M,M,16,16}, 64);
-            auto * pB0 = reinterpret_cast<int8_t*>(internalB.data.get());
+            auto * pB0 = reinterpret_cast<int8_t*>(&internalB[0]);
             auto * const pC0 = &buffC[0];
             int k;
             const auto strideA = matA.stride;
@@ -1170,7 +1230,7 @@ struct Matmul {
             auto * pA0 = reinterpret_cast<int8_t*>(&matA(m, 0));
             auto * pA1 = reinterpret_cast<int8_t*>(&matA(m + 16, 0));
             auto strideA = matA.stride;
-            auto * pB = reinterpret_cast<int8_t*>(&internalB(0, n));
+            auto * pB = reinterpret_cast<int8_t*>(&internalB(n>>5, 0));
             zero_tiles<0, 1, 2, 3>();
             // 2x2
             for (int k = 0; k < K; k += kStep) {

@@ -220,22 +220,34 @@ int amx_unit_test_perf() {
 void amx_FC_acc(int M, int K, int N) {
     tensor2D<bfloat16> A(M, K);
     tensor2D<bfloat16> B(K, N);
+    tensor2D<bfloat16> BT = B.Tr();
     tensor2D<bfloat16> C(M, N);
     tensor2D<bfloat16> C0(M, N);
     Matmul fc(true, false, precision);
+    Matmul fcTr(true, true, precision);
     amx_bf16::PP::Store2bf16 pp(C);
+    std::stringstream ss;
     fc(A, B, pp);
-
     C0=0;
     matmul(A, B, C0);
     std::cout << __func__ << " [" << M << "," << K << "," << N << "," << precision << "] ";
     if (C0 == C) {
-        std::cout << ANSIcolor("1;32") << "Match!\n" << ANSIcolor();
+        ss << ANSIcolor("1;32") << "no_trans: Match!     " << ANSIcolor();
     } else {
-        std::cout << ANSIcolor("1;31") << "Mismatch!\n" << ANSIcolor();
-        std::cout << C0 << std::endl;
-        std::cout << C << std::endl;
+        ss << ANSIcolor("1;31") << "no_trans: Mismatch!  " << ANSIcolor();
+        //std::cout << C0 << std::endl;
+        //std::cout << C << std::endl;
     }
+    C = 0;
+    fcTr(A, BT, pp);
+    if (C0 == C) {
+        ss << ANSIcolor("1;32") << "trans:  Match!" << ANSIcolor();
+    } else {
+        ss << ANSIcolor("1;31") << "trans:  Mismatch!" << ANSIcolor();
+        //std::cout << C0 << std::endl;
+        //std::cout << C << std::endl;
+    }
+    std::cout << ss.str() << std::endl;
 }
 
 void amx_FC_perf(int M, int K, int N, int times = -1000) {
@@ -792,7 +804,7 @@ int main(int argc, const char *argv[]) {
     std::cout << ANSIcolor("31") << "omp_get_num_threads() = " << omp_get_num_threads() << std::endl << ANSIcolor();
     std::cout << ANSIcolor("31") << "OMP_NT = " << OMP_NT << std::endl << ANSIcolor();
 
-    //test_acc();    test_perf();    return 0;
+    test_acc();    test_perf();    return 0;
 
     precision = Matmul::Weight_BF16;
     amx_FC_acc(2, 10*32 + 17, 256 + 15);
