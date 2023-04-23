@@ -562,20 +562,69 @@ namespace functional {
         return poly;
     }
 
-    inline void kpack_tile_B0B1(void * _dst0, void * _dst1, const void * _src, int stride, int src_rows) {
-        // in 64unit
-        //
-        //  [a1 a2 a3 a4 | a5 a6 a7 a8]
-        //  [b1 b2 b3 b4 | b5 b6 b7 b8]
-        // _mm512_permutexvar_epi64
-        //  [a1 a5 a2 a6 a3 a7 a4 a8]
-        //  [b1 b5 b2 b6 b3 b7 b4 b8]
-        // _mm512_unpacklo_epi16 works in 128 lanes, & means interleave
-        //  [a1&b1 a2&b2 a3&b3 a4&b4]
-        // _mm512_unpackhi_epi16 
-        //  [a5&b5 a6&b6 a7&b7 a8&b8]
-        //
-        //
+
+    //
+    void kpack_tile_B0B1(void * _dst0, void * _dst1, const int8_t * _src, int stride, int src_rows) {
+        #define FROM_B(i) ((1<<4)|(i))
+        static const uint32_t idx[16] = { 0,4,FROM_B(0),FROM_B(4),
+                                          1,5,FROM_B(1),FROM_B(5),
+                                          2,6,FROM_B(2),FROM_B(6),
+                                          3,7,FROM_B(3),FROM_B(7)};
+        auto midx = _mm512_loadu_epi64(idx);
+        __mmask16 mask = _cvtu32_mask16(0xFFFFu);
+        const auto * src = reinterpret_cast<const int8_t *>(_src);
+        auto * dst0 = reinterpret_cast<int8_t *>(_dst0);
+        auto * dst1 = reinterpret_cast<int8_t *>(_dst1);        
+        if (src_rows == 64) {
+            for (int row = 0; row < 16; row++) {
+                                                                   // each element (a? or b?) is 32-bits, two lanes in each ymm register
+                auto a256 = _mm256_loadu_epi8(src); src += stride; // [a0 a1 a2 a3 | a4 a5 a6 a7]  256-bits ymm0 B0: a0-a3 B1: a4:a7
+                auto b256 = _mm256_loadu_epi8(src); src += stride; // [b0 b1 b2 b3 | b4 b5 b6 b7]  256-bits ymm1 B0: b0-b3 B1: b4:b7
+                auto c256 = _mm256_loadu_epi8(src); src += stride; // [c0 c1 c2 c3 | c4 c5 c6 c7]  256-bits ymm2 B0: c0-c3 B1: c4:c7
+                auto d256 = _mm256_loadu_epi8(src); src += stride; // [d0 d1 d2 d3 | d4 d5 d6 d7]  256-bits ymm3 B0: d0-d3 B1: d4:d7
+                auto a = _mm512_castsi256_si512(a256);
+                auto b = _mm512_castsi256_si512(b256);
+                auto c = _mm512_castsi256_si512(c256);
+                auto d = _mm512_castsi256_si512(d256);                       
+                auto ac = _mm512_mask_permutex2var_epi32(a, mask, midx, c); // [a0 a4 c0 c4 | a1 a5 c1 c5 | a2 a6 c2 c6 | a3 a7 c3 c7]
+                auto bd = _mm512_mask_permutex2var_epi32(b, mask, midx, d); // [b0 b4 d0 d4 | b1 b5 d1 d5 | b2 b6 d2 d6 | b3 b7 d3 d7] 
+                auto aib = _mm512_unpacklo_epi8(ac, bd);                    // [a0&b0 a4&b4 | a1&b1 a5&b5 | a2&b2 a6&b6 | a3&b3 a7&b7]
+                auto cid = _mm512_unpackhi_epi8(ac, bd);                    // [c0&d0 c4&d4 | c1&d1 c5&d5 | c2&d2 c6&d6 | c3&d3 c7&d7]
+                auto rowB0 = _mm512_unpacklo_epi16(aib, cid);               // [a0&b0&c0&d0 | a1&b1&c1&d1 | a2&b2&c2&d2 | a3&b3&c3&d3] 512-bit (64bytes) line in B0
+                auto rowB1 = _mm512_unpackhi_epi16(aib, cid);               // [a4&b4&c4&d4 | a5&b5&c5&d5 | a6&b6&c6&d6 | a7&b7&c7&d7] 512-bit (64bytes) line in B1
+                _mm512_storeu_epi16(dst0, rowB0);
+                _mm512_storeu_epi16(dst1, rowB1);
+                dst0 += 64;
+                dst1 += 64;
+            }
+        } else {
+            // less than 64 source lines, 
+            int r = 0;
+            __mmask32 kmask = _cvtu32_mask32(0xFFFFFFFF);
+            for (int row = 0; row < 16; row++) {
+                auto a256 = _mm256_maskz_loadu_epi8 (kmask, src); src += stride; if (++r >= src_rows) kmask = _cvtu32_mask32(0);
+                auto b256 = _mm256_maskz_loadu_epi8 (kmask, src); src += stride; if (++r >= src_rows) kmask = _cvtu32_mask32(0);
+                auto c256 = _mm256_maskz_loadu_epi8 (kmask, src); src += stride; if (++r >= src_rows) kmask = _cvtu32_mask32(0);
+                auto d256 = _mm256_maskz_loadu_epi8 (kmask, src); src += stride; if (++r >= src_rows) kmask = _cvtu32_mask32(0);
+                auto a = _mm512_castsi256_si512(a256);
+                auto b = _mm512_castsi256_si512(b256);
+                auto c = _mm512_castsi256_si512(c256);
+                auto d = _mm512_castsi256_si512(d256);
+                auto ac = _mm512_mask_permutex2var_epi32(a, mask, midx, c); // [a0 a4 c0 c4 | a1 a5 c1 c5 | a2 a6 c2 c6 | a3 a7 c3 c7]
+                auto bd = _mm512_mask_permutex2var_epi32(b, mask, midx, d); // [b0 b4 d0 d4 | b1 b5 d1 d5 | b2 b6 d2 d6 | b3 b7 d3 d7] 
+                auto aib = _mm512_unpacklo_epi8(ac, bd);                    // [a0&b0 a4&b4 | a1&b1 a5&b5 | a2&b2 a6&b6 | a3&b3 a7&b7]
+                auto cid = _mm512_unpackhi_epi8(ac, bd);                    // [c0&d0 c4&d4 | c1&d1 c5&d5 | c2&d2 c6&d6 | c3&d3 c7&d7]
+                auto rowB0 = _mm512_unpacklo_epi16(aib, cid);               // [a0&b0&c0&d0 | a1&b1&c1&d1 | a2&b2&c2&d2 | a3&b3&c3&d3] 512-bit (64bytes) line in B0
+                auto rowB1 = _mm512_unpackhi_epi16(aib, cid);               // [a4&b4&c4&d4 | a5&b5&c5&d5 | a6&b6&c6&d6 | a7&b7&c7&d7] 512-bit (64bytes) line in B1
+                _mm512_storeu_epi16(dst0, rowB0);
+                _mm512_storeu_epi16(dst1, rowB1);
+                dst0 += 64;
+                dst1 += 64;
+            }
+        }
+    }
+
+    void kpack_tile_B0B1(void * _dst0, void * _dst1, const bfloat16 * _src, int stride, int src_rows) {
         static const uint64_t idx[8] = {0,4,1,5,2,6,3,7};
         auto midx = _mm512_loadu_epi64(idx);
         const auto * src = reinterpret_cast<const int8_t *>(_src);
@@ -584,12 +633,12 @@ namespace functional {
         __m512i a,b,rowB0, rowB1;
         if (src_rows == 32) {
             for (int row = 0; row < 16; row++) {
-                a = _mm512_loadu_epi16(src);
-                b = _mm512_loadu_epi16(src + stride);
-                a = _mm512_permutexvar_epi64(midx, a);
-                b = _mm512_permutexvar_epi64(midx, b);
-                rowB0 = _mm512_unpacklo_epi16(a, b);
-                rowB1 = _mm512_unpackhi_epi16(a, b);
+                a = _mm512_loadu_epi16(src);            // [a1  a2  a3 a4 | a5  a6  a7 a8]   total 512-bits in 8 64bits unit
+                b = _mm512_loadu_epi16(src + stride);   // [b1  b2  b3 b4 | b5  b6  b7 b8]   total 512-bits
+                a = _mm512_permutexvar_epi64(midx, a);  // [a1 a5 | a2 a6 | a3 a7 | a4 a8]
+                b = _mm512_permutexvar_epi64(midx, b);  // [b1 b5 | b2 b6 | b3 b7 | b4 b8]
+                rowB0 = _mm512_unpacklo_epi16(a, b);    // [ a1&b1  a2&b2   a3&b3   a4&b4] for each 128-bits lane, interleave word in low 64 bits
+                rowB1 = _mm512_unpackhi_epi16(a, b);    // [ a5&b5  a6&b6   a7&b7   a8&b8] for each 128-bits lane, interleave word in high 64 bits
                 _mm512_storeu_epi16(dst0, rowB0);
                 _mm512_storeu_epi16(dst1, rowB1);
                 src += 2*stride;
@@ -598,6 +647,7 @@ namespace functional {
             }
         } else {
             int row = 0;
+            // all non-zero rows
             for (; row < (src_rows/2); row++) {
                 a = _mm512_loadu_epi16(src);
                 b = _mm512_loadu_epi16(src + stride);
@@ -627,6 +677,7 @@ namespace functional {
                 dst1 += 64;
                 row ++;
             }
+            // all zeros
             rowB0 = _mm512_setzero_si512();
             rowB1 = _mm512_setzero_si512();
             for(; row < 16; row++) {
@@ -756,12 +807,20 @@ namespace PP {
         }
     };
 
+    template<class T>
+    struct is_f32i32 : std::false_type {};
+    template<>
+    struct is_f32i32<float> : std::true_type {};
+    template<>
+    struct is_f32i32<int32_t> : std::true_type {};
+
     struct Store2bf16 : Dequantizable<true> {
         tensor2D<bfloat16> & C;
 
         Store2bf16(tensor2D<bfloat16> & C) : C(C) {}
 
-        FORCE_INLINE void operator()(tensor2D<float> & buffC, int m, int n, int valid_m, int valid_n) {
+        template<typename T, std::enable_if_t<is_f32i32<T>::value, bool> = true>
+        FORCE_INLINE void operator()(tensor2D<T> & buffC, int m, int n, int valid_m, int valid_n) {
             // fast dynamic dispatch to polymorphic implementations
             if (do_deq)
                 exec<true>(buffC, m, n, valid_m, valid_n);
@@ -769,8 +828,8 @@ namespace PP {
                 exec<false>(buffC, m, n, valid_m, valid_n);
         }
 
-        template<bool deq>
-        FORCE_INLINE void exec(tensor2D<float> & buffC, int m, int n, int valid_m, int valid_n) {
+        template<bool deq, typename T, std::enable_if_t<is_f32i32<T>::value, bool> = true>
+        FORCE_INLINE void exec(tensor2D<T> & buffC, int m, int n, int valid_m, int valid_n) {
             auto * psrc = &buffC(0,0);
             int8_t * pdst = reinterpret_cast<int8_t*>(&(C(m, n)));
             int stride = C.stride;
@@ -779,6 +838,10 @@ namespace PP {
             for(int i = 0; i < valid_m; i ++) {
                 auto r0 = _mm512_loadu_ps(psrc);
                 auto r1 = _mm512_loadu_ps(psrc + 16);
+                if (std::is_same<T, int32_t>::value) {
+                    r0 = _mm512_cvtepi32_ps(_mm512_castps_si512(r0));
+                    r1 = _mm512_cvtepi32_ps(_mm512_castps_si512(r1));
+                }
                 if (deq) {
                     r0 = _mm512_mul_ps(r0, m512_deq_scale);   // dequantize
                     r1 = _mm512_mul_ps(r1, m512_deq_scale);   // dequantize
@@ -1004,8 +1067,9 @@ tensor2D<T> repackB_1x2(const tensor2D<T> &Bi, bool transpose) {
         for(int n = 0; n < N; n += N_unit) {
             auto * dst = reinterpret_cast<int8_t *>(&Bo(n/N_unit, 0));
             for(int k = 0; k < K; k+=kStep) {
-                // B0 B1 32x(16+16) => repack as two 16x16x2
-                int src_rows = std::min(K - k, 32);
+                // bf16: B0 B1 32x(16+16) => repack as two 16x16x2
+                // int8: B0 B1 64x(16+16) => repack as two 16x16x4
+                int src_rows = std::min(K - k, kStep);
                 functional::kpack_tile_B0B1(dst, dst + (1024), &Bi(k, n), Bi.stride, src_rows);
                 dst += 2048;
             }
@@ -1154,7 +1218,6 @@ struct Matmul {
         // for constB, internalB is updated once
         if (!constB || (internalB.capacity == 0)) {
             internalB = repackB_1x2(matB, transposeB);
-            //functional::prepareB(internalB, matB, transposeB);
         }
 
         // Due to the fact that we load a full tile at tails of K dimension
@@ -1175,6 +1238,7 @@ struct Matmul {
 
         // special case when whole B matrix can fit in 6 tiles
         // we can load B only once
+        /*
         if (M >= 16 && N <= 16 && K <= 6*kStep) {
             // B is zero-padded
             // C:0
@@ -1194,6 +1258,7 @@ struct Matmul {
             }
             return;
         }
+        */
 
         if (M <= 16) {
             // register/cache blocking scheme is simplified when M <= 16

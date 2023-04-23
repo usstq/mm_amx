@@ -279,10 +279,9 @@ struct tensor2D {
 
 using func_act = std::function<float(float)>;
 
-template<typename T>
-void matmul(tensor2D<T> & A,
-            tensor2D<T> & B,
-            tensor2D<T> & C,
+void matmul(tensor2D<ov::bfloat16> & A,
+            tensor2D<ov::bfloat16> & B,
+            tensor2D<ov::bfloat16> & C,
             float * bias = nullptr,
             func_act act = func_act()) {
     int M = C.dims[0];
@@ -304,6 +303,60 @@ void matmul(tensor2D<T> & A,
                 sum += (psum0 + psum1);
             }
             for(; k < K; k++) {
+                sum += static_cast<float>(A(m,k)) * static_cast<float>(B(k,n));
+            }
+            if (bias) {
+                sum += bias[n];
+            }
+            if (act) {
+                sum = act(sum);
+            }
+            C(m,n) = sum;
+        }
+    }
+}
+
+void matmul(tensor2D<float> & A,
+            tensor2D<float> & B,
+            tensor2D<float> & C,
+            float * bias = nullptr,
+            func_act act = func_act()) {
+    int M = C.dims[0];
+    int N = C.dims[1];
+    int K = A.dims[1];
+    assert(B.dims[0] == K);
+    assert(B.dims[1] == N);
+    for(int m = 0; m < M; m++) {
+        for(int n = 0; n < N; n++) {
+            float sum = C(m,n);
+            for(int k = 0; k < K; k++) {
+                sum += static_cast<float>(A(m,k)) * static_cast<float>(B(k,n));
+            }
+            if (bias) {
+                sum += bias[n];
+            }
+            if (act) {
+                sum = act(sum);
+            }
+            C(m,n) = sum;
+        }
+    }
+}
+
+void matmul(tensor2D<int8_t> & A,
+            tensor2D<int8_t> & B,
+            tensor2D<float> & C,
+            float * bias = nullptr,
+            func_act act = func_act()) {
+    int M = C.dims[0];
+    int N = C.dims[1];
+    int K = A.dims[1];
+    assert(B.dims[0] == K);
+    assert(B.dims[1] == N);
+    for(int m = 0; m < M; m++) {
+        for(int n = 0; n < N; n++) {
+            float sum = C(m,n);
+            for(int k = 0; k < K; k++) {
                 sum += static_cast<float>(A(m,k)) * static_cast<float>(B(k,n));
             }
             if (bias) {

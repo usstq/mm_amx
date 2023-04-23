@@ -34,20 +34,23 @@ struct Matmul {
     };
     amx_bf16::Matmul<bfloat16, bfloat16> mbf16bf16;
     amx_bf16::Matmul<bfloat16, int8_t> mbf16s8;
+    amx_bf16::Matmul<int8_t, int8_t> ms8s8;
     tensor2D<int8_t> compressedB;
     WeightPrecision wei_prec;
     bool transposeB;
 
     Matmul(bool constB = false, bool transposeB = false, WeightPrecision wei_prec = Weight_BF16) :
-        mbf16bf16(constB, transposeB), mbf16s8(constB, transposeB), transposeB(transposeB), wei_prec(wei_prec) {
+        mbf16bf16(constB, transposeB), mbf16s8(constB, transposeB), ms8s8(constB, transposeB), transposeB(transposeB), wei_prec(wei_prec) {
     }
-    template<typename PP>
-    void operator()(tensor2D<bfloat16> & A,
-                    tensor2D<bfloat16> & B,
+    template<typename T, typename PP, std::enable_if_t<std::is_same<T, bfloat16>::value || std::is_same<T, int8_t>::value, bool> = true>
+    void operator()(tensor2D<T> & A,
+                    tensor2D<T> & B,
                     PP ppkernel) {
         int N = B.dims[transposeB?0:1];
-        (*this)(A, B, 0, N, ppkernel);    
+        (*this)(A, B, 0, N, ppkernel);
     }
+
+    // bfloat16 overload
     template<typename PP>
     void operator()(tensor2D<bfloat16> & A,
                     tensor2D<bfloat16> & B,
@@ -60,6 +63,15 @@ struct Matmul {
             // mbf16s8
             mbf16s8(A, B, n0, n1, ppkernel);
         }
+    }
+
+    // int8_t overload
+    template<typename PP>
+    void operator()(tensor2D<int8_t> & A,
+                    tensor2D<int8_t> & B,
+                    int n0, int n1,
+                    PP ppkernel) {
+        ms8s8(A, B, n0, n1, ppkernel);
     }
 };
 
@@ -655,6 +667,7 @@ void amx_FC_MTML_perf(int M, int K, int N, int repeates, int times = -1000) {
 
 int test_acc() {
     auto do_test_acc = [&](){
+        amx_FC_acc(128, 96, 16);
         amx_FC_acc(2, 2560, 10752);
         amx_FC_acc(22, 2560, 10752);
         amx_FC_acc(32*22, 10*32, 256);
