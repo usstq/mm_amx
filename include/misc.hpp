@@ -222,6 +222,31 @@ struct tileconfig_t {
 } __attribute__ ((__packed__));
 
 
+// default implementation
+template <typename T>
+struct TypeName {
+    static const char* get(){return typeid(T).name();}
+};
+
+// a specialization for each type of those you want to support
+// and don't like the string returned by typeid
+template <>
+struct TypeName<int32_t>{
+    static const char* get(){return "int32_t";}
+};
+template <>
+struct TypeName<float>{
+    static const char* get(){return "foat";}
+};
+template <>
+struct TypeName<ov::bfloat16>{
+    static const char* get(){return "bfloat16";}
+};
+template <>
+struct TypeName<int8_t>{
+    static const char* get(){return "int8_t";}
+};
+
 #ifdef ENABLE_NUMA
 static auto USE_NUMA = readenv("USE_NUMA");
 #endif

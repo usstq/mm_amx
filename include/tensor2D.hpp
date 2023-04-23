@@ -345,7 +345,7 @@ void matmul(tensor2D<float> & A,
 
 void matmul(tensor2D<int8_t> & A,
             tensor2D<int8_t> & B,
-            tensor2D<float> & C,
+            tensor2D<ov::bfloat16> & C,
             float * bias = nullptr,
             func_act act = func_act()) {
     int M = C.dims[0];

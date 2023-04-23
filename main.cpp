@@ -75,10 +75,9 @@ struct Matmul {
     }
 };
 
-
 std::ostream & operator<<(std::ostream & os, Matmul::WeightPrecision & prec) {
     static const char* names_prec[] = {
-    "org",
+    "bf16",
     "int8",
     "int4"
     };
@@ -229,10 +228,11 @@ int amx_unit_test_perf() {
     return 0;
 }
 
+template<typename T>
 void amx_FC_acc(int M, int K, int N) {
-    tensor2D<bfloat16> A(M, K);
-    tensor2D<bfloat16> B(K, N);
-    tensor2D<bfloat16> BT = B.Tr();
+    tensor2D<T> A(M, K);
+    tensor2D<T> B(K, N);
+    tensor2D<T> BT = B.Tr();
     tensor2D<bfloat16> C(M, N);
     tensor2D<bfloat16> C0(M, N);
     Matmul fc(true, false, precision);
@@ -242,7 +242,7 @@ void amx_FC_acc(int M, int K, int N) {
     fc(A, B, pp);
     C0=0;
     matmul(A, B, C0);
-    std::cout << __func__ << " [" << M << "," << K << "," << N << "," << precision << "] ";
+    std::cout << __func__ << " [" << M << "," << K << "," << N << "," << TypeName<T>::get() << "(" << precision << ")] ";
     if (C0 == C) {
         ss << ANSIcolor("1;32") << "no_trans: Match!     " << ANSIcolor();
     } else {
@@ -262,13 +262,14 @@ void amx_FC_acc(int M, int K, int N) {
     std::cout << ss.str() << std::endl;
 }
 
+template<typename T>
 void amx_FC_perf(int M, int K, int N, int times = -1000) {
-    tensor2D<bfloat16> A(M, K);
-    tensor2D<bfloat16> B(K, N);
+    tensor2D<T> A(M, K);
+    tensor2D<T> B(K, N);
     tensor2D<bfloat16> C(M, N);
     Matmul mm(true, false, precision);
     amx_bf16::PP::Store2bf16 pp(C);
-    timer.tag(__func__, M, K, N, precision)(times, [&](){
+    timer.tag(__func__, M, K, N, TypeName<T>::get(), precision)(times, [&](){
         mm(A, B, pp);
     },
     double(M * N) * K * 2,
@@ -665,48 +666,58 @@ void amx_FC_MTML_perf(int M, int K, int N, int repeates, int times = -1000) {
     "Byte/s");
 }
 
+
+template<typename T>
+void test_FC_acc() {
+    amx_FC_acc<T>(128, 96, 16);
+    amx_FC_acc<T>(2, 2560, 10752);
+    amx_FC_acc<T>(2, 10*32 + 17, 256 + 15);
+    amx_FC_acc<T>(22, 2560, 10752);
+    amx_FC_acc<T>(32*22, 10*32, 256);
+    amx_FC_acc<T>(32*22 + 1, 10*32, 256 + 1);
+    amx_FC_acc<T>(32*22 + 16, 10*32, 256 + 17);
+    amx_FC_acc<T>(32*22 + 31, 10*32, 256 + 15);
+    amx_FC_acc<T>(32*22 + 31, 10*32 + 1, 256 + 15);
+    amx_FC_acc<T>(32*22 + 31, 10*32 + 17, 256 + 15);
+    amx_FC_acc<T>(2, 10*32, 256);
+}
+
 int test_acc() {
-    auto do_test_acc = [&](){
-        amx_FC_acc(128, 96, 16);
-        amx_FC_acc(2, 2560, 10752);
-        amx_FC_acc(22, 2560, 10752);
-        amx_FC_acc(32*22, 10*32, 256);
-        amx_FC_acc(32*22 + 1, 10*32, 256 + 1);
-        amx_FC_acc(32*22 + 16, 10*32, 256 + 17);
-        amx_FC_acc(32*22 + 31, 10*32, 256 + 15);
-        amx_FC_acc(32*22 + 31, 10*32 + 1, 256 + 15);
-        amx_FC_acc(32*22 + 31, 10*32 + 17, 256 + 15);
-        amx_FC_acc(2, 10*32, 256);
-    };
+    test_FC_acc<int8_t>();
+
     precision = Matmul::Weight_BF16;
-    do_test_acc();
+    test_FC_acc<bfloat16>();
     precision = Matmul::Weight_INT8;
-    do_test_acc();
+    test_FC_acc<bfloat16>();
     return 0;
 }
 
+template<typename T>
+void test_FC_perf() {
+    amx_FC_perf<T>(2, 2560, 10752);
+    amx_FC_perf<T>(22, 2560, 10752);
+    amx_FC_perf<T>(32*28, 32*80, 10240);
+    amx_FC_perf<T>(32*28 + 1, 32*80, 10240);
+    amx_FC_perf<T>(32*28 + 16, 32*80, 10240);
+    amx_FC_perf<T>(32*28 + 17, 32*80, 10240);
+    amx_FC_perf<T>(32*28 + 31, 32*80, 10240);
+    amx_FC_perf<T>(32*28, 32*80, 10240);
+    amx_FC_perf<T>(32*28 + 1, 32*80, 10240);
+    amx_FC_perf<T>(32*28, 32*80 + 1, 10240);
+    amx_FC_perf<T>(32*28, 32*80, 10240 + 1);
+    amx_FC_perf<T>(32*28 + 1, 32*80 + 1, 10240 + 1);
+    amx_FC_perf<T>(32*28 + 32, 32*80 + 32, 10240 + 32);
+    amx_FC_perf<T>(896, 256, 1024, 10000);
+    amx_FC_perf<T>(896, 256, 1024, 10000);
+}
+
 void test_perf() {
-    auto do_test_perf = [&](){
-        amx_FC_perf(2, 2560, 10752);
-        amx_FC_perf(22, 2560, 10752);
-        amx_FC_perf(32*28, 32*80, 10240);
-        amx_FC_perf(32*28 + 1, 32*80, 10240);
-        amx_FC_perf(32*28 + 16, 32*80, 10240);
-        amx_FC_perf(32*28 + 17, 32*80, 10240);
-        amx_FC_perf(32*28 + 31, 32*80, 10240);
-        amx_FC_perf(32*28, 32*80, 10240);
-        amx_FC_perf(32*28 + 1, 32*80, 10240);
-        amx_FC_perf(32*28, 32*80 + 1, 10240);
-        amx_FC_perf(32*28, 32*80, 10240 + 1);
-        amx_FC_perf(32*28 + 1, 32*80 + 1, 10240 + 1);
-        amx_FC_perf(32*28 + 32, 32*80 + 32, 10240 + 32);
-        amx_FC_perf(896, 256, 1024, 10000);
-        amx_FC_perf(896, 256, 1024, 10000);
-    };
     precision = Matmul::Weight_BF16;
-    do_test_perf();
+    test_FC_perf<int8_t>();
+    precision = Matmul::Weight_BF16;
+    test_FC_perf<bfloat16>();
     precision = Matmul::Weight_INT8;
-    do_test_perf();
+    test_FC_perf<bfloat16>();
 }
 
 /*
@@ -818,11 +829,6 @@ int main(int argc, const char *argv[]) {
     std::cout << ANSIcolor("31") << "OMP_NT = " << OMP_NT << std::endl << ANSIcolor();
 
     test_acc();    test_perf();    return 0;
-
-    precision = Matmul::Weight_BF16;
-    amx_FC_acc(2, 10*32 + 17, 256 + 15);
-    precision = Matmul::Weight_INT8;
-    amx_FC_acc(2, 10*32 + 17, 256 + 15);
 
     precision = Matmul::Weight_BF16;
     amx_MatmulMT_perf(2, 2560, 10752, false, -1000);
