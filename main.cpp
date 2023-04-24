@@ -685,6 +685,7 @@ void amx_FC_MTML_perf(int M, int K, int N, int repeates, int times = -1000) {
 
 template<typename T, amx::PP::Steps ppsteps>
 void test_FC_acc() {
+    amx_FC_acc<T, ppsteps>(32, 64, 5);
     amx_FC_acc<T, ppsteps>(128, 96, 16);
     amx_FC_acc<T, ppsteps>(2, 2560, 10752);
     amx_FC_acc<T, ppsteps>(2, 10*32 + 17, 256 + 15);

@@ -1017,22 +1017,22 @@ struct Matmul {
         int8_t * pA0 = reinterpret_cast<int8_t*>(&A[0]);
         int strideA = A.stride;
         // load B tiles outside of loop
-        if (tmmN > 0) _tile_loadd(2, pB0, 64); pB0 += 1024;
-        if (tmmN > 1) _tile_loadd(3, pB0, 64); pB0 += 1024;
-        if (tmmN > 2) _tile_loadd(4, pB0, 64); pB0 += 1024;
-        if (tmmN > 3) _tile_loadd(5, pB0, 64); pB0 += 1024;
-        if (tmmN > 4) _tile_loadd(6, pB0, 64); pB0 += 1024;
-        if (tmmN > 5) _tile_loadd(7, pB0, 64); pB0 += 1024;
+        if (tmmN > 0) _tile_loadd(2, pB0, 64); pB0 += 1024*2;
+        if (tmmN > 1) _tile_loadd(3, pB0, 64); pB0 += 1024*2;
+        if (tmmN > 2) _tile_loadd(4, pB0, 64); pB0 += 1024*2;
+        if (tmmN > 3) _tile_loadd(5, pB0, 64); pB0 += 1024*2;
+        if (tmmN > 4) _tile_loadd(6, pB0, 64); pB0 += 1024*2;
+        if (tmmN > 5) _tile_loadd(7, pB0, 64); pB0 += 1024*2;
         //asm("int3");
         for(int m0 = 0; m0 < M; m0+=16) {
             int m = m0;
-            pA0 += 16*A.stride;
             if (M - m0 < 16) {
                 // shift up to prevent M-tails
-                pA0 -= (M - m0)*A.stride;
+                pA0 -= (16 - (M - m0))*A.stride;
                 m = M - 16;
             }
             auto * pA = pA0;
+            zero_tiles<0>();
             if (tmmN > 0) {
                 _tile_loadd(1, pA, strideA); pA += 64;
                 TILE_DP(0, 1, 2);
@@ -1059,6 +1059,7 @@ struct Matmul {
             }
             _tile_stored(0, pC0, buffC.stride);
             (ppkernel)(buffC, m, 0, 16, N);
+            pA0 += 16*A.stride;
         }
     }
 
@@ -1097,7 +1098,6 @@ struct Matmul {
 
         // special case when whole B matrix can fit in 6 tiles
         // we can load B only once
-        /*
         if (M >= 16 && N <= 16 && K <= 6*kStep) {
             // B is zero-padded
             // C:0
@@ -1117,7 +1117,6 @@ struct Matmul {
             }
             return;
         }
-        */
 
         if (M <= 16) {
             // register/cache blocking scheme is simplified when M <= 16
