@@ -47,7 +47,7 @@ bool is_pointer_valid(void *p) {
 //#define FORCE_INLINE inline __attribute__((always_inline))
 //#define FORCE_INLINE 
 
-namespace amx {
+namespace amx_kernel {
 
 // KpackedB is B matrix in block of 32x32 arranged in column-major
 // each 32x32 block is composed of 2 horizontal neighboring tiles
@@ -717,7 +717,7 @@ namespace PP {
         }
 
         // source buffC can be i32 or f32
-        template<typename T, std::enable_if_t<is_f32i32<T>::value, bool> = true>
+        template<typename T, typename std::enable_if<is_f32i32<T>::value, bool>::type = true>
         void operator()(tensor2D<T> & buffC, int m, int n, int valid_m, int valid_n) {
             auto * psrc = &buffC(0,0);
             int8_t * pdst = reinterpret_cast<int8_t*>(&(C(m, n)));
@@ -1402,7 +1402,7 @@ struct Matmul<ov::bfloat16, int8_t, float> {
                 std::cout << "\t WANING: dynamic quantization of weight matrix for non-constB is time-consuming " << std::endl;
             }
             float min, max;
-            amx::functional::get_min_max(_matB, min, max);
+            functional::get_min_max(_matB, min, max);
             float q, dq;
             max = std::max(std::abs(max), std::abs(min));
             q = 127 / max;

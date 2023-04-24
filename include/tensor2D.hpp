@@ -42,9 +42,8 @@ struct tensor2D {
     }
 
     tensor2D(int d0, int d1, bool _force_compact = false) {
-        force_compact = _force_compact;
         capacity = 0;
-        resize(d0, d1);
+        resize(d0, d1, _force_compact);
         fill_rnd();
     }
 

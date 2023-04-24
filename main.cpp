@@ -28,15 +28,16 @@ using ov::bfloat16;
 // initialize AMX
 static bool initAMX = initXTILE();
 
+// this is a non-template class dynamic type dispatching
 struct Matmul {
     enum WeightPrecision {
         Weight_BF16,
         Weight_INT8,
         Weight_INT4
     };
-    amx::Matmul<bfloat16, bfloat16> mbf16bf16;
-    amx::Matmul<bfloat16, int8_t> mbf16s8;
-    amx::Matmul<int8_t, int8_t> ms8s8;
+    amx_kernel::Matmul<bfloat16, bfloat16> mbf16bf16;
+    amx_kernel::Matmul<bfloat16, int8_t> mbf16s8;
+    amx_kernel::Matmul<int8_t, int8_t> ms8s8;
     tensor2D<int8_t> compressedB;
     WeightPrecision wei_prec;
     bool transposeB;
@@ -44,7 +45,7 @@ struct Matmul {
     Matmul(bool constB = false, bool transposeB = false, WeightPrecision wei_prec = Weight_BF16) :
         mbf16bf16(constB, transposeB), mbf16s8(constB, transposeB), ms8s8(constB, transposeB), transposeB(transposeB), wei_prec(wei_prec) {
     }
-    template<typename T, typename PP, std::enable_if_t<std::is_same<T, bfloat16>::value || std::is_same<T, int8_t>::value, bool> = true>
+    template<typename T, typename PP, typename std::enable_if<std::is_same<T, bfloat16>::value || std::is_same<T, int8_t>::value, bool>::type = true>
     void operator()(tensor2D<T> & A,
                     tensor2D<T> & B,
                     PP ppkernel) {
@@ -52,7 +53,8 @@ struct Matmul {
         (*this)(A, B, 0, N, ppkernel);
     }
 
-    // bfloat16 overload
+    // bfloat16 overload, wei_prec specifies whether we do internal weight-compression
+    // by quantization
     template<typename PP>
     void operator()(tensor2D<bfloat16> & A,
                     tensor2D<bfloat16> & B,
@@ -230,7 +232,7 @@ int amx_unit_test_perf() {
     return 0;
 }
 
-template<typename T, amx::PP::Steps ppsteps>
+template<typename T, amx_kernel::PP::Steps ppsteps>
 void amx_FC_acc(int M, int K, int N) {
     tensor2D<T> A(M, K);
     tensor2D<T> B(K, N);
@@ -239,7 +241,7 @@ void amx_FC_acc(int M, int K, int N) {
     tensor2D<bfloat16> C0(M, N);
     Matmul fc(true, false, precision);
     Matmul fcTr(true, true, precision);
-    amx::PP::BiasGeluStore<bfloat16, ppsteps> pp(C);
+    amx_kernel::PP::BiasGeluStore<bfloat16, ppsteps> pp(C);
     std::stringstream ss;
     fc(A, B, pp);
     C0=0;
@@ -264,13 +266,13 @@ void amx_FC_acc(int M, int K, int N) {
     std::cout << ss.str() << std::endl;
 }
 
-template<typename T, amx::PP::Steps ppsteps>
+template<typename T, amx_kernel::PP::Steps ppsteps>
 void amx_FC_perf(int M, int K, int N, int times = -1000) {
     tensor2D<T> A(M, K);
     tensor2D<T> B(K, N);
     tensor2D<bfloat16> C(M, N);
     Matmul mm(true, false, precision);
-    amx::PP::BiasGeluStore<bfloat16, ppsteps> pp(C);
+    amx_kernel::PP::BiasGeluStore<bfloat16, ppsteps> pp(C);
     timer.tag(__func__, M, K, N, TypeName<T>::get(), precision)(times, [&](){
         mm(A, B, pp);
     },
@@ -285,7 +287,7 @@ void amx_Matmul_perf(int M, int K, int N, bool transB, int times = -1000) {
     tensor2D<bfloat16> C(M, N);
     tensor2D<bfloat16> C0(M, N);
     Matmul mm(false, transB);
-    amx::PP::BiasGeluStore<bfloat16, amx::PP::Steps::NONE> pp(C);
+    amx_kernel::PP::BiasGeluStore<bfloat16, amx_kernel::PP::Steps::NONE> pp(C);
     std::cout << __func__ << " [" << M << "," << K << "," << N << "] ";
 
     C0=0;
@@ -308,14 +310,18 @@ void amx_Matmul_perf(int M, int K, int N, bool transB, int times = -1000) {
     AMXBf16PeakGops2PerCore * 1e9);
 }
 
-void amx_unit_test_gemAvB(int M, int K, int times = -1000) {
+int amx_unit_test_gemAvB(int M, int K, int times = -1000) {
     int N = 1;
     tensor2D<bfloat16> A(M, K);
     tensor2D<bfloat16> B(1, K);
     tensor2D<bfloat16> B0(K, 1);
     tensor2D<bfloat16> C0(M, 1);
     tensor2D<bfloat16> C(1, M);
-    amx::GemAvB gemAvB;
+    tensor2D<bfloat16> C2(M, 1, true);
+    amx_kernel::GemAvB gemAvB;
+
+    amx_kernel::Matmul<bfloat16, bfloat16> mm(false, false);
+    amx_kernel::PP::BiasGeluStore<bfloat16, amx_kernel::PP::Steps::NONE> pp(C2);
 
     // same B, different layout
     std::cout << __func__ << " [" << M << "," << K << "," << N << "] ";
@@ -330,15 +336,31 @@ void amx_unit_test_gemAvB(int M, int K, int times = -1000) {
         std::cout << C0Tr << std::endl;
         std::cout << C << std::endl;
         std::cout << ANSIcolor("1;31") << "Mismatch!\n" << ANSIcolor();
-        return;
+        return 1;
     }
 
-    std::cout << __func__ << " [" << M << "," << K << "," << N << "] ";
-    timer(times, [&](){
+    mm(A, B0, 0, N, pp);
+    if (C0 == C2) {
+        std::cout << ANSIcolor("1;32") << "Match2!\n" << ANSIcolor();
+    } else {
+        std::cout << C0Tr << std::endl;
+        std::cout << C << std::endl;
+        std::cout << ANSIcolor("1;31") << "Mismatch2!\n" << ANSIcolor();
+        return 1;
+    }
+
+    timer.tag(__func__, M, K, N, "gemAvB")(times, [&](){
         gemAvB(A, &B(0,0), &C(0,0));
     },
     double(M * N) * K * 2,
     256 * 3e9);
+
+    timer.tag(__func__, M, K, N, "mm")(times, [&](){
+        mm(A, B0, 0, 1, pp);
+    },
+    double(M * N) * K * 2,
+    256 * 3e9);
+    return 0;
 }
 
 void test_blk_loops() {
@@ -450,7 +472,7 @@ struct MatmulMTOMP {
     }
 };
 
-template<typename T, amx::PP::Steps steps>
+template<typename T, amx_kernel::PP::Steps steps>
 void amx_MatmulMT_perf(int M, int K, int N, bool transB, int times = -1000) {
     tensor2D<T> A(M, K);
     tensor2D<T> B(K, N);
@@ -460,14 +482,14 @@ void amx_MatmulMT_perf(int M, int K, int N, bool transB, int times = -1000) {
     Matmul mm(true, transB, precision);
     MatmulMTOMP      mmMT(true, transB, precision);
     tensor2D<float> Bias0(1, N);
-    amx::PP::BiasGeluStore<T, steps> pp0(C0, &Bias0(0,0));
-    amx::PP::BiasGeluStore<T, steps> pp(C, &Bias0(0,0));
+    amx_kernel::PP::BiasGeluStore<T, steps> pp0(C0, &Bias0(0,0));
+    amx_kernel::PP::BiasGeluStore<T, steps> pp(C, &Bias0(0,0));
 
-    if (steps & amx::PP::Steps::DEQUANT) {
+    if (steps & amx_kernel::PP::Steps::DEQUANT) {
         pp0.set_deq_scale(0.25f);
         pp.set_deq_scale(0.25f);
     }
-    if (steps & amx::PP::Steps::QUANT) {
+    if (steps & amx_kernel::PP::Steps::QUANT) {
         pp0.set_q_scale(4.0f);
         pp.set_q_scale(4.0f);
     }
@@ -506,7 +528,7 @@ void amx_MatmulMT_BiasGelu_acc(int M, int K, int N, bool transB) {
     tensor2D<bfloat16> C0(M, N);
     tensor2D<float> Bias(1, N);
     Matmul mm(true, transB);
-    amx::PP::BiasGeluStore<bfloat16, amx::PP::Steps::BIAS_GELU> pp0(C, &Bias(0,0));
+    amx_kernel::PP::BiasGeluStore<bfloat16, amx_kernel::PP::Steps::BIAS_GELU> pp0(C, &Bias(0,0));
 
     std::cout << __func__ << " [" << M << "," << K << "," << N << "] ";
     C0 = 0;
@@ -535,8 +557,8 @@ void amx_MatmulMT_BiasGelu_perf(int M, int K, int N, bool transB, int times = -1
     tensor2D<float> Bias(1, N);
     Matmul mm(true, transB);
     MatmulMTOMP      mmMT(true, transB);
-    amx::PP::BiasGeluStore<bfloat16, amx::PP::Steps::BIAS_GELU> pp0(C0, &Bias(0,0));
-    amx::PP::BiasGeluStore<bfloat16, amx::PP::Steps::BIAS_GELU> pp(C, &Bias(0,0));
+    amx_kernel::PP::BiasGeluStore<bfloat16, amx_kernel::PP::Steps::BIAS_GELU> pp0(C0, &Bias(0,0));
+    amx_kernel::PP::BiasGeluStore<bfloat16, amx_kernel::PP::Steps::BIAS_GELU> pp(C, &Bias(0,0));
 
     std::cout << __func__ << " [" << M << "," << K << "," << N << "] ";
 
@@ -635,7 +657,7 @@ repeate following topology
    ...
 
 */
-template<typename T, amx::PP::Steps ppsteps>
+template<typename T, amx_kernel::PP::Steps ppsteps>
 void amx_FC_MTML_perf(int M, int K, int N, int repeates, int times = -1000) {
     tensor2D<T> A1(M, K);
     tensor2D<T> A2(M, N);
@@ -663,13 +685,13 @@ void amx_FC_MTML_perf(int M, int K, int N, int repeates, int times = -1000) {
 
     timer.tag(__func__, M, K, N, TypeName<T>::get(), precision, repeates)(times, [&](){
         for(int i = 0; i<repeates; i++) {
-            amx::PP::BiasGeluStore<T, ppsteps> ppToA2(A2, &biasA2[i](0,0));
-            amx::PP::BiasGeluStore<T, ppsteps> ppToA1(A1, &biasA1[i](0,0));
-            if (ppsteps & amx::PP::Steps::DEQUANT) {
+            amx_kernel::PP::BiasGeluStore<T, ppsteps> ppToA2(A2, &biasA2[i](0,0));
+            amx_kernel::PP::BiasGeluStore<T, ppsteps> ppToA1(A1, &biasA1[i](0,0));
+            if (ppsteps & amx_kernel::PP::Steps::DEQUANT) {
                 ppToA2.set_deq_scale(0.2);
                 ppToA1.set_deq_scale(0.2);
             }
-            if (ppsteps & amx::PP::Steps::QUANT) {
+            if (ppsteps & amx_kernel::PP::Steps::QUANT) {
                 ppToA2.set_q_scale(128);
                 ppToA1.set_q_scale(128);
             }
@@ -683,7 +705,7 @@ void amx_FC_MTML_perf(int M, int K, int N, int repeates, int times = -1000) {
 }
 
 
-template<typename T, amx::PP::Steps ppsteps>
+template<typename T, amx_kernel::PP::Steps ppsteps>
 void test_FC_acc() {
     amx_FC_acc<T, ppsteps>(32, 64, 5);
     amx_FC_acc<T, ppsteps>(128, 96, 16);
@@ -700,15 +722,15 @@ void test_FC_acc() {
 }
 
 int test_acc() {
-    test_FC_acc<int8_t, amx::PP::Steps::NONE>();
+    test_FC_acc<int8_t, amx_kernel::PP::Steps::NONE>();
     precision = Matmul::Weight_BF16;
-    test_FC_acc<bfloat16, amx::PP::Steps::NONE>();
+    test_FC_acc<bfloat16, amx_kernel::PP::Steps::NONE>();
     precision = Matmul::Weight_INT8;
-    test_FC_acc<bfloat16, amx::PP::Steps::DEQUANT>();
+    test_FC_acc<bfloat16, amx_kernel::PP::Steps::DEQUANT>();
     return 0;
 }
 
-template<typename T, amx::PP::Steps ppsteps>
+template<typename T, amx_kernel::PP::Steps ppsteps>
 void test_FC_perf() {
     amx_FC_perf<T, ppsteps>(2, 2560, 10752);
     amx_FC_perf<T, ppsteps>(22, 2560, 10752);
@@ -729,11 +751,11 @@ void test_FC_perf() {
 
 void test_perf() {
     precision = Matmul::Weight_BF16;
-    test_FC_perf<int8_t, amx::PP::Steps::DEQUANT>();
+    test_FC_perf<int8_t, amx_kernel::PP::Steps::DEQUANT>();
     precision = Matmul::Weight_BF16;
-    test_FC_perf<bfloat16, amx::PP::Steps::NONE>();
+    test_FC_perf<bfloat16, amx_kernel::PP::Steps::NONE>();
     precision = Matmul::Weight_INT8;
-    test_FC_perf<bfloat16, amx::PP::Steps::DEQUANT>();
+    test_FC_perf<bfloat16, amx_kernel::PP::Steps::DEQUANT>();
 }
 
 /*
@@ -767,8 +789,8 @@ void test_parallel_FC(int L, int M, int K, int N, int times = -5000) {
         }
         void run() {
             // post-ops do nothing
-            //amx::PP::Dummy ppkernel(C);
-            amx::PP::BiasGeluStore<bfloat16, amx::PP::Steps::BIAS_GELU> ppkernel(C, &Bias(0,0));
+            //amx_kernel::PP::Dummy ppkernel(C);
+            amx_kernel::PP::BiasGeluStore<bfloat16, amx_kernel::PP::Steps::BIAS_GELU> ppkernel(C, &Bias(0,0));
             (*mm.get())(A, B, 0, _N, ppkernel);
         }
     };
@@ -833,7 +855,7 @@ void test_parallel_FC() {
     }
 }
 
-using amx::PP::Steps;
+using amx_kernel::PP::Steps;
 
 //=====================================================================================================
 int main(int argc, const char *argv[]) {
@@ -847,6 +869,7 @@ int main(int argc, const char *argv[]) {
     std::cout << ANSIcolor("31") << "OMP_NT = " << OMP_NT << std::endl << ANSIcolor();
 
     //test_acc();    test_perf();    return 0;
+    return amx_unit_test_gemAvB(901, 80);
 
     precision = Matmul::Weight_BF16;
     amx_MatmulMT_perf<bfloat16, Steps::BIAS_GELU>(2, 2560, 10752, false, -1000);
