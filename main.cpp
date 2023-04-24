@@ -22,6 +22,8 @@
 #include <omp.h>
 timeit timer;
 
+using ov::bfloat16;
+
 //================================================================================
 // initialize AMX
 static bool initAMX = initXTILE();
@@ -659,7 +661,7 @@ void amx_FC_MTML_perf(int M, int K, int N, int repeates, int times = -1000) {
 
     double elesize = (precision == Matmul::Weight_BF16)? sizeof(bfloat16) : sizeof(int8_t);
 
-    timer.tag(__func__, M, K, N, precision, repeates)(times, [&](){
+    timer.tag(__func__, M, K, N, TypeName<T>::get(), precision, repeates)(times, [&](){
         for(int i = 0; i<repeates; i++) {
             amx::PP::BiasGeluStore<T, ppsteps> ppToA2(A2, &biasA2[i](0,0));
             amx::PP::BiasGeluStore<T, ppsteps> ppToA1(A1, &biasA1[i](0,0));
@@ -697,12 +699,11 @@ void test_FC_acc() {
 }
 
 int test_acc() {
-    test_FC_acc<int8_t, amx::PP::Steps::DEQUANT_BIAS_GELU>();
-
+    test_FC_acc<int8_t, amx::PP::Steps::NONE>();
     precision = Matmul::Weight_BF16;
-    test_FC_acc<bfloat16, amx::PP::Steps::BIAS_GELU>();
+    test_FC_acc<bfloat16, amx::PP::Steps::NONE>();
     precision = Matmul::Weight_INT8;
-    test_FC_acc<bfloat16, amx::PP::Steps::DEQUANT_BIAS_GELU>();
+    test_FC_acc<bfloat16, amx::PP::Steps::DEQUANT>();
     return 0;
 }
 

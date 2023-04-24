@@ -3,117 +3,6 @@
 /*
 https://www.intel.com/content/www/us/en/develop/documentation/cpp-compiler-developer-guide-and-reference/top/compiler-reference/intrinsics/intrinsics-for-amx-instructions/intrinsics-for-amx-tile-instructions/tile-loadconfig.html
 
-void _tile_loadconfig (const void * mem_addr)
-	format of memory payload. each field is a byte.
-		 0: palette_id
-		 1: startRow (8b)
-	 2-15: reserved (must be zero)
-	16-17: tile0.colsb -- bytes_per_row
-	18-19: tile1.colsb
-	20-21: tile2.colsb
-			...
-	46-47: tile15.colsb
-		48: tile0.rows
-		49: tile1.rows
-		50: tile2.rows
-			 ...
-		63: tile15.rows
-
-void _tile_storeconfig (void * mem_addr)
-    Stores the current tile configuration to a 64-byte memory location specified by "mem_addr".
-    The tile configuration format is specified below, and includes the tile type pallette,
-    the number of bytes per row, and the number of rows. If tiles are not configured,
-    all zeroes will be stored to memory.
-*/
-
-/*
-void _tile_loadd (__tile dst, const void * base, int stride)
-    Load tile rows from memory specifieid by "base" address and "stride"
-    into destination tile "dst" using the tile configuration previously
-    configured via "_tile_loadconfig".
-    Operation:
-        start := tileconfig.startRow
-        IF start == 0 // not restarting, zero incoming state
-            tilezero(dst)
-        FI
-        nbytes := dst.colsb
-        DO WHILE start < dst.rows
-            memptr := base + start * stride
-            write_row_and_zero(dst, start, read_memory(memptr, nbytes), nbytes)
-            start := start + 1
-        OD
-        zero_upper_rows(dst, dst.rows)
-        zero_tileconfig_start()
-
-void _tile_stored (__tile src, void * base, int stride)
-    Store the tile specified by "src" to memory specifieid by "base" address and "stride"
-    using the tile configuration previously configured via "_tile_loadconfig".
-    Operation:
-        start := tileconfig.startRow
-        DO WHILE start < src.rows
-            memptr := base + start * stride
-            write_memory(memptr, src.colsb, src.row[start])
-            start := start + 1
-        OD
-        zero_tileconfig_start()
-
-void _tile_stream_loadd (__tile dst, const void * base, int stride)
-    Load tile rows from memory specifieid by "base" address and "stride"
-    into destination tile "dst" using the tile configuration previously
-    configured via "_tile_loadconfig". This intrinsic provides a hint to
-    the implementation that the data will likely not be reused in the near
-    future and the data caching can be optimized accordingly.
-
-void _tile_zero (__tile tdest)
-    Zero the tile specified by "tdest".
-    Operation:
-        nbytes := palette_table[tileconfig.palette_id].bytes_per_row
-        FOR i := 0 TO palette_table[tileconfig.palette_id].max_rows-1
-            FOR j := 0 TO nbytes-1
-                tdest.row[i].byte[j] := 0
-            ENDFOR
-        ENDFOR
-	
-
-void _tile_release ()
-    Release the tile configuration to return to the init state, which releases all storage it currently holds.
-
-
-Instruction Throughput Latency
-LDTILECFG                204
-STTILECFG                19
-TILETRELEASE             13
-TDP / *          16      52
-TILELOADD         8      45
-TILELOADDT1      33      48
-TILESTORED       16
-TILEZERO          0      16
-
-Due to the high latency of the LDTILECFG instruction we recommend issuing a single pair
-of LDTILECFG and TILERELEASE operations per Intel AMX-based DL layer implementation.
-
-
-• A-tiles can have between 1-16 rows and 1-MAX_TILE_K columns.
-• B-tiles can have between 1-MAX_TILE_K rows and 1–16 columns.
-• C-tiles can have between 1-16 rows and 1–16 columns.
-
-MAX_TILE_K=64/sizeof(type_t)
-          = 32 BF16
-          = 64 INT8
-
-A tiles and B tiles contain data of type_t, which can be (u)int8 or bfloat16.
-• C tiles contain data of type res_type_t:
-• int32 if type_t=(u)int8
-• float if type_t=bfloat16
-
-Like the Intel® DL Boost use case, the B matrix must undergo a re-layout before it can be used within the
-corresponding Intel AMX multiply instruction.
-
-BF16    C_float_16x16 = A_bfloat16_16x32 * B_bfloat16_32x16 (re-layout as 16x16x2 Ab2a)
-INT8    C_int32_16x16 = A_int8_16x64 * B_int8_64x16 (re-layout as 16x16x4 Ab4a)
-
-
-
 FC:
     (2,1~900,2560)x(2560,7680)
     (2,1~900,2560)x(2560,2560)
@@ -156,9 +45,7 @@ bool is_pointer_valid(void *p) {
 }
 
 //#define FORCE_INLINE inline __attribute__((always_inline))
-#define FORCE_INLINE 
-
-using ov::bfloat16;
+//#define FORCE_INLINE 
 
 namespace amx {
 
@@ -258,7 +145,7 @@ struct KpackedB {
     // quant: bf16->fp32->int8:
     //  1, q_scale = 127 / max(abs(w))
     //  2, w_i8 = round(w * q_scale)
-    void quant_from(KpackedB<bfloat16>& src) {
+    void quant_from(KpackedB<ov::bfloat16>& src) {
         resize(src.K, src.N);
         auto scale = _mm512_set1_ps(quant_scale);
         auto p_src = &src(0, 0);
@@ -277,7 +164,7 @@ struct KpackedB {
     }
 
     template<int K>
-    void deq_Kx32_full(int8_t *&src, bfloat16 *dst)
+    void deq_Kx32_full(int8_t *&src, ov::bfloat16 *dst)
     {
         for (int k = 0; k < K; k++)
         {
@@ -302,7 +189,7 @@ struct KpackedB {
 
     // dequantize is moved to post-process of C matrix
     template<int K>
-    void i8_to_bf16_Kx32(int8_t *&src, bfloat16 *dst)
+    void i8_to_bf16_Kx32(int8_t *&src, ov::bfloat16 *dst)
     {
         for (int k = 0; k < K; k++)
         {
@@ -323,7 +210,7 @@ struct KpackedB {
     // dequant: int8->fp32->bf16
     //  1, dq_scale = max(abs(w)) / 127
     //  2, w = w_i8 * dq_scale
-    void dequant16x32_to(int8_t*& src, bfloat16* dst) {
+    void dequant16x32_to(int8_t*& src, ov::bfloat16* dst) {
         auto dq_scale = _mm512_set1_ps(dequant_scale);
         for (int k = 0; k < 16; k++) {
             auto a = _mm_load_si128((__m128i*)src);
@@ -341,15 +228,6 @@ struct KpackedB {
         }
     }
 };
-
-constexpr int tC00 = 0;
-constexpr int tC01 = 1;
-constexpr int tC10 = 2;
-constexpr int tC11 = 3;
-constexpr int tA0 = 4;
-constexpr int tA1 = 5;
-constexpr int tB0 = 6;
-constexpr int tB1 = 7;
 
 namespace functional {
 
@@ -624,7 +502,7 @@ namespace functional {
         }
     }
 
-    void kpack_tile_B0B1(void * _dst0, void * _dst1, const bfloat16 * _src, int stride, int src_rows) {
+    void kpack_tile_B0B1(void * _dst0, void * _dst1, const ov::bfloat16 * _src, int stride, int src_rows) {
         static const uint64_t idx[8] = {0,4,1,5,2,6,3,7};
         auto midx = _mm512_loadu_epi64(idx);
         const auto * src = reinterpret_cast<const int8_t *>(_src);
@@ -694,12 +572,12 @@ namespace functional {
     // will be accessed in 1x2)
     // given 2x2 blocking scheme, Kx32 blocks are always
     // accessed sequentially:
-    // transpose/repack each 32xK bfloat16 submatrix
+    // transpose/repack each 32xK ov::bfloat16 submatrix
     // into Kx32 slices (each number is a 16x32 bf16-block):
     //   0 2 4 6 ... ...
     //   1 3 5 7 ... ...
     // 
-    inline void prepareB(KpackedB<bfloat16> & B, tensor2D<bfloat16> & matB, bool transpose = false) {
+    inline void prepareB(KpackedB<ov::bfloat16> & B, tensor2D<ov::bfloat16> & matB, bool transpose = false) {
         int K = matB.dims[transpose?1:0];
         int N = matB.dims[transpose?0:1];
         B.resize(K, N);
@@ -752,7 +630,7 @@ namespace functional {
         }
     }
 
-    inline void get_min_max(tensor2D<bfloat16> & matB, float& min, float& max) {
+    inline void get_min_max(tensor2D<ov::bfloat16> & matB, float& min, float& max) {
         int K = matB.dims[0];
         int N = matB.dims[1];
         auto m_max = _mm512_set1_ps(-__FLT_MAX__);
@@ -806,9 +684,9 @@ namespace PP {
 
     template<typename D, Steps steps>
     struct BiasGeluStore {
-        // output type D can be bfloat16 or int8_t or float
-        static_assert(std::is_same<D, bfloat16>::value || std::is_same<D, int8_t>::value || std::is_same<D, float>::value,
-                      "BiasGeluStore only support bfloat16/int8_t/float output data types");
+        // output type D can be ov::bfloat16 or int8_t or float
+        static_assert(std::is_same<D, ov::bfloat16>::value || std::is_same<D, int8_t>::value || std::is_same<D, float>::value,
+                      "BiasGeluStore only support ov::bfloat16/int8_t/float output data types");
 
         BiasGeluStore(tensor2D<D> & C, float * bias = nullptr) : C(C), bias(bias) {}
 
@@ -840,7 +718,7 @@ namespace PP {
 
         // source buffC can be i32 or f32
         template<typename T, std::enable_if_t<is_f32i32<T>::value, bool> = true>
-        FORCE_INLINE void operator()(tensor2D<T> & buffC, int m, int n, int valid_m, int valid_n) {
+        void operator()(tensor2D<T> & buffC, int m, int n, int valid_m, int valid_n) {
             auto * psrc = &buffC(0,0);
             int8_t * pdst = reinterpret_cast<int8_t*>(&(C(m, n)));
             int stride = C.stride;
@@ -906,7 +784,7 @@ namespace PP {
                     r0 = _mm512_mul_ps(r0, m512_q_scale0);
                     r1 = _mm512_mul_ps(r1, m512_q_scale1);
                 }
-                if (std::is_same<D, bfloat16>::value) {
+                if (std::is_same<D, ov::bfloat16>::value) {
                     auto c = _mm512_cvtne2ps_pbh(r1, r0);   // convert to bf16
                     _mm512_mask_storeu_epi16(pdst, kall, c);   // store bf16
                 }
@@ -1062,7 +940,7 @@ tensor2D<T> repackB_1x2(const tensor2D<T> &Bi, bool transpose) {
 template<class T = void>
 struct acc_type {};
 template<>
-struct acc_type <bfloat16> { typedef float type; };
+struct acc_type <ov::bfloat16> { typedef float type; };
 template<>
 struct acc_type <int8_t> { typedef int32_t type; };
 template<>
@@ -1079,8 +957,8 @@ struct Matmul {
     bool constB;
     bool transposeB;
 
-    constexpr static bool is_bf16s8 = std::is_same<TA,bfloat16>::value && std::is_same<TB,int8_t>::value;
-    constexpr static bool is_bf16bf16 = std::is_same<TA,bfloat16>::value && std::is_same<TB,bfloat16>::value;
+    constexpr static bool is_bf16s8 = std::is_same<TA,ov::bfloat16>::value && std::is_same<TB,int8_t>::value;
+    constexpr static bool is_bf16bf16 = std::is_same<TA,ov::bfloat16>::value && std::is_same<TB,ov::bfloat16>::value;
     constexpr static bool is_s8s8 = std::is_same<TA,int8_t>::value && std::is_same<TB,int8_t>::value;
     constexpr static bool is_s8u8 = std::is_same<TA,int8_t>::value && std::is_same<TB,uint8_t>::value;
     constexpr static bool is_u8s8 = std::is_same<TA,uint8_t>::value && std::is_same<TB,int8_t>::value;
@@ -1206,7 +1084,7 @@ struct Matmul {
         // we do an preliminary check to ensure this will not cause segmentfalut.
         int Ktails = K % kStep;
         if (Ktails) {
-            // the last tileload will load 64 bytes with only Ktails*sizeof(bfloat16) bytes
+            // the last tileload will load 64 bytes with only Ktails*sizeof(ov::bfloat16) bytes
             // are inside A matrix, the rest is going to exceed A's range, if that's inside
             // the same page, it's OK, otherwise, we requires next page following it is valid
             // to access.
@@ -1321,8 +1199,8 @@ struct Matmul {
 #if 0
     // for M < 16, use 1x2 tiles
     template<typename PP>
-    void exec_Wint8_m16(tensor2D<bfloat16> & matA,
-                        tensor2D<bfloat16> & _matB,
+    void exec_Wint8_m16(tensor2D<ov::bfloat16> & matA,
+                        tensor2D<ov::bfloat16> & _matB,
                         int n0, int n1,
                         PP ppkernel) {
         auto matB = getSubMatB(_matB, n0, n1);
@@ -1345,7 +1223,7 @@ struct Matmul {
             dq = max / 127;
             internalBI8.set_scale(q, dq);
 
-            KpackedB<bfloat16> internalTmpB;
+            KpackedB<ov::bfloat16> internalTmpB;
             functional::prepareB(internalTmpB, matB, transposeB);
             internalBI8.quant_from(internalTmpB);
         }
@@ -1484,13 +1362,13 @@ struct Matmul {
 };
 
 // specialization:
-//  TA is bfloat16 and TB is int8_t, decompressed on the fly into bfloat16 by simply convert
+//  TA is ov::bfloat16 and TB is int8_t, decompressed on the fly into ov::bfloat16 by simply convert
 template<>
-struct Matmul<bfloat16, int8_t, float> {
+struct Matmul<ov::bfloat16, int8_t, float> {
     KpackedB<int8_t> internalBI8;
 
-    // wei_buff is ping-pong buffer containing bfloat16 weights decompressed on the fly.
-    tensor2D<bfloat16> weiBuff;
+    // wei_buff is ping-pong buffer containing ov::bfloat16 weights decompressed on the fly.
+    tensor2D<ov::bfloat16> weiBuff;
 
     bool constB;
     bool transposeB;
@@ -1506,8 +1384,8 @@ struct Matmul<bfloat16, int8_t, float> {
         constB(constB), transposeB(transposeB), buffC(32, 32) {}
 
     template<typename PP>
-    void operator()(tensor2D<bfloat16> & matA,
-                    tensor2D<bfloat16> & _matB,
+    void operator()(tensor2D<ov::bfloat16> & matA,
+                    tensor2D<ov::bfloat16> & _matB,
                     int n0, int n1,
                     PP ppkernel) {
         auto matB = getSubMatB(_matB, n0, n1, transposeB);
@@ -1532,7 +1410,7 @@ struct Matmul<bfloat16, int8_t, float> {
             dq = max / 127;
             internalBI8.set_scale(q, dq);
 
-            KpackedB<bfloat16> internalTmpB;
+            KpackedB<ov::bfloat16> internalTmpB;
             functional::prepareB(internalTmpB, matB, transposeB);
             internalBI8.quant_from(internalTmpB);
         }
@@ -1587,8 +1465,8 @@ struct Matmul<bfloat16, int8_t, float> {
 
         // 4 tiles buffC is reused as decompressed bf16 weights 
         constexpr int prefetch_ahead = 16*1024;
-        bfloat16 * pBa = reinterpret_cast<bfloat16*>(&buffC(0,0));
-        bfloat16 * pBb = pBa + (16*32)*2;
+        ov::bfloat16 * pBa = reinterpret_cast<ov::bfloat16*>(&buffC(0,0));
+        ov::bfloat16 * pBb = pBa + (16*32)*2;
         auto kernel_2x2 = [&](int m, int n, int valid_m, int valid_n) {
             auto strideA = matA.stride;
             auto * pA0 = &matA(m, 0);
@@ -1642,129 +1520,6 @@ struct Matmul<bfloat16, int8_t, float> {
     }
 };
 
-#if 0
-// using only 1 tile in C matrix:
-//
-//      B0
-//      B1
-//      ...
-//      B5
-//   A0 C0
-//
-// when K < (32*6)=192, Kx16 B sub-matrix can repack dynamically once and
-// all hold in titles, then we can go vertially until A-sub matrix is fit
-// in L2 cache, then we go next
-// 
-template<typename PP, int K>
-void matmul1x1(tensor2D<bfloat16> & matA,
-                tensor2D<bfloat16> & matB,
-                tensor2D<bfloat16> & matC,
-                tensor2D<bfloat16> & scratch,
-                bool transB,
-                PP ppkernel) {
-    constexpr int tB0 = 0;
-    constexpr int tB1 = 1;
-    constexpr int tB2 = 2;
-    constexpr int tB3 = 3;
-    constexpr int tB4 = 4;
-    constexpr int tB5 = 5;
-    constexpr int tC = 6;
-    constexpr int tA = 7;
-    tensor2D<bfloat16> & Atails = scratch;
-    int M = matC.dims[0];
-    int N = matC.dims[1];
-    int _K = matA.dims[1];
-    assert(_K == matB.K);
-    assert(N == matB.N);
-    assert(_K == K);
-    assert (K < 32*6);
-
-    // determine blocking scheme
-    int elesz = sizeof(uint16_t);
-    int L2 = 2048*1024; // 2MB
-    int slice_size = 16*K*elesz;
-    int mc = L2/slice_size - 1;
-    assert(mc > 0);
-
-    auto dmax = std::numeric_limits<int>::max();
-    BlockIterator::blkloop bloops[] = {
-        {1,mc*16,0}, {dmax,0,16}, {dmax,mc*16,0}
-    };
-    bloop.reset(bloops, 3, M, N);
-
-    int mtails = M % 16;
-    if (mtails > 0) {
-        Atails.resize(16, rndup(K, 32));
-        // copy tails into Atails (in unit of 32x32)
-        for (int m = 0; m < mtails; m++) {
-            memcpy(&Atails(m, 0), &matA(M - mtails + m, 0), matA.stride);
-            if (Atails.stride > matA.stride) {
-                memset(reinterpret_cast<int8_t*>(&Atails(m, 0)) + matA.stride,
-                        0,
-                        Atails.stride - matA.stride);
-            }
-        }
-    }
-
-    do
-    {
-        // k loop is unrolled, so we handle mc*16 blocks
-        int m = blk_it.m;
-        int n = blk_it.n;
-
-        // load all B tiles
-        for (int k = 0; k < K; k += 32) {
-
-        }
-        int valid_m = std::min(M - m, 16);
-        int valid_n = std::min(N - n, 16);
-
-
-        auto * pA0 = &matA(m, 0);
-        auto strideA = matA.stride;
-        auto * pB = &matB(0, n);
-        if (valid_m < 16) {
-            // use Atails buffer to prevent memory read segmentfault
-            pA0 = &Atails(0, 0);
-            strideA = Atails.stride;
-        }
-        // load all B tiles
-
-        // k loop is unrolled, 
-        _tile_zero(tC);
-        _tile_loadd(tA, pA0 + 0, strideA);
-        _tile_dpbf16ps(tC, tA, tB0);
-
-        if (K > 32) {
-            _tile_loadd(tA, pA0 + 32, strideA);
-            _tile_dpbf16ps(tC, tA, tB1);
-        }
-        if (K > 32*2) {
-            _tile_loadd(tA, pA0 + 32*2, strideA);
-            _tile_dpbf16ps(tC, tA, tB2);
-        }
-        if (K > 32*3) {
-            _tile_loadd(tA, pA0 + 32*3, strideA);
-            _tile_dpbf16ps(tC, tA, tB3);
-        }
-        if (K > 32*4) {
-            _tile_loadd(tA, pA0 + 32*4, strideA);
-            _tile_dpbf16ps(tC, tA, tB4);
-        }
-        if (K > 32*5) {
-            _tile_loadd(tA, pA0 + 32*5, strideA);
-            _tile_dpbf16ps(tC, tA, tB5);
-        }
-
-        // post processing the accumulator tiles
-        //  - add bias
-        //  - do activations
-        //  - convert into bfloat16
-        //  - store into C matrix
-        (ppkernel)(&matC(m, n), matC.stride, valid_m, valid_n);
-    } while(blk_it.next());
-}
-#endif
 //https://stackoverflow.com/questions/29519222/how-to-transpose-a-16x16-matrix-using-simd-instructions
 // vector multiply with matrix:
 //  mAvB:  A(M, K) * B(K, 1) => C(M, 1)
@@ -1777,13 +1532,13 @@ void matmul1x1(tensor2D<bfloat16> & matA,
 // B is pre-broadcasted in unit of 2
 // 
 struct GemAvB {
-    tensor2D<bfloat16> Bpadded;
+    tensor2D<ov::bfloat16> Bpadded;
     GemAvB() {
     }
 
-    void operator()(tensor2D<bfloat16> & matA,
-                    bfloat16 * vecB,
-                    bfloat16 * vecC) {
+    void operator()(tensor2D<ov::bfloat16> & matA,
+                    ov::bfloat16 * vecB,
+                    ov::bfloat16 * vecC) {
         int M = matA.dims[0];
         int K = matA.dims[1];
 
@@ -1792,7 +1547,7 @@ struct GemAvB {
                 Bpadded.resize(1, rndup(K, 32));
             auto newB = &Bpadded(0, 0);
             memset(newB, 0, Bpadded.stride);
-            memcpy(newB, vecB, K * sizeof(bfloat16));
+            memcpy(newB, vecB, K * sizeof(ov::bfloat16));
             vecB = newB;
         }
 
@@ -1849,70 +1604,11 @@ struct GemAvB {
                 regC1 = _mm512_dpbf16_ps(regC1, rf, _mm512_set1_epi32(pBi32[15]));
             }
             regC0 = _mm512_add_ps(regC0, regC1);
-            auto regOut = _mm512_cvtne2ps_pbh(regC0, regC0); // only 16 bfloat16 results in lower 256bits 
+            auto regOut = _mm512_cvtne2ps_pbh(regC0, regC0); // only 16 ov::bfloat16 results in lower 256bits 
             _mm256_storeu_si256(reinterpret_cast<__m256i_u *>(vecC + m), _mm512_extracti64x4_epi64(regOut, 0));
         }
     }
 };
 
-
-
-#if 0
-
-// Matmul support B [KxN] matrix in few forms:
-//    1. already transposed in KxN, only re-pack is needed
-//    2. not transposed yet, it's NxK, need transpose and re-pack 
-//
-//     w=q*k': [S,80]*[80,S] => [S,S]   TBD
-//     x=w*v : [S,S]*[S,80] => [S,80]   TBD
-// standard implementation (not optimized):
-//  a reorder routine that can prepare B-type tiles by:
-//      1. transpose + re-pack
-//      2. re-pack only
-//  after which each B-type tile memory is placed sequentially
-//  acording to blocking scheme's accessing order, it should be
-//  done in single thread order, for examplem if whole matmul
-//  is splitted among several cores, each core is responsible
-//  for a few submatrixes result, then each core should do
-//  this reorder on their own for their part of the B matrix.
-//
-//  if B matrix is constant, then it can be done only once
-//  if not, it needs to be done on every execution.
-//  
-//  the memory of the prepared part of the B matrix will be kept
-//  in the executor as a state(to save memory allocation overhead)
-//  across calls
-//
-//  blocking scheme is determined outside, once it's done, executor's
-//  job is just to execute it:
-//   - using amx intrinsic.
-//   - handling B matrix repack.
-//   - handling tails.
-// hard assumption:
-//   - there is no blocking done on dimension K, and it only done on M,N
-//   - two register/tile blockings on C matrix: 2x2 (32x32) or 1x4 (16x64)
-//     determined by outside logic, executor has no strategy at all
-
-// using Blocking described above, C matrix can be decomposed into a lot of
-// blocks in different level of sizes, and it multi-threading scheme can tell
-// executor to do only part of the job by giving range of indexes on some block level
-// for example, for C matrix of 320x320, 10x10 L0 blocks are sequentially numbered
-// as 0-99 (the order is determined by bloops), and split them among 5 threads
-// each will only do 20 L0-blocks, in the order determined by Blocking struct.
-//
-
-void Matmul(tensor2D<bfloat16> & matA,
-            tensor2D<bfloat16> & matB,
-            tensor2D<bfloat16> & matC,
-            tensor2D<bfloat16> & scratch, // scratch tensor for packing B
-            bool transposeB,
-            const Blocking & blk,
-            int start, int end) {
-    // check the range of B used by this kernel
-    // (transpose) repack it into scratch
-
-    // loop according to blk
-}
-#endif
 } // namespace amx
 
