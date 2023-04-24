@@ -11,7 +11,7 @@
 #include <cstring>
 #include <thread>
 
-#include "kernels_amxbf16.hpp"
+#include "kernels_amx.hpp"
 #include "kernels_avx512.hpp"
 #include "thread_pool.hpp"
 #include "timeit.hpp"
@@ -32,9 +32,9 @@ struct Matmul {
         Weight_INT8,
         Weight_INT4
     };
-    amx_bf16::Matmul<bfloat16, bfloat16> mbf16bf16;
-    amx_bf16::Matmul<bfloat16, int8_t> mbf16s8;
-    amx_bf16::Matmul<int8_t, int8_t> ms8s8;
+    amx::Matmul<bfloat16, bfloat16> mbf16bf16;
+    amx::Matmul<bfloat16, int8_t> mbf16s8;
+    amx::Matmul<int8_t, int8_t> ms8s8;
     tensor2D<int8_t> compressedB;
     WeightPrecision wei_prec;
     bool transposeB;
@@ -228,7 +228,7 @@ int amx_unit_test_perf() {
     return 0;
 }
 
-template<typename T, amx_bf16::PP::Steps ppsteps>
+template<typename T, amx::PP::Steps ppsteps>
 void amx_FC_acc(int M, int K, int N) {
     tensor2D<T> A(M, K);
     tensor2D<T> B(K, N);
@@ -237,7 +237,7 @@ void amx_FC_acc(int M, int K, int N) {
     tensor2D<bfloat16> C0(M, N);
     Matmul fc(true, false, precision);
     Matmul fcTr(true, true, precision);
-    amx_bf16::PP::BiasGeluStore<bfloat16, ppsteps> pp(C);
+    amx::PP::BiasGeluStore<bfloat16, ppsteps> pp(C);
     std::stringstream ss;
     fc(A, B, pp);
     C0=0;
@@ -262,13 +262,13 @@ void amx_FC_acc(int M, int K, int N) {
     std::cout << ss.str() << std::endl;
 }
 
-template<typename T, amx_bf16::PP::Steps ppsteps>
+template<typename T, amx::PP::Steps ppsteps>
 void amx_FC_perf(int M, int K, int N, int times = -1000) {
     tensor2D<T> A(M, K);
     tensor2D<T> B(K, N);
     tensor2D<bfloat16> C(M, N);
     Matmul mm(true, false, precision);
-    amx_bf16::PP::BiasGeluStore<bfloat16, ppsteps> pp(C);
+    amx::PP::BiasGeluStore<bfloat16, ppsteps> pp(C);
     timer.tag(__func__, M, K, N, TypeName<T>::get(), precision)(times, [&](){
         mm(A, B, pp);
     },
@@ -283,7 +283,7 @@ void amx_Matmul_perf(int M, int K, int N, bool transB, int times = -1000) {
     tensor2D<bfloat16> C(M, N);
     tensor2D<bfloat16> C0(M, N);
     Matmul mm(false, transB);
-    amx_bf16::PP::BiasGeluStore<bfloat16, amx_bf16::PP::Steps::NONE> pp(C);
+    amx::PP::BiasGeluStore<bfloat16, amx::PP::Steps::NONE> pp(C);
     std::cout << __func__ << " [" << M << "," << K << "," << N << "] ";
 
     C0=0;
@@ -313,7 +313,7 @@ void amx_unit_test_gemAvB(int M, int K, int times = -1000) {
     tensor2D<bfloat16> B0(K, 1);
     tensor2D<bfloat16> C0(M, 1);
     tensor2D<bfloat16> C(1, M);
-    amx_bf16::GemAvB gemAvB;
+    amx::GemAvB gemAvB;
 
     // same B, different layout
     std::cout << __func__ << " [" << M << "," << K << "," << N << "] ";
@@ -448,7 +448,7 @@ struct MatmulMTOMP {
     }
 };
 
-template<typename T, amx_bf16::PP::Steps steps>
+template<typename T, amx::PP::Steps steps>
 void amx_MatmulMT_perf(int M, int K, int N, bool transB, int times = -1000) {
     tensor2D<T> A(M, K);
     tensor2D<T> B(K, N);
@@ -458,14 +458,14 @@ void amx_MatmulMT_perf(int M, int K, int N, bool transB, int times = -1000) {
     Matmul mm(true, transB, precision);
     MatmulMTOMP      mmMT(true, transB, precision);
     tensor2D<float> Bias0(1, N);
-    amx_bf16::PP::BiasGeluStore<T, steps> pp0(C0, &Bias0(0,0));
-    amx_bf16::PP::BiasGeluStore<T, steps> pp(C, &Bias0(0,0));
+    amx::PP::BiasGeluStore<T, steps> pp0(C0, &Bias0(0,0));
+    amx::PP::BiasGeluStore<T, steps> pp(C, &Bias0(0,0));
 
-    if (steps & amx_bf16::PP::Steps::DEQUANT) {
+    if (steps & amx::PP::Steps::DEQUANT) {
         pp0.set_deq_scale(0.25f);
         pp.set_deq_scale(0.25f);
     }
-    if (steps & amx_bf16::PP::Steps::QUANT) {
+    if (steps & amx::PP::Steps::QUANT) {
         pp0.set_q_scale(4.0f);
         pp.set_q_scale(4.0f);
     }
@@ -504,7 +504,7 @@ void amx_MatmulMT_BiasGelu_acc(int M, int K, int N, bool transB) {
     tensor2D<bfloat16> C0(M, N);
     tensor2D<float> Bias(1, N);
     Matmul mm(true, transB);
-    amx_bf16::PP::BiasGeluStore<bfloat16, amx_bf16::PP::Steps::BIAS_GELU> pp0(C, &Bias(0,0));
+    amx::PP::BiasGeluStore<bfloat16, amx::PP::Steps::BIAS_GELU> pp0(C, &Bias(0,0));
 
     std::cout << __func__ << " [" << M << "," << K << "," << N << "] ";
     C0 = 0;
@@ -533,8 +533,8 @@ void amx_MatmulMT_BiasGelu_perf(int M, int K, int N, bool transB, int times = -1
     tensor2D<float> Bias(1, N);
     Matmul mm(true, transB);
     MatmulMTOMP      mmMT(true, transB);
-    amx_bf16::PP::BiasGeluStore<bfloat16, amx_bf16::PP::Steps::BIAS_GELU> pp0(C0, &Bias(0,0));
-    amx_bf16::PP::BiasGeluStore<bfloat16, amx_bf16::PP::Steps::BIAS_GELU> pp(C, &Bias(0,0));
+    amx::PP::BiasGeluStore<bfloat16, amx::PP::Steps::BIAS_GELU> pp0(C0, &Bias(0,0));
+    amx::PP::BiasGeluStore<bfloat16, amx::PP::Steps::BIAS_GELU> pp(C, &Bias(0,0));
 
     std::cout << __func__ << " [" << M << "," << K << "," << N << "] ";
 
@@ -633,7 +633,7 @@ repeate following topology
    ...
 
 */
-template<typename T, amx_bf16::PP::Steps ppsteps>
+template<typename T, amx::PP::Steps ppsteps>
 void amx_FC_MTML_perf(int M, int K, int N, int repeates, int times = -1000) {
     tensor2D<T> A1(M, K);
     tensor2D<T> A2(M, N);
@@ -661,13 +661,13 @@ void amx_FC_MTML_perf(int M, int K, int N, int repeates, int times = -1000) {
 
     timer.tag(__func__, M, K, N, precision, repeates)(times, [&](){
         for(int i = 0; i<repeates; i++) {
-            amx_bf16::PP::BiasGeluStore<T, ppsteps> ppToA2(A2, &biasA2[i](0,0));
-            amx_bf16::PP::BiasGeluStore<T, ppsteps> ppToA1(A1, &biasA1[i](0,0));
-            if (ppsteps & amx_bf16::PP::Steps::DEQUANT) {
+            amx::PP::BiasGeluStore<T, ppsteps> ppToA2(A2, &biasA2[i](0,0));
+            amx::PP::BiasGeluStore<T, ppsteps> ppToA1(A1, &biasA1[i](0,0));
+            if (ppsteps & amx::PP::Steps::DEQUANT) {
                 ppToA2.set_deq_scale(0.2);
                 ppToA1.set_deq_scale(0.2);
             }
-            if (ppsteps & amx_bf16::PP::Steps::QUANT) {
+            if (ppsteps & amx::PP::Steps::QUANT) {
                 ppToA2.set_q_scale(128);
                 ppToA1.set_q_scale(128);
             }
@@ -681,7 +681,7 @@ void amx_FC_MTML_perf(int M, int K, int N, int repeates, int times = -1000) {
 }
 
 
-template<typename T, amx_bf16::PP::Steps ppsteps>
+template<typename T, amx::PP::Steps ppsteps>
 void test_FC_acc() {
     amx_FC_acc<T, ppsteps>(128, 96, 16);
     amx_FC_acc<T, ppsteps>(2, 2560, 10752);
@@ -697,16 +697,16 @@ void test_FC_acc() {
 }
 
 int test_acc() {
-    test_FC_acc<int8_t, amx_bf16::PP::Steps::DEQUANT_BIAS_GELU>();
+    test_FC_acc<int8_t, amx::PP::Steps::DEQUANT_BIAS_GELU>();
 
     precision = Matmul::Weight_BF16;
-    test_FC_acc<bfloat16, amx_bf16::PP::Steps::BIAS_GELU>();
+    test_FC_acc<bfloat16, amx::PP::Steps::BIAS_GELU>();
     precision = Matmul::Weight_INT8;
-    test_FC_acc<bfloat16, amx_bf16::PP::Steps::DEQUANT_BIAS_GELU>();
+    test_FC_acc<bfloat16, amx::PP::Steps::DEQUANT_BIAS_GELU>();
     return 0;
 }
 
-template<typename T, amx_bf16::PP::Steps ppsteps>
+template<typename T, amx::PP::Steps ppsteps>
 void test_FC_perf() {
     amx_FC_perf<T, ppsteps>(2, 2560, 10752);
     amx_FC_perf<T, ppsteps>(22, 2560, 10752);
@@ -727,11 +727,11 @@ void test_FC_perf() {
 
 void test_perf() {
     precision = Matmul::Weight_BF16;
-    test_FC_perf<int8_t, amx_bf16::PP::Steps::DEQUANT>();
+    test_FC_perf<int8_t, amx::PP::Steps::DEQUANT>();
     precision = Matmul::Weight_BF16;
-    test_FC_perf<bfloat16, amx_bf16::PP::Steps::NONE>();
+    test_FC_perf<bfloat16, amx::PP::Steps::NONE>();
     precision = Matmul::Weight_INT8;
-    test_FC_perf<bfloat16, amx_bf16::PP::Steps::DEQUANT>();
+    test_FC_perf<bfloat16, amx::PP::Steps::DEQUANT>();
 }
 
 /*
@@ -765,8 +765,8 @@ void test_parallel_FC(int L, int M, int K, int N, int times = -5000) {
         }
         void run() {
             // post-ops do nothing
-            //amx_bf16::PP::Dummy ppkernel(C);
-            amx_bf16::PP::BiasGeluStore<bfloat16, amx_bf16::PP::Steps::BIAS_GELU> ppkernel(C, &Bias(0,0));
+            //amx::PP::Dummy ppkernel(C);
+            amx::PP::BiasGeluStore<bfloat16, amx::PP::Steps::BIAS_GELU> ppkernel(C, &Bias(0,0));
             (*mm.get())(A, B, 0, _N, ppkernel);
         }
     };
@@ -831,7 +831,7 @@ void test_parallel_FC() {
     }
 }
 
-using amx_bf16::PP::Steps;
+using amx::PP::Steps;
 
 //=====================================================================================================
 int main(int argc, const char *argv[]) {

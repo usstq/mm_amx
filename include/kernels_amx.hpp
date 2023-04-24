@@ -160,7 +160,7 @@ bool is_pointer_valid(void *p) {
 
 using ov::bfloat16;
 
-namespace amx_bf16 {
+namespace amx {
 
 // KpackedB is B matrix in block of 32x32 arranged in column-major
 // each 32x32 block is composed of 2 horizontal neighboring tiles
@@ -1338,7 +1338,7 @@ struct Matmul {
                 std::cout << "\t WANING: dynamic quantization of weight matrix for non-constB is time-consuming " << std::endl;
 
             float min, max;
-            amx_bf16::functional::get_min_max(_matB, min, max);
+            amx::functional::get_min_max(_matB, min, max);
             float q, dq;
             max = std::max(std::abs(max), std::abs(min));
             q = 127 / max;
@@ -1525,7 +1525,7 @@ struct Matmul<bfloat16, int8_t, float> {
                 std::cout << "\t WANING: dynamic quantization of weight matrix for non-constB is time-consuming " << std::endl;
             }
             float min, max;
-            amx_bf16::functional::get_min_max(_matB, min, max);
+            amx::functional::get_min_max(_matB, min, max);
             float q, dq;
             max = std::max(std::abs(max), std::abs(min));
             q = 127 / max;
@@ -1914,5 +1914,5 @@ void Matmul(tensor2D<bfloat16> & matA,
     // loop according to blk
 }
 #endif
-} // namespace amx_bf16
+} // namespace amx
 
