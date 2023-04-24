@@ -314,10 +314,10 @@ int amx_unit_test_gemAvB(int M, int K, int times = -1000) {
     int N = 1;
     tensor2D<bfloat16> A(M, K);
     tensor2D<bfloat16> B(1, K);
-    tensor2D<bfloat16> B0(K, 1);
+    tensor2D<bfloat16> B0(K, 1, true);  // compact
     tensor2D<bfloat16> C0(M, 1);
     tensor2D<bfloat16> C(1, M);
-    tensor2D<bfloat16> C2(M, 1, true);
+    tensor2D<bfloat16> C2(M, 1, true);  // compact
     amx_kernel::GemAvB gemAvB;
 
     amx_kernel::Matmul<bfloat16, bfloat16> mm(false, false);
