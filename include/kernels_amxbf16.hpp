@@ -785,28 +785,6 @@ namespace functional {
 //   tC10/tC11
 
 namespace PP {
-
-    // PP kernel has infinite combinations, the generation
-    // of specific PP kernel with high-efficiency means
-    // it should be combined in source code level and
-    // let compiler to optimize it. extra syntax sugar
-    // through more complex meta programing is not so
-    // worthy. hard code all combinations needed is not
-    // that difficult and it also ensures most efficient
-    // implementation.
-
-    // a helper callable for most frequenctly used pp kernels
-    template<bool support_deq>
-    struct Dequantizable {
-        float deq_scale;
-        bool do_deq = false;
-        void set_deq_scale(float scale = 1.0f) {
-            assert (support_deq);
-            deq_scale = scale;
-            do_deq = (deq_scale != 1.0f);
-        }
-    };
-
     template<class T>
     struct is_f32i32 : std::false_type {};
     template<>
@@ -814,135 +792,138 @@ namespace PP {
     template<>
     struct is_f32i32<int32_t> : std::true_type {};
 
-    struct Store2bf16 : Dequantizable<true> {
-        tensor2D<bfloat16> & C;
+    enum Steps {
+        NONE = 0,
+        DEQUANT = 1<<0,
+        BIAS = 1<<1,
+        GELU = 1<<2,
+        QUANT = 1<<3,
 
-        Store2bf16(tensor2D<bfloat16> & C) : C(C) {}
+        BIAS_GELU = BIAS | GELU,
+        DEQUANT_BIAS_GELU = DEQUANT | BIAS_GELU,
+        DEQUANT_BIAS_GELU_QUANT = DEQUANT_BIAS_GELU | QUANT
+    };
 
-        template<typename T, std::enable_if_t<is_f32i32<T>::value, bool> = true>
-        FORCE_INLINE void operator()(tensor2D<T> & buffC, int m, int n, int valid_m, int valid_n) {
-            // fast dynamic dispatch to polymorphic implementations
-            if (do_deq)
-                exec<true>(buffC, m, n, valid_m, valid_n);
-            else
-                exec<false>(buffC, m, n, valid_m, valid_n);
+    template<typename D, Steps steps>
+    struct BiasGeluStore {
+        // output type D can be bfloat16 or int8_t or float
+        static_assert(std::is_same<D, bfloat16>::value || std::is_same<D, int8_t>::value || std::is_same<D, float>::value,
+                      "BiasGeluStore only support bfloat16/int8_t/float output data types");
+
+        BiasGeluStore(tensor2D<D> & C, float * bias = nullptr) : C(C), bias(bias) {}
+
+        tensor2D<D> & C;
+        float * bias;
+        void set_bias(float * _bias) {
+            assert (steps & BIAS);
+            bias = _bias;
         }
 
-        template<bool deq, typename T, std::enable_if_t<is_f32i32<T>::value, bool> = true>
-        FORCE_INLINE void exec(tensor2D<T> & buffC, int m, int n, int valid_m, int valid_n) {
+        float deq_scale = 1.0f;
+        void set_deq_scale(float scale = 1.0f) {
+            assert (steps & DEQUANT);
+            deq_scale = scale;
+        }
+
+        float q_scale_common = 0.0f;
+        float * q_scale_per_oc = nullptr;
+        void set_q_scale(float scale) {
+            assert (steps & QUANT);
+            q_scale_common = scale;
+            q_scale_per_oc = nullptr;
+        }
+        void set_q_scale(float * scale_per_oc) {
+            assert (steps & QUANT);
+            q_scale_common = 0;
+            q_scale_per_oc = scale_per_oc;
+        }
+
+        // source buffC can be i32 or f32
+        template<typename T, std::enable_if_t<is_f32i32<T>::value, bool> = true>
+        FORCE_INLINE void operator()(tensor2D<T> & buffC, int m, int n, int valid_m, int valid_n) {
             auto * psrc = &buffC(0,0);
             int8_t * pdst = reinterpret_cast<int8_t*>(&(C(m, n)));
             int stride = C.stride;
-            __mmask32 k = _cvtu32_mask32(0xFFFFFFFF >> (32-valid_n));
-            auto m512_deq_scale = _mm512_set1_ps(deq_scale);
+
+            __m512 bias0, bias1;
+            if (steps & BIAS) {
+                bias0 = _mm512_loadu_ps(bias + n);
+                bias1 = _mm512_loadu_ps(bias + n + 16);
+            }
+
+            __m512  m512_q_scale0;
+            __m512  m512_q_scale1;
+            __m512  m512_deq_scale;
+            if (steps & DEQUANT) {
+                m512_deq_scale = _mm512_set1_ps(deq_scale);
+            }
+            if (steps & QUANT) {
+                if (q_scale_per_oc) {
+                    m512_q_scale0 = _mm512_loadu_ps(q_scale_per_oc + n);
+                    m512_q_scale1 = _mm512_loadu_ps(q_scale_per_oc + n + 16);
+                } else {
+                    m512_q_scale0 = _mm512_set1_ps(q_scale_common);
+                    m512_q_scale1 = _mm512_set1_ps(q_scale_common);
+                }
+            }
+
+            __mmask32 kall;
+            __mmask16 k0, k1;
+            if (std::is_same<D, float>::value) {
+                if (valid_n >= 16) {
+                    k0 = _cvtu32_mask16(0xFFFF);
+                    k1 = _cvtu32_mask16(0xFFFF >> (32-valid_n));
+                } else {
+                    k0 = _cvtu32_mask16(0xFFFF >> (16-valid_n));
+                    k1 = _cvtu32_mask16(0);
+                }
+            } else {
+                kall = _cvtu32_mask32(0xFFFFFFFF >> (32-valid_n));
+            }
+
             for(int i = 0; i < valid_m; i ++) {
                 auto r0 = _mm512_loadu_ps(psrc);
                 auto r1 = _mm512_loadu_ps(psrc + 16);
                 if (std::is_same<T, int32_t>::value) {
-                    r0 = _mm512_cvtepi32_ps(_mm512_castps_si512(r0));
-                    r1 = _mm512_cvtepi32_ps(_mm512_castps_si512(r1));
+                    r0 = _mm512_cvtepi32_ps(_mm512_castps_si512(r0));   // cvt i32=>f32
+                    r1 = _mm512_cvtepi32_ps(_mm512_castps_si512(r1));   // cvt i32=>f32
                 }
-                if (deq) {
+                if (steps & DEQUANT) {
                     r0 = _mm512_mul_ps(r0, m512_deq_scale);   // dequantize
                     r1 = _mm512_mul_ps(r1, m512_deq_scale);   // dequantize
                 }
-                auto c = _mm512_cvtne2ps_pbh(r1, r0);
-                _mm512_mask_storeu_epi16(pdst, k, c);   // 32 bf16
-                pdst += stride;
-                psrc += 32;
-                m++;
-            }
-        }
-    };
-
-    struct Addbias_Store2bf16 : Dequantizable<false> {
-        tensor2D<bfloat16> & C;
-        float * bias;
-        Addbias_Store2bf16(tensor2D<bfloat16> & C, float * bias) : C(C), bias(bias) {}
-
-        FORCE_INLINE void operator()(tensor2D<float> & buffC, int m, int n, int valid_m, int valid_n) {
-            auto * psrc = &buffC(0,0);
-            int8_t * pdst = reinterpret_cast<int8_t*>(&(C(m, n)));
-            int stride = C.stride;
-            auto bias0 = _mm512_loadu_ps(bias + n);
-            auto bias1 = _mm512_loadu_ps(bias + n + 16);
-            __mmask32 k = _cvtu32_mask32(0xFFFFFFFF >> (32-valid_n));
-            for(int i = 0; i < valid_m; i ++) {
-                auto r0 = _mm512_loadu_ps(psrc);
-                auto r1 = _mm512_loadu_ps(psrc + 16);
-                r0 = _mm512_add_ps(r0, bias0);          // add bias
-                r1 = _mm512_add_ps(r1, bias1);          // add bias
-                auto c = _mm512_cvtne2ps_pbh(r1, r0);   // cvt2 bf16
-                _mm512_mask_storeu_epi16(pdst, k, c);   // store 32 x bf16
-                pdst += stride;
-                psrc += 32;
-            }
-        }
-    };
-
-    struct Addbias_Gelu_Store2bf16 : Dequantizable<true> {
-        tensor2D<bfloat16> & C;
-        float * bias;
-
-        Addbias_Gelu_Store2bf16(tensor2D<bfloat16> & C, float * bias) : C(C), bias(bias) {}
-
-        FORCE_INLINE void operator()(tensor2D<float> & buffC, int m, int n, int valid_m, int valid_n) {
-            // fast dynamic dispatch to polymorphic implementations
-            if (do_deq)
-                exec<true>(buffC, m, n, valid_m, valid_n);
-            else
-                exec<false>(buffC, m, n, valid_m, valid_n);
-        }
-
-        template<bool deq>
-        FORCE_INLINE void exec(tensor2D<float> & buffC, int m, int n, int valid_m, int valid_n) {
-            auto * psrc = &buffC(0,0);
-            int8_t * pdst = reinterpret_cast<int8_t*>(&(C(m, n)));
-            int stride = C.stride;
-            auto bias0 = _mm512_loadu_ps(bias + n);
-            auto bias1 = _mm512_loadu_ps(bias + n + 16);
-            __mmask32 k = _cvtu32_mask32(0xFFFFFFFF >> (32-valid_n));
-            auto m512_deq_scale = _mm512_set1_ps(deq_scale);
-            for(int i = 0; i < valid_m; i ++) {
-                auto r0 = _mm512_loadu_ps(psrc);
-                auto r1 = _mm512_loadu_ps(psrc + 16);
-                if (deq) {
-                    r0 = _mm512_mul_ps(r0, m512_deq_scale);   // dequantize
-                    r1 = _mm512_mul_ps(r1, m512_deq_scale);   // dequantize
+                if (steps & BIAS) {
+                    r0 = _mm512_add_ps(r0, bias0);
+                    r1 = _mm512_add_ps(r1, bias1);
                 }
-                // add bias
-                r0 = _mm512_add_ps(r0, bias0);
-                r1 = _mm512_add_ps(r1, bias1);
-                r0 = functional::gelu_erf_minmax_approx(r0);
-                r1 = functional::gelu_erf_minmax_approx(r1);
-                // cvt2 bf16
-                auto c = _mm512_cvtne2ps_pbh(r1, r0);
-                //store
-                _mm512_mask_storeu_epi16(pdst, k, c);   // 32 bf16
-                pdst += stride;
-                psrc += 32;
-            }
-        }
-    };
+                if (steps & GELU) {
+                    r0 = functional::gelu_erf_minmax_approx(r0);
+                    r1 = functional::gelu_erf_minmax_approx(r1);
+                }
 
-    struct Store2float : Dequantizable<false> {
-        tensor2D<float> & C;
-        Store2float(tensor2D<float> & C) : C(C) {}
-        FORCE_INLINE void operator()(tensor2D<float> & buffC, int m, int n, int valid_m, int valid_n) {
-            auto * psrc = &buffC(0,0);
-            int8_t * pdst = reinterpret_cast<int8_t*>(&(C(m, n)));
-            int stride = C.stride;
-            uint32_t mask = 0xFFFFFFFF >> (32-valid_n);
-            __mmask32 k0 = _cvtu32_mask32(mask & 0xFFFF);
-            __mmask32 k1 = _cvtu32_mask32(mask >> 16);
-            for(int i = 0; i < valid_m; i ++) {
-                auto r0 = _mm512_loadu_ps(psrc);
-                auto r1 = _mm512_loadu_ps(psrc + 16);
-                _mm512_mask_storeu_ps(pdst, k0, r0);
-                _mm512_mask_storeu_ps(pdst + 64, k1, r1);
+                // quantize & store
+                if (steps & QUANT) {
+                    r0 = _mm512_mul_ps(r0, m512_q_scale0);
+                    r1 = _mm512_mul_ps(r1, m512_q_scale1);
+                }
+                if (std::is_same<D, bfloat16>::value) {
+                    auto c = _mm512_cvtne2ps_pbh(r1, r0);   // convert to bf16
+                    _mm512_mask_storeu_epi16(pdst, kall, c);   // store bf16
+                }
+                if (std::is_same<D, int8_t>::value) {
+                    auto d0 = _mm512_cvtps_epi32(r0);       // convert to dword(i32)
+                    auto d1 = _mm512_cvtps_epi32(r1);       // convert to dword(i32)
+                    auto b0 = _mm512_cvtsepi32_epi8 (d0);   // dword => int8 with Saturate8
+                    auto b1 = _mm512_cvtsepi32_epi8 (d1);   // dword => int8 with Saturate8
+                    auto b0b1 = _mm256_inserti32x4(_mm256_castsi128_si256(b0), b1, 1); // combine two int8 xmm into a ymm
+                    _mm256_mask_storeu_epi8(pdst, kall, b0b1); // masked store
+                }
+                if (std::is_same<D, float>::value) {
+                    _mm512_mask_storeu_ps(pdst, k0, r0);        // store float
+                    _mm512_mask_storeu_ps(pdst + 64, k1, r1);   // store float
+                }
                 pdst += stride;
                 psrc += 32;
-                m++;
             }
         }
     };
