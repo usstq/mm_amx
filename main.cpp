@@ -313,53 +313,62 @@ void amx_Matmul_perf(int M, int K, int N, bool transB, int times = -1000) {
 int amx_unit_test_gemAvB(int M, int K, int times = -1000) {
     int N = 1;
     tensor2D<bfloat16> A(M, K);
-    tensor2D<bfloat16> B(1, K);
-    tensor2D<bfloat16> B0(K, 1, true);  // compact
-    tensor2D<bfloat16> C0(M, 1);
-    tensor2D<bfloat16> C(1, M);
-    tensor2D<bfloat16> C2(M, 1, true);  // compact
-    amx_kernel::GemAvB gemAvB;
+    tensor2D<bfloat16> B(K, 1, true);
+    tensor2D<float> C0(M, 1, true);    // reference result
+    tensor2D<float> C1(M, 1, true);    // actual result
 
+    amx_kernel::GemAvB gemAvB;
     amx_kernel::Matmul<bfloat16, bfloat16> mm(false, false);
-    amx_kernel::PP::BiasGeluStore<bfloat16, amx_kernel::PP::Steps::NONE> pp(C2);
+    amx_kernel::PP::BiasGeluStore<float, amx_kernel::PP::Steps::NONE> pp(C1);
+    amx_kernel::MatmulVector<bfloat16, bfloat16> matxvec;
 
     // same B, different layout
     std::cout << __func__ << " [" << M << "," << K << "," << N << "] ";
-    B0 = B;
     C0 = 0;
-    matmul(A, B0, C0);
-    auto C0Tr = C0.Tr();
-    gemAvB(A, &B(0,0), &C(0,0));
-    if (C0Tr == C) {
+    matmul(A, B, C0);
+
+    gemAvB(A, &B[0], &C1[0]);
+    if (C0 == C1) {
         std::cout << ANSIcolor("1;32") << "Match!\n" << ANSIcolor();
     } else {
-        std::cout << C0Tr << std::endl;
-        std::cout << C << std::endl;
+        std::cout << C0 << std::endl;
+        std::cout << C1 << std::endl;
         std::cout << ANSIcolor("1;31") << "Mismatch!\n" << ANSIcolor();
         return 1;
     }
 
-    mm(A, B0, 0, N, pp);
-    if (C0 == C2) {
+    mm(A, B, 0, N, pp);
+    if (C0 == C1) {
         std::cout << ANSIcolor("1;32") << "Match2!\n" << ANSIcolor();
     } else {
-        std::cout << C0Tr << std::endl;
-        std::cout << C << std::endl;
+        std::cout << C0 << std::endl;
+        std::cout << C1 << std::endl;
         std::cout << ANSIcolor("1;31") << "Mismatch2!\n" << ANSIcolor();
         return 1;
     }
 
+    matxvec(A, &B[0], &C1[0]);
+    if (C0 == C1) {
+        std::cout << ANSIcolor("1;32") << "Match3!\n" << ANSIcolor();
+    } else {
+        std::cout << C0 << std::endl;
+        std::cout << C1 << std::endl;
+        std::cout << ANSIcolor("1;31") << "Mismatch3!\n" << ANSIcolor();
+        return 1;
+    }
+
     timer.tag(__func__, M, K, N, "gemAvB")(times, [&](){
-        gemAvB(A, &B(0,0), &C(0,0));
-    },
-    double(M * N) * K * 2,
-    256 * 3e9);
+        gemAvB(A, &B[0], &C1[0]);
+    });
 
     timer.tag(__func__, M, K, N, "mm")(times, [&](){
-        mm(A, B0, 0, 1, pp);
-    },
-    double(M * N) * K * 2,
-    256 * 3e9);
+        mm(A, B, 0, 1, pp);
+    });
+
+    timer.tag(__func__, M, K, N, "matxvec")(times, [&](){
+        matxvec(A, &B[0], &C1[0]);
+    });
+
     return 0;
 }
 

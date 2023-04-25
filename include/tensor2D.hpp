@@ -25,17 +25,14 @@ static inline bool isfinite2(float a)  { return load_ieee754_rep(a) << 1  < inf_
 
 template<typename T>
 struct tensor2D {
-    int dims[2];
+    int dims[2] = {0};
     std::shared_ptr<T> data;
-    int64_t capacity;
-    int stride;
-    bool force_compact;
-    int padded_dim1;
-    tensor2D() {
-        dims[0] = 0;
-        dims[1] = 0;
-        capacity = 0;
-    }
+    int64_t capacity = 0;
+    int stride = 0;
+    bool force_compact = false;
+    int padded_dim1 = 0;
+
+    tensor2D() = default;
 
     operator bool() {
         return dims[0] * dims[1] > 0;
@@ -135,7 +132,8 @@ struct tensor2D {
     void fill_rnd() {
         auto * p = data.get();
         int i = 0;
-        for(i = 0; i<dims[0]*padded_dim1; i+=8) {
+        int total = dims[0]*padded_dim1;
+        for(i = 0; i + 8 <= total; i+=8) {
             // lower mantissa can help to avoid small errors in accuracy comparison
             auto num = rand() & 0x07;
             p[i] = (num & 1) - 0.5f; num>>=1;
@@ -147,7 +145,7 @@ struct tensor2D {
             p[i+6] = (num & 1) - 0.5f; num>>=1;
             p[i+7] = (num & 1) - 0.5f; num>>=1;
         }
-        for(i = 0; i<dims[0]*padded_dim1; i++) {
+        for(; i<total; i++) {
             auto num = rand();
             p[i] = (num & 1) - 0.5f;
         }
@@ -278,9 +276,10 @@ struct tensor2D {
 
 using func_act = std::function<float(float)>;
 
+template<typename TC>
 void matmul(tensor2D<ov::bfloat16> & A,
             tensor2D<ov::bfloat16> & B,
-            tensor2D<ov::bfloat16> & C,
+            tensor2D<TC> & C,
             float * bias = nullptr,
             func_act act = func_act()) {
     int M = C.dims[0];
@@ -310,6 +309,7 @@ void matmul(tensor2D<ov::bfloat16> & A,
             if (act) {
                 sum = act(sum);
             }
+            //std::cout << m << "," << n << std::endl;
             C(m,n) = sum;
         }
     }
@@ -342,9 +342,10 @@ void matmul(tensor2D<float> & A,
     }
 }
 
+template<typename TC>
 void matmul(tensor2D<int8_t> & A,
             tensor2D<int8_t> & B,
-            tensor2D<ov::bfloat16> & C,
+            tensor2D<TC> & C,
             float * bias = nullptr,
             func_act act = func_act()) {
     int M = C.dims[0];

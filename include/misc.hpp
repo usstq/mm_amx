@@ -167,6 +167,15 @@ inline void tshow() {
     }
 }
 
+template<typename T0, typename T1>
+std::vector<std::pair<T0, T1>> zip_vector(const std::vector<T0> & v0, const std::vector<T1> & v1) {
+    std::vector<std::pair<T0, T1>> ret;
+    auto sz = v0.size();
+    for(decltype(sz) i=0; i<sz; i++)
+        ret.push_back(std::make_pair(v0[i], v1[i]));
+    return ret;
+}
+
 struct tileconfig_t {
     uint8_t palette_id;
     uint8_t startRow;
@@ -174,25 +183,30 @@ struct tileconfig_t {
     uint16_t cols[16];
     uint8_t rows[16];
     tileconfig_t() = default;
-    tileconfig_t(int palette, int _startRow, const std::vector<int> &_rows, int columnsBytes) {
+
+    tileconfig_t(int palette, int _startRow, const std::vector<std::pair<int, int>> &_rows_columnsBytes) {
         palette_id = palette;
         startRow = _startRow;
-        for(int i = 0; i < 14; i++) {
+        int i;
+        for(i = 0; i < 14; i++) {
             reserved[i] = 0;
         }
-        for(int i = 0; i < _rows.size(); i++) {
-            cols[i] = columnsBytes;
-            rows[i] = _rows[i];
+        for(i = 0; i < _rows_columnsBytes.size(); i++) {
+            rows[i] = _rows_columnsBytes[i].first;
+            cols[i] = _rows_columnsBytes[i].second;
         }
-        for(int i = _rows.size(); i < 16; i++) {
+        for(; i < 16; i++) {
             cols[i] = 0;
             rows[i] = 0;
         }
         load();        
     }
 
+    tileconfig_t(int palette, int _startRow, const std::vector<int> &_rows, int columnsBytes):
+        tileconfig_t(palette, _startRow, zip_vector(_rows, std::vector<int>(_rows.size(), columnsBytes))) {
+        }
     tileconfig_t(int palette, int _startRow, int numTiles, int _rows, int columnsBytes) :
-        tileconfig_t(palette, _startRow, std::vector<int>(numTiles, _rows), columnsBytes) {
+        tileconfig_t(palette, _startRow, std::vector<std::pair<int, int>>(numTiles, {_rows, columnsBytes})) {
     }
 
     ~tileconfig_t() {

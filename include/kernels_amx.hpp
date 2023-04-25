@@ -946,6 +946,144 @@ struct acc_type <int8_t> { typedef int32_t type; };
 template<>
 struct acc_type <uint8_t> { typedef int32_t type; };
 
+// matrix multiply with vector
+// C_Nx1 = A_MxK * b_Kx1
+
+template<typename TA, typename TB, typename TC = typename acc_type<TA>::type>
+struct MatmulVector {
+    MatmulVector() {}
+    constexpr static bool is_bf16s8 = std::is_same<TA,ov::bfloat16>::value && std::is_same<TB,int8_t>::value;
+    constexpr static bool is_bf16bf16 = std::is_same<TA,ov::bfloat16>::value && std::is_same<TB,ov::bfloat16>::value;
+    constexpr static bool is_s8s8 = std::is_same<TA,int8_t>::value && std::is_same<TB,int8_t>::value;
+    constexpr static bool is_s8u8 = std::is_same<TA,int8_t>::value && std::is_same<TB,uint8_t>::value;
+    constexpr static bool is_u8s8 = std::is_same<TA,uint8_t>::value && std::is_same<TB,int8_t>::value;
+    constexpr static bool is_u8u8 = std::is_same<TA,uint8_t>::value && std::is_same<TB,uint8_t>::value;
+    constexpr static bool is_i8_mode = is_s8s8 || is_s8u8 || is_u8s8 || is_u8u8;
+    constexpr static int kStep = is_i8_mode ? 64 : 32;
+
+#define TILE_DP(dst, a, b) \
+    if (is_bf16bf16) _tile_dpbf16ps(dst, a, b); \
+    if (is_s8s8) _tile_dpbssd(dst, a, b); \
+    if (is_s8u8) _tile_dpbsud(dst, a, b); \
+    if (is_u8s8) _tile_dpbusd(dst, a, b); \
+    if (is_u8u8) _tile_dpbuud(dst, a, b);
+
+    template<int tmmN>
+    void kernel(int M, const void * pA, int strideA, const void * vB, void * vC) {
+        const auto * pA0 = reinterpret_cast<const int8_t*>(pA);
+        const auto * pB0 = reinterpret_cast<const int8_t*>(vB);
+        auto * pC0 = reinterpret_cast<int8_t*>(vC);
+        // load B tiles outside of loop
+        if (tmmN > 0) _tile_loadd(2, pB0, 4); pB0 += 16*4;
+        if (tmmN > 1) _tile_loadd(3, pB0, 4); pB0 += 16*4;
+        if (tmmN > 2) _tile_loadd(4, pB0, 4); pB0 += 16*4;
+        if (tmmN > 3) _tile_loadd(5, pB0, 4); pB0 += 16*4;
+        if (tmmN > 4) _tile_loadd(6, pB0, 4); pB0 += 16*4;
+        if (tmmN > 5) _tile_loadd(7, pB0, 4); pB0 += 16*4;
+        //asm("int3");
+        for(int m = 0; m < M; m+=16) {
+            auto * pA = pA0;
+            zero_tiles<0>();
+            if (tmmN > 0) {
+                _tile_loadd(1, pA, strideA); pA += 64;
+                TILE_DP(0, 1, 2);
+            }
+            if (tmmN > 1) {
+                _tile_loadd(1, pA, strideA); pA += 64;
+                TILE_DP(0, 1, 3);
+            }
+            if (tmmN > 2) {
+                _tile_loadd(1, pA, strideA); pA += 64;
+                TILE_DP(0, 1, 4);
+            }
+            if (tmmN > 3) {
+                _tile_loadd(1, pA, strideA); pA += 64;
+                TILE_DP(0, 1, 5);
+            }
+            if (tmmN > 4) {
+                _tile_loadd(1, pA, strideA); pA += 64;
+                TILE_DP(0, 1, 6);
+            }
+            if (tmmN > 5) {
+                _tile_loadd(1, pA, strideA); pA += 64;
+                TILE_DP(0, 1, 7);
+            }
+            _tile_stored(0, pC0, 4); pC0 += 16*4;   // C is single column, always take 4 bytes
+            pA0 += 16 * strideA;
+        }
+    }
+
+    alignas(64) int8_t Kbuff[64*6];
+
+    void operator()(tensor2D<TA> & matA, const TB * vB, TC * vC) {
+        int M = matA.dims[0];
+        int K = matA.dims[1];
+        TA * pA = &matA[0];
+        int strideA = matA.stride;
+
+        // M tails is handled
+        assert(K <= 6*kStep);
+
+        int Ktail = K % kStep;
+        if (Ktail) {
+            // K tails is handled by zero-padding B matrix, matA may be accessed over the end
+            memset(Kbuff, 0, sizeof(Kbuff));
+            memcpy(Kbuff, vB, K*sizeof(TB));
+            vB = reinterpret_cast<TB*>(Kbuff);
+        }
+
+        int Mtail = M % 16;
+        int Mbody = M - Mtail;
+        int numBtiles = (K + kStep - 1)/kStep;
+        if (Mbody) {
+            tileconfig_t tfg(1, 0, {
+                {16, 4},  // C:0   M x 1     (4b)
+                {16, 64}, // A:1   M x 32/64 (64b)
+                {16, 4}, // B:2   32/64 x 1 (4b)
+                {16, 4}, // B:3
+                {16, 4}, // B:4
+                {16, 4}, // B:5
+                {16, 4}, // B:6
+                {16, 4}, // B:7
+            });
+            switch(numBtiles) {
+                case 1: kernel<1>(Mbody, pA, strideA, vB, vC); break;
+                case 2: kernel<2>(Mbody, pA, strideA, vB, vC); break;
+                case 3: kernel<3>(Mbody, pA, strideA, vB, vC); break;
+                case 4: kernel<4>(Mbody, pA, strideA, vB, vC); break;
+                case 5: kernel<5>(Mbody, pA, strideA, vB, vC); break;
+                case 6: kernel<6>(Mbody, pA, strideA, vB, vC); break;
+                default:
+                    assert(false); // impossible since (K <= 6*kStep)
+            }
+        }
+
+        if (Mtail) {
+            pA = &matA(Mbody, 0);
+            tileconfig_t tfg(1, 0, {
+                {Mtail, 4},   // C:0   M x 1     (4b)
+                {Mtail, 64},  // A:1   M x 32/64 (64b)
+                {16, 4}, // B:2   32/64 x 1 (4b)
+                {16, 4}, // B:3
+                {16, 4}, // B:4
+                {16, 4}, // B:5
+                {16, 4}, // B:6
+                {16, 4}, // B:7
+            });
+            switch(numBtiles) {
+                case 1: kernel<1>(Mtail, pA, strideA, vB, vC + Mbody); break;
+                case 2: kernel<2>(Mtail, pA, strideA, vB, vC + Mbody); break;
+                case 3: kernel<3>(Mtail, pA, strideA, vB, vC + Mbody); break;
+                case 4: kernel<4>(Mtail, pA, strideA, vB, vC + Mbody); break;
+                case 5: kernel<5>(Mtail, pA, strideA, vB, vC + Mbody); break;
+                case 6: kernel<6>(Mtail, pA, strideA, vB, vC + Mbody); break;
+                default:
+                    assert(false); // impossible since (K <= 6*kStep)
+            }
+        }
+    }
+};
+
 template<typename TA, typename TB, typename TC = typename acc_type<TA>::type>
 struct Matmul {
     // B matrix is orgnized as tensor2D of shape axb where a=round_up_div(N, 32), b=round_up(K,32/64)*32
@@ -1537,7 +1675,7 @@ struct GemAvB {
 
     void operator()(tensor2D<ov::bfloat16> & matA,
                     ov::bfloat16 * vecB,
-                    ov::bfloat16 * vecC) {
+                    float * vecC) {
         int M = matA.dims[0];
         int K = matA.dims[1];
 
@@ -1555,6 +1693,10 @@ struct GemAvB {
             auto * pBi32 = reinterpret_cast<int32_t*>(vecB);
             __m512 regC0 = _mm512_setzero();
             __m512 regC1 = _mm512_setzero();
+            __mmask16 kmask = _cvtu32_mask16(0xFFFF);
+            if (M-m < 16) {
+                kmask = _cvtu32_mask16(0xFFFF >> (16-(M-m)));
+            }
             for(int k = 0; k < K; k += 32, pA += 64, pBi32 += 16) {
                 // handle Ab: 16x32
                 // transposed in register as 16x16x2
@@ -1603,8 +1745,9 @@ struct GemAvB {
                 regC1 = _mm512_dpbf16_ps(regC1, rf, _mm512_set1_epi32(pBi32[15]));
             }
             regC0 = _mm512_add_ps(regC0, regC1);
-            auto regOut = _mm512_cvtne2ps_pbh(regC0, regC0); // only 16 ov::bfloat16 results in lower 256bits 
-            _mm256_storeu_si256(reinterpret_cast<__m256i_u *>(vecC + m), _mm512_extracti64x4_epi64(regOut, 0));
+            _mm512_mask_storeu_ps (vecC + m, kmask, regC0);
+            //auto regOut = _mm512_cvtne2ps_pbh(regC0, regC0); // only 16 ov::bfloat16 results in lower 256bits 
+            //_mm256_storeu_si256(reinterpret_cast<__m256i_u *>(vecC + m), _mm512_extracti64x4_epi64(regOut, 0));
         }
     }
 };
