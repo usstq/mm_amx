@@ -237,16 +237,17 @@ void amx_FC_acc(int M, int K, int N) {
     tensor2D<T> A(M, K);
     tensor2D<T> B(K, N);
     tensor2D<T> BT = B.Tr();
-    tensor2D<bfloat16> C(M, N);
-    tensor2D<bfloat16> C0(M, N);
+    tensor2D<float> C(M, N);
+    tensor2D<float> C0(M, N);
     Matmul fc(true, false, precision);
     Matmul fcTr(true, true, precision);
-    amx_kernel::PP::BiasGeluStore<bfloat16, ppsteps> pp(C);
+    amx_kernel::PP::BiasGeluStore<float, ppsteps> pp(C);
     std::stringstream ss;
-    fc(A, B, pp);
+    std::cout << __func__ << "<" << TypeName<T>::get() << "," << ppsteps << ">(" << M << "," << K << "," << N << ")" << "  prec=" << precision << ";";
     C0=0;
     matmul(A, B, C0);
-    std::cout << __func__ << " [" << M << "," << K << "," << N << "," << TypeName<T>::get() << "(" << precision << ")] ";
+
+    fc(A, B, pp);
     if (C0 == C) {
         ss << ANSIcolor("1;32") << "no_trans: Match!     " << ANSIcolor();
     } else {
@@ -254,7 +255,7 @@ void amx_FC_acc(int M, int K, int N) {
         //std::cout << C0 << std::endl;
         //std::cout << C << std::endl;
     }
-    C = 0;
+
     fcTr(A, BT, pp);
     if (C0 == C) {
         ss << ANSIcolor("1;32") << "trans:  Match!" << ANSIcolor();
@@ -877,8 +878,7 @@ int main(int argc, const char *argv[]) {
     std::cout << ANSIcolor("31") << "omp_get_num_threads() = " << omp_get_num_threads() << std::endl << ANSIcolor();
     std::cout << ANSIcolor("31") << "OMP_NT = " << OMP_NT << std::endl << ANSIcolor();
 
-    //test_acc();    test_perf();    return 0;
-    return amx_unit_test_gemAvB(901, 80);
+    amx_unit_test_gemAvB(901, 80); test_acc();    test_perf();    return 0; 
 
     precision = Matmul::Weight_BF16;
     amx_MatmulMT_perf<bfloat16, Steps::BIAS_GELU>(2, 2560, 10752, false, -1000);

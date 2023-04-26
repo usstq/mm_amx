@@ -261,6 +261,17 @@ struct TypeName<int8_t>{
     static const char* get(){return "int8_t";}
 };
 
+std::ostream & logger() {
+    //https://stackoverflow.com/questions/11826554/standard-no-op-output-stream
+    static class NullBuffer : public std::streambuf {
+    public:
+        int overflow(int c) { return c; }
+    } null_buffer;
+    static std::ostream null_stream(&null_buffer);
+    static int log_level = std::getenv("LOGL") ? atoi(std::getenv("LOGL")) : 0;
+    return log_level == 0 ? null_stream : std::cout;
+}
+
 #ifdef ENABLE_NUMA
 static auto USE_NUMA = readenv("USE_NUMA");
 #endif

@@ -81,7 +81,7 @@ struct tensor2D {
         stride = d1 * sizeof(T);
         if ((stride % 64) && (!force_compact)) {
             auto stride_fix = rndup(stride, 64);
-            std::cout << "\tWarnning: stride " << stride << " is not aligned to cache line, will increase to " << stride_fix
+            logger() << "\tWarnning: stride " << stride << " is not aligned to cache line, will increase to " << stride_fix
                       << " (" << stride_fix/64 << " cache lines)\n";
             stride = stride_fix;
         }
@@ -133,21 +133,24 @@ struct tensor2D {
         auto * p = data.get();
         int i = 0;
         int total = dims[0]*padded_dim1;
+        // +1 -1 for integer types
+        // 0.5 -0.5 for float point 
+        float scale = std::is_integral<T>::value ? 2:1;
         for(i = 0; i + 8 <= total; i+=8) {
             // lower mantissa can help to avoid small errors in accuracy comparison
-            auto num = rand() & 0x07;
-            p[i] = (num & 1) - 0.5f; num>>=1;
-            p[i+1] = (num & 1) - 0.5f; num>>=1;
-            p[i+2] = (num & 1) - 0.5f; num>>=1;
-            p[i+3] = (num & 1) - 0.5f; num>>=1;
-            p[i+4] = (num & 1) - 0.5f; num>>=1;
-            p[i+5] = (num & 1) - 0.5f; num>>=1;
-            p[i+6] = (num & 1) - 0.5f; num>>=1;
-            p[i+7] = (num & 1) - 0.5f; num>>=1;
+            auto num = rand() & 0xFF;
+            p[i]   = scale*((num & 1) - 0.5f); num>>=1;
+            p[i+1] = scale*((num & 1) - 0.5f); num>>=1;
+            p[i+2] = scale*((num & 1) - 0.5f); num>>=1;
+            p[i+3] = scale*((num & 1) - 0.5f); num>>=1;
+            p[i+4] = scale*((num & 1) - 0.5f); num>>=1;
+            p[i+5] = scale*((num & 1) - 0.5f); num>>=1;
+            p[i+6] = scale*((num & 1) - 0.5f); num>>=1;
+            p[i+7] = scale*((num & 1) - 0.5f); num>>=1;
         }
         for(; i<total; i++) {
             auto num = rand();
-            p[i] = (num & 1) - 0.5f;
+            p[i] = scale*((num & 1) - 0.5f);
         }
     }
 

@@ -348,28 +348,28 @@ namespace functional {
     }
 
     // 16xN, N<=16, non-valid part is filled with zeros
-    inline void transpose_epi32_16xN(void * _dst, const void * src, int stride, int valid_n) {
+    void transpose_epi32_16xN(void * _dst, const void * src, int stride, int valid_bytes) {
         auto * dst = reinterpret_cast<uint32_t*>(_dst);
         __m512i r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, ra, rb, rc, rd, re, rf;
         auto * pA = reinterpret_cast<const uint8_t*>(src);
-        uint32_t mask_value = 0xFFFFFFFF >> (32-valid_n);
-        __mmask32 mask = _cvtu32_mask32(mask_value);
-        r0 = _mm512_maskz_loadu_epi16 (mask, pA);
-        r1 = _mm512_maskz_loadu_epi16 (mask, pA + stride);
-        r2 = _mm512_maskz_loadu_epi16 (mask, pA + 2*stride);
-        r3 = _mm512_maskz_loadu_epi16 (mask, pA + 3*stride);
-        r4 = _mm512_maskz_loadu_epi16 (mask, pA + 4*stride);
-        r5 = _mm512_maskz_loadu_epi16 (mask, pA + 5*stride);
-        r6 = _mm512_maskz_loadu_epi16 (mask, pA + 6*stride);
-        r7 = _mm512_maskz_loadu_epi16 (mask, pA + 7*stride);
-        r8 = _mm512_maskz_loadu_epi16 (mask, pA + 8*stride);
-        r9 = _mm512_maskz_loadu_epi16 (mask, pA + 9*stride);
-        ra = _mm512_maskz_loadu_epi16 (mask, pA + 10*stride);
-        rb = _mm512_maskz_loadu_epi16 (mask, pA + 11*stride);
-        rc = _mm512_maskz_loadu_epi16 (mask, pA + 12*stride);
-        rd = _mm512_maskz_loadu_epi16 (mask, pA + 13*stride);
-        re = _mm512_maskz_loadu_epi16 (mask, pA + 14*stride);
-        rf = _mm512_maskz_loadu_epi16 (mask, pA + 15*stride);
+        uint64_t mask_value = 0xFFFFFFFFFFFFFFFF >> (64 - valid_bytes);
+        __mmask64 mask = _cvtu64_mask64(mask_value);
+        r0 = _mm512_maskz_loadu_epi8 (mask, pA);
+        r1 = _mm512_maskz_loadu_epi8 (mask, pA + stride);
+        r2 = _mm512_maskz_loadu_epi8 (mask, pA + 2*stride);
+        r3 = _mm512_maskz_loadu_epi8 (mask, pA + 3*stride);
+        r4 = _mm512_maskz_loadu_epi8 (mask, pA + 4*stride);
+        r5 = _mm512_maskz_loadu_epi8 (mask, pA + 5*stride);
+        r6 = _mm512_maskz_loadu_epi8 (mask, pA + 6*stride);
+        r7 = _mm512_maskz_loadu_epi8 (mask, pA + 7*stride);
+        r8 = _mm512_maskz_loadu_epi8 (mask, pA + 8*stride);
+        r9 = _mm512_maskz_loadu_epi8 (mask, pA + 9*stride);
+        ra = _mm512_maskz_loadu_epi8 (mask, pA + 10*stride);
+        rb = _mm512_maskz_loadu_epi8 (mask, pA + 11*stride);
+        rc = _mm512_maskz_loadu_epi8 (mask, pA + 12*stride);
+        rd = _mm512_maskz_loadu_epi8 (mask, pA + 13*stride);
+        re = _mm512_maskz_loadu_epi8 (mask, pA + 14*stride);
+        rf = _mm512_maskz_loadu_epi8 (mask, pA + 15*stride);
         transpose_m512i_16x16(r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, ra, rb, rc, rd, re, rf);
         _mm512_storeu_epi32(dst, r0);
         _mm512_storeu_epi32(dst + 16, r1);
@@ -599,9 +599,9 @@ namespace functional {
                         dst += (16*32);
                     }
                     if (k < K) {
-                        functional::transpose_epi32_16xN(dst, src0, matB.stride, K-k);
+                        functional::transpose_epi32_16xN(dst, src0, matB.stride, (K-k)*2);
                         dst += (16*32);
-                        functional::transpose_epi32_16xN(dst, src1, matB.stride, K-k);
+                        functional::transpose_epi32_16xN(dst, src1, matB.stride, (K-k)*2);
                         dst += (16*32);
                     }
                 }
@@ -684,9 +684,8 @@ namespace PP {
 
     template<typename D, Steps steps>
     struct BiasGeluStore {
-        // output type D can be ov::bfloat16 or int8_t or float
         static_assert(std::is_same<D, ov::bfloat16>::value || std::is_same<D, int8_t>::value || std::is_same<D, float>::value,
-                      "BiasGeluStore only support ov::bfloat16/int8_t/float output data types");
+                      "BiasGeluStore only support output data types ov::bfloat16/int8_t/float");
 
         BiasGeluStore(tensor2D<D> & C, float * bias = nullptr) : C(C), bias(bias) {}
 
@@ -915,9 +914,9 @@ tensor2D<T> repackB_1x2(const tensor2D<T> &Bi, bool transpose) {
                 dst += 1024;
             }
             if (k < K) {
-                functional::transpose_epi32_16xN(dst, src0 + 0*16*Bi.stride + k*sizeof(T), Bi.stride, K-k);
+                functional::transpose_epi32_16xN(dst, src0 + 0*16*Bi.stride + k*sizeof(T), Bi.stride, (K-k)*sizeof(T));
                 dst += 1024;
-                functional::transpose_epi32_16xN(dst, src0 + 1*16*Bi.stride + k*sizeof(T), Bi.stride, K-k);
+                functional::transpose_epi32_16xN(dst, src0 + 1*16*Bi.stride + k*sizeof(T), Bi.stride, (K-k)*sizeof(T));
                 dst += 1024;
             }
         }
@@ -946,10 +945,13 @@ struct acc_type <int8_t> { typedef int32_t type; };
 template<>
 struct acc_type <uint8_t> { typedef int32_t type; };
 
+template<class T>
+using acc_type_t = typename acc_type<T>::type;
+
 // matrix multiply with vector
 // C_Nx1 = A_MxK * b_Kx1
 
-template<typename TA, typename TB, typename TC = typename acc_type<TA>::type>
+template<typename TA, typename TB, typename TC = acc_type_t<TA>>
 struct MatmulVector {
     MatmulVector() {}
     constexpr static bool is_bf16s8 = std::is_same<TA,ov::bfloat16>::value && std::is_same<TB,int8_t>::value;
@@ -1754,3 +1756,17 @@ struct GemAvB {
 
 } // namespace amx
 
+std::ostream & operator<<(std::ostream & os, const amx_kernel::PP::Steps & steps) {
+    os << "amx_kernel::PP::Steps::";
+    if (steps == amx_kernel::PP::Steps::NONE)
+        os << "NONE";
+    if (steps & amx_kernel::PP::Steps::DEQUANT)
+        os << "_DEQUANT";
+    if (steps & amx_kernel::PP::Steps::BIAS)
+        os << "_BIAS";
+    if (steps & amx_kernel::PP::Steps::GELU)
+        os << "_GELU";
+    if (steps & amx_kernel::PP::Steps::QUANT)
+        os << "_QUANT";
+    return os;
+}
