@@ -234,7 +234,7 @@ int amx_unit_test_perf() {
 
 template<typename T, amx_kernel::PP::Steps ppsteps>
 void amx_FC_acc(int M, int K, int N) {
-    tensor2D<T> A(M, K);
+    tensor2D<T> A(M, K, true);
     tensor2D<T> B(K, N);
     tensor2D<T> BT = B.Tr();
     tensor2D<float> C(M, N);
@@ -242,29 +242,28 @@ void amx_FC_acc(int M, int K, int N) {
     Matmul fc(true, false, precision);
     Matmul fcTr(true, true, precision);
     amx_kernel::PP::BiasGeluStore<float, ppsteps> pp(C);
-    std::stringstream ss;
     std::cout << __func__ << "<" << TypeName<T>::get() << "," << ppsteps << ">(" << M << "," << K << "," << N << ")" << "  prec=" << precision << ";";
     C0=0;
     matmul(A, B, C0);
 
     fc(A, B, pp);
     if (C0 == C) {
-        ss << ANSIcolor("1;32") << "no_trans: Match!     " << ANSIcolor();
+        std::cout << ANSIcolor("1;32") << "no_trans: Match!     " << ANSIcolor();
     } else {
-        ss << ANSIcolor("1;31") << "no_trans: Mismatch!  " << ANSIcolor();
+        std::cout << ANSIcolor("1;31") << "no_trans: Mismatch!  " << ANSIcolor();
         //std::cout << C0 << std::endl;
         //std::cout << C << std::endl;
     }
 
     fcTr(A, BT, pp);
     if (C0 == C) {
-        ss << ANSIcolor("1;32") << "trans:  Match!" << ANSIcolor();
+        std::cout << ANSIcolor("1;32") << "trans:  Match!" << ANSIcolor();
     } else {
-        ss << ANSIcolor("1;31") << "trans:  Mismatch!" << ANSIcolor();
+        std::cout << ANSIcolor("1;31") << "trans:  Mismatch!" << ANSIcolor();
         //std::cout << C0 << std::endl;
         //std::cout << C << std::endl;
     }
-    std::cout << ss.str() << std::endl;
+    std::cout << std::endl;
 }
 
 template<typename T, amx_kernel::PP::Steps ppsteps>
@@ -335,7 +334,6 @@ int amx_unit_test_gemAvB(int M, int K, int times = -1000) {
         std::cout << C0 << std::endl;
         std::cout << C1 << std::endl;
         std::cout << ANSIcolor("1;31") << "Mismatch!\n" << ANSIcolor();
-        return 1;
     }
 
     mm(A, B, 0, N, pp);
@@ -345,7 +343,6 @@ int amx_unit_test_gemAvB(int M, int K, int times = -1000) {
         std::cout << C0 << std::endl;
         std::cout << C1 << std::endl;
         std::cout << ANSIcolor("1;31") << "Mismatch2!\n" << ANSIcolor();
-        return 1;
     }
 
     matxvec(A, &B[0], &C1[0]);
@@ -355,7 +352,6 @@ int amx_unit_test_gemAvB(int M, int K, int times = -1000) {
         std::cout << C0 << std::endl;
         std::cout << C1 << std::endl;
         std::cout << ANSIcolor("1;31") << "Mismatch3!\n" << ANSIcolor();
-        return 1;
     }
 
     timer.tag(__func__, M, K, N, "gemAvB")(times, [&](){
@@ -717,6 +713,13 @@ void amx_FC_MTML_perf(int M, int K, int N, int repeates, int times = -1000) {
 
 template<typename T, amx_kernel::PP::Steps ppsteps>
 void test_FC_acc() {
+    // Ktails test
+    amx_FC_acc<T, ppsteps>(16,65,32);
+    amx_FC_acc<T, ppsteps>(16,66,32);
+    amx_FC_acc<T, ppsteps>(16,67,32);
+    amx_FC_acc<T, ppsteps>(16,68,32);
+    amx_FC_acc<T, ppsteps>(16,69,32);
+
     amx_FC_acc<T, ppsteps>(32, 64, 5);
     amx_FC_acc<T, ppsteps>(128, 96, 16);
     amx_FC_acc<T, ppsteps>(2, 2560, 10752);
@@ -878,7 +881,9 @@ int main(int argc, const char *argv[]) {
     std::cout << ANSIcolor("31") << "omp_get_num_threads() = " << omp_get_num_threads() << std::endl << ANSIcolor();
     std::cout << ANSIcolor("31") << "OMP_NT = " << OMP_NT << std::endl << ANSIcolor();
 
-    amx_unit_test_gemAvB(901, 80); test_acc();    test_perf();    return 0; 
+    test_acc();
+    amx_unit_test_gemAvB(901, 80); 
+    test_perf();
 
     precision = Matmul::Weight_BF16;
     amx_MatmulMT_perf<bfloat16, Steps::BIAS_GELU>(2, 2560, 10752, false, -1000);
