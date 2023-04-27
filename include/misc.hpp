@@ -143,6 +143,7 @@ inline bool initXTILE() {
     return true;
 }
 //===============================================================
+#ifdef _tile_stored
 template<typename T, int tile>
 inline void tshow() {
     if (std::is_same<ov::bfloat16,T>::value) {
@@ -166,7 +167,9 @@ inline void tshow() {
         show(data, 16, 64);
     }
 }
+#endif
 
+#ifdef _tile_stored
 template<typename T0, typename T1>
 std::vector<std::pair<T0, T1>> zip_vector(const std::vector<T0> & v0, const std::vector<T1> & v1) {
     std::vector<std::pair<T0, T1>> ret;
@@ -234,7 +237,7 @@ struct tileconfig_t {
         return out;
     }
 } __attribute__ ((__packed__));
-
+#endif
 
 // default implementation
 template <typename T>

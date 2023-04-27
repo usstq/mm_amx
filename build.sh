@@ -1,5 +1,13 @@
 if ! which icx > /dev/null; then
-source ~/intel/oneapi/setvars.sh
+if test -f "~/intel/oneapi/setvars.sh"; then
+    echo "initializing oneapi environment for intel compiler"
+    source ~/intel/oneapi/setvars.sh
+    CXX=icx
+else
+    echo "use g++ instead of intel compiler"
+    CXX=g++
+fi
+
 fi
 
 source=$1
@@ -17,15 +25,15 @@ target=a.out
 
 # g++ ./test.cpp -O2 -lpthread -march=native -lstdc++
 
-COMMON_OPTS="-DENABLE_NUMA -I$SCRIPT_DIR/include -lpthread -march=native -std=c++14 -lstdc++ -lnuma -qopenmp"
+COMMON_OPTS="-DENABLE_NUMA -I$SCRIPT_DIR/include -lpthread -march=native -std=c++14 -lstdc++ -lnuma -fopenmp"
 
-icx $source -O2 $COMMON_OPTS -S -masm=intel -fverbose-asm  -o _main.s &&
+$CXX $source -O2 $COMMON_OPTS -S -masm=intel -fverbose-asm  -o _main.s &&
 cat _main.s | c++filt > main.s &&
-icx $source -O2 $COMMON_OPTS -o $target &&
-icx $source -O0 $COMMON_OPTS -g -o debug.out &&
+$CXX $source -O2 $COMMON_OPTS -o $target &&
+$CXX $source -O0 $COMMON_OPTS -g -o debug.out &&
 echo $target is generated &&
 echo main.s is generated &&
 echo debug.out is generated &&
 echo ======== test begin========== &&
-echo numactl --localalloc -C 0-55 ./$target &&
-numactl --localalloc -C 0-55 ./$target
+echo numactl --localalloc -C 0-5 ./$target &&
+numactl --localalloc -C 0-5 ./$target
