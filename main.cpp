@@ -312,7 +312,7 @@ void amx_Matmul_perf(int M, int K, int N, bool transB, int times = -1000) {
 
 int amx_unit_test_gemAvB(int M, int K, int times = -1000) {
     int N = 1;
-    tensor2D<bfloat16> A(M, K);
+    tensor2D<bfloat16> A(M, K, true); // ensure stride of A matrix is multiple of cache line, which is vital to performance.
     tensor2D<bfloat16> B(K, 1, true);
     tensor2D<float> C0(M, 1, true);    // reference result
     tensor2D<float> C1(M, 1, true);    // actual result
@@ -323,7 +323,7 @@ int amx_unit_test_gemAvB(int M, int K, int times = -1000) {
     amx_kernel::MatmulVector<bfloat16, bfloat16> matxvec;
 
     // same B, different layout
-    std::cout << __func__ << " [" << M << "," << K << "," << N << "] ";
+    std::cout << __func__ << "(" << M << "," << K << ")";
     C0 = 0;
     matmul(A, B, C0);
 
@@ -331,8 +331,8 @@ int amx_unit_test_gemAvB(int M, int K, int times = -1000) {
     if (C0 == C1) {
         std::cout << ANSIcolor("1;32") << "Match!\n" << ANSIcolor();
     } else {
-        std::cout << C0 << std::endl;
-        std::cout << C1 << std::endl;
+        logger() << C0 << std::endl;
+        logger() << C1 << std::endl;
         std::cout << ANSIcolor("1;31") << "Mismatch!\n" << ANSIcolor();
     }
 
@@ -340,8 +340,8 @@ int amx_unit_test_gemAvB(int M, int K, int times = -1000) {
     if (C0 == C1) {
         std::cout << ANSIcolor("1;32") << "Match2!\n" << ANSIcolor();
     } else {
-        std::cout << C0 << std::endl;
-        std::cout << C1 << std::endl;
+        logger() << C0 << std::endl;
+        logger() << C1 << std::endl;
         std::cout << ANSIcolor("1;31") << "Mismatch2!\n" << ANSIcolor();
     }
 
@@ -349,8 +349,8 @@ int amx_unit_test_gemAvB(int M, int K, int times = -1000) {
     if (C0 == C1) {
         std::cout << ANSIcolor("1;32") << "Match3!\n" << ANSIcolor();
     } else {
-        std::cout << C0 << std::endl;
-        std::cout << C1 << std::endl;
+        logger() << C0 << std::endl;
+        logger() << C1 << std::endl;
         std::cout << ANSIcolor("1;31") << "Mismatch3!\n" << ANSIcolor();
     }
 
@@ -881,8 +881,11 @@ int main(int argc, const char *argv[]) {
     std::cout << ANSIcolor("31") << "omp_get_num_threads() = " << omp_get_num_threads() << std::endl << ANSIcolor();
     std::cout << ANSIcolor("31") << "OMP_NT = " << OMP_NT << std::endl << ANSIcolor();
 
+    amx_unit_test_gemAvB(901, 80);
+    amx_unit_test_gemAvB(901, 96);
+
     test_acc();
-    amx_unit_test_gemAvB(901, 80); 
+    
     test_perf();
 
     precision = Matmul::Weight_BF16;

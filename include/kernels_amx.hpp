@@ -160,7 +160,7 @@ namespace functional {
         auto * dst = reinterpret_cast<uint32_t*>(_dst);
         __m512i r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, ra, rb, rc, rd, re, rf;
         auto * pA = reinterpret_cast<const uint8_t*>(src);
-        uint64_t mask_value = 0xFFFFFFFFFFFFFFFF >> (64 - valid_bytes);
+        uint64_t mask_value = 0xFFFFFFFFFFFFFFFFull >> (64 - valid_bytes);
         __mmask64 mask = _cvtu64_mask64(mask_value);
         r0 = _mm512_maskz_loadu_epi8 (mask, pA);
         r1 = _mm512_maskz_loadu_epi8 (mask, pA + stride);
@@ -203,7 +203,7 @@ namespace functional {
         __m512i r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, ra, rb, rc, rd, re, rf;
         int invalid_bytes = 64 - valid_bytes;
         auto * pA = reinterpret_cast<const uint8_t*>(src) - invalid_bytes;
-        uint64_t mask_value = 0xFFFFFFFFFFFFFFFF << invalid_bytes;
+        uint64_t mask_value = 0xFFFFFFFFFFFFFFFFull << invalid_bytes;
         __mmask64 mask = _cvtu64_mask64(mask_value);
         r0 = _mm512_maskz_loadu_epi8 (mask, pA);
         r1 = _mm512_maskz_loadu_epi8 (mask, pA + stride);
@@ -844,52 +844,112 @@ struct MatmulVector {
     if (is_u8s8) _tile_dpbusd(dst, a, b); \
     if (is_u8u8) _tile_dpbuud(dst, a, b);
 
-    template<int tmmN>
-    void kernel(int M, const void * pA, int strideA, const void * vB, void * vC) {
+    alignas(64) int8_t KtailBuff[64];
+
+    template<int tmmN, bool bFallbackKtails>
+    void kernel(int M, int K, const void * pA, int strideA, const void * vB, void * vC) {
+        static_assert(tmmN >= 1 && tmmN <= 6, "tmmN must be within [1-6] range");
         const auto * pA0 = reinterpret_cast<const int8_t*>(pA);
+        int KLastOffBytes = (K - kStep) * sizeof(TA); 
         const auto * pB0 = reinterpret_cast<const int8_t*>(vB);
         auto * pC0 = reinterpret_cast<int8_t*>(vC);
+
+        const auto * pBLast = pB0 + 64*(tmmN - 1);
+        int Ktail = K & (kStep - 1);
+        if (Ktail) {
+            if (bFallbackKtails) {
+                // if bContainMtails, the last submatrix needs to use special to prevent A matrix read overflow
+                // K tails is handled by:
+                //  - zero-padding the last tile of vector B, at the top
+                //  - right-align last tile load from matA
+                __mmask64 kmask = _cvtu64_mask64(0xFFFFFFFFFFFFFFFFull << (kStep - Ktail)*sizeof(TB));
+                auto r = _mm512_maskz_loadu_epi8(kmask, pB0 + KLastOffBytes);
+                _mm512_storeu_epi8(KtailBuff, r);
+            } else {
+                // each row of A can be read overflow w/o worrying NaN numbers
+                // zero-padding the last tile of vector B as bottom is enough 
+                __mmask64 kmask = _cvtu64_mask64(0xFFFFFFFFFFFFFFFFull >> (kStep - Ktail)*sizeof(TB));
+                KLastOffBytes = (K - Ktail)*sizeof(TA);
+                auto r = _mm512_maskz_loadu_epi8(kmask, pB0 + KLastOffBytes);
+                _mm512_storeu_epi8(KtailBuff, r);
+            }
+            pBLast = KtailBuff;
+        }
+
         // load B tiles outside of loop
-        if (tmmN > 0) _tile_loadd(2, pB0, 4); pB0 += 16*4;
-        if (tmmN > 1) _tile_loadd(3, pB0, 4); pB0 += 16*4;
-        if (tmmN > 2) _tile_loadd(4, pB0, 4); pB0 += 16*4;
-        if (tmmN > 3) _tile_loadd(5, pB0, 4); pB0 += 16*4;
-        if (tmmN > 4) _tile_loadd(6, pB0, 4); pB0 += 16*4;
-        if (tmmN > 5) _tile_loadd(7, pB0, 4); pB0 += 16*4;
+        if (tmmN == 1) {
+            _tile_loadd(2, pB0, 4);
+        }
+        if (tmmN == 2) {
+            _tile_loadd(2, pB0, 4);
+            _tile_loadd(3, pBLast, 4);
+        }
+        if (tmmN == 3) {
+            _tile_loadd(2, pB0, 4);
+            _tile_loadd(3, pB0 + 64, 4);
+            _tile_loadd(4, pBLast, 4);
+        }
+        if (tmmN == 4) {
+            _tile_loadd(2, pB0, 4);
+            _tile_loadd(3, pB0 + 64, 4);
+            _tile_loadd(4, pB0 + 64*2, 4);
+            _tile_loadd(5, pBLast, 4);
+        }
+        if (tmmN == 5) {
+            _tile_loadd(2, pB0, 4);
+            _tile_loadd(3, pB0 + 64, 4);
+            _tile_loadd(4, pB0 + 64*2, 4);
+            _tile_loadd(5, pB0 + 64*3, 4);
+            _tile_loadd(6, pBLast, 4);
+        }
+        if (tmmN == 6) {
+            _tile_loadd(2, pB0, 4);
+            _tile_loadd(3, pB0 + 64, 4);
+            _tile_loadd(4, pB0 + 64*2, 4);
+            _tile_loadd(5, pB0 + 64*3, 4);
+            _tile_loadd(6, pB0 + 64*4, 4);
+            _tile_loadd(7, pBLast, 4);
+        }
         //asm("int3");
         for(int m = 0; m < M; m+=16) {
-            auto * pA = pA0;
             zero_tiles<0>();
-            if (tmmN > 0) {
-                _tile_loadd(1, pA, strideA); pA += 64;
-                TILE_DP(0, 1, 2);
+            if (tmmN == 1) {
+                _tile_loadd(1, pA0, strideA); TILE_DP(0, 1, 2);
             }
-            if (tmmN > 1) {
-                _tile_loadd(1, pA, strideA); pA += 64;
-                TILE_DP(0, 1, 3);
+            if (tmmN == 2) {
+                _tile_loadd(1, pA0, strideA); TILE_DP(0, 1, 2);
+                _tile_loadd(1, pA0 + KLastOffBytes, strideA); TILE_DP(0, 1, 3);
             }
-            if (tmmN > 2) {
-                _tile_loadd(1, pA, strideA); pA += 64;
-                TILE_DP(0, 1, 4);
+            if (tmmN == 3) {
+                _tile_loadd(1, pA0, strideA); TILE_DP(0, 1, 2);
+                _tile_loadd(1, pA0 + 64, strideA); TILE_DP(0, 1, 3);
+                _tile_loadd(1, pA0 + KLastOffBytes, strideA);  TILE_DP(0, 1, 4);
             }
-            if (tmmN > 3) {
-                _tile_loadd(1, pA, strideA); pA += 64;
-                TILE_DP(0, 1, 5);
+            if (tmmN == 4) {
+                _tile_loadd(1, pA0, strideA); TILE_DP(0, 1, 2);
+                _tile_loadd(1, pA0 + 64, strideA); TILE_DP(0, 1, 3);
+                _tile_loadd(1, pA0 + 128, strideA);  TILE_DP(0, 1, 4);
+                _tile_loadd(1, pA0 + KLastOffBytes, strideA); TILE_DP(0, 1, 5);
             }
-            if (tmmN > 4) {
-                _tile_loadd(1, pA, strideA); pA += 64;
-                TILE_DP(0, 1, 6);
+            if (tmmN == 6) {
+                _tile_loadd(1, pA0, strideA); TILE_DP(0, 1, 2);
+                _tile_loadd(1, pA0 + 64, strideA); TILE_DP(0, 1, 3);
+                _tile_loadd(1, pA0 + 128, strideA);  TILE_DP(0, 1, 4);
+                _tile_loadd(1, pA0 + 192, strideA); TILE_DP(0, 1, 5);
+                _tile_loadd(1, pA0 + KLastOffBytes, strideA); TILE_DP(0, 1, 6);
             }
-            if (tmmN > 5) {
-                _tile_loadd(1, pA, strideA); pA += 64;
-                TILE_DP(0, 1, 7);
+            if (tmmN == 7) {
+                _tile_loadd(1, pA0, strideA); TILE_DP(0, 1, 2);
+                _tile_loadd(1, pA0 + 64, strideA); TILE_DP(0, 1, 3);
+                _tile_loadd(1, pA0 + 128, strideA);  TILE_DP(0, 1, 4);
+                _tile_loadd(1, pA0 + 192, strideA); TILE_DP(0, 1, 5);
+                _tile_loadd(1, pA0 + 256, strideA); TILE_DP(0, 1, 6);
+                _tile_loadd(1, pA0 + KLastOffBytes, strideA); TILE_DP(0, 1, 7);
             }
             _tile_stored(0, pC0, 4); pC0 += 16*4;   // C is single column, always take 4 bytes
             pA0 += 16 * strideA;
         }
     }
-
-    alignas(64) int8_t Kbuff[64*6];
 
     void operator()(tensor2D<TA> & matA, const TB * vB, TC * vC) {
         int M = matA.dims[0];
@@ -898,19 +958,22 @@ struct MatmulVector {
         int strideA = matA.stride;
 
         // M tails is handled
-        assert(K <= 6*kStep);
+        assert(K >= kStep && K <= 6*kStep);
 
-        int Ktail = K % kStep;
-        if (Ktail) {
-            // K tails is handled by zero-padding B matrix, matA may be accessed over the end
-            memset(Kbuff, 0, sizeof(Kbuff));
-            memcpy(Kbuff, vB, K*sizeof(TB));
-            vB = reinterpret_cast<TB*>(Kbuff);
-        }
-
-        int Mtail = M % 16;
+        int Ktail = K & (kStep - 1);
+        int Mtail = M & (16 - 1);
         int Mbody = M - Mtail;
         int numBtiles = (K + kStep - 1)/kStep;
+
+        // if we have Ktails, then it will always be handled in Mtail, so we split
+        // Mtail out even if it's zero
+        if (Ktail) {
+            if (Mtail == 0) {
+                Mtail = 16;
+                Mbody -= 16;
+            }
+        }
+
         if (Mbody) {
             tileconfig_t tfg(1, 0, {
                 {16, 4},  // C:0   M x 1     (4b)
@@ -922,13 +985,14 @@ struct MatmulVector {
                 {16, 4}, // B:6
                 {16, 4}, // B:7
             });
+            // Ktail fallback will always be done at Mtails loop
             switch(numBtiles) {
-                case 1: kernel<1>(Mbody, pA, strideA, vB, vC); break;
-                case 2: kernel<2>(Mbody, pA, strideA, vB, vC); break;
-                case 3: kernel<3>(Mbody, pA, strideA, vB, vC); break;
-                case 4: kernel<4>(Mbody, pA, strideA, vB, vC); break;
-                case 5: kernel<5>(Mbody, pA, strideA, vB, vC); break;
-                case 6: kernel<6>(Mbody, pA, strideA, vB, vC); break;
+                case 1: kernel<1, false>(Mbody, K, pA, strideA, vB, vC); break;
+                case 2: kernel<2, false>(Mbody, K, pA, strideA, vB, vC); break;
+                case 3: kernel<3, false>(Mbody, K, pA, strideA, vB, vC); break;
+                case 4: kernel<4, false>(Mbody, K, pA, strideA, vB, vC); break;
+                case 5: kernel<5, false>(Mbody, K, pA, strideA, vB, vC); break;
+                case 6: kernel<6, false>(Mbody, K, pA, strideA, vB, vC); break;
                 default:
                     assert(false); // impossible since (K <= 6*kStep)
             }
@@ -946,15 +1010,28 @@ struct MatmulVector {
                 {16, 4}, // B:6
                 {16, 4}, // B:7
             });
-            switch(numBtiles) {
-                case 1: kernel<1>(Mtail, pA, strideA, vB, vC + Mbody); break;
-                case 2: kernel<2>(Mtail, pA, strideA, vB, vC + Mbody); break;
-                case 3: kernel<3>(Mtail, pA, strideA, vB, vC + Mbody); break;
-                case 4: kernel<4>(Mtail, pA, strideA, vB, vC + Mbody); break;
-                case 5: kernel<5>(Mtail, pA, strideA, vB, vC + Mbody); break;
-                case 6: kernel<6>(Mtail, pA, strideA, vB, vC + Mbody); break;
-                default:
-                    assert(false); // impossible since (K <= 6*kStep)
+            if (Ktail) {
+                switch(numBtiles) {
+                    case 1: kernel<1, true>(Mtail, K, pA, strideA, vB, vC + Mbody); break;
+                    case 2: kernel<2, true>(Mtail, K, pA, strideA, vB, vC + Mbody); break;
+                    case 3: kernel<3, true>(Mtail, K, pA, strideA, vB, vC + Mbody); break;
+                    case 4: kernel<4, true>(Mtail, K, pA, strideA, vB, vC + Mbody); break;
+                    case 5: kernel<5, true>(Mtail, K, pA, strideA, vB, vC + Mbody); break;
+                    case 6: kernel<6, true>(Mtail, K, pA, strideA, vB, vC + Mbody); break;
+                    default:
+                        assert(false); // impossible since (K <= 6*kStep)
+                }
+            } else {
+                switch(numBtiles) {
+                    case 1: kernel<1, false>(Mtail, K, pA, strideA, vB, vC + Mbody); break;
+                    case 2: kernel<2, false>(Mtail, K, pA, strideA, vB, vC + Mbody); break;
+                    case 3: kernel<3, false>(Mtail, K, pA, strideA, vB, vC + Mbody); break;
+                    case 4: kernel<4, false>(Mtail, K, pA, strideA, vB, vC + Mbody); break;
+                    case 5: kernel<5, false>(Mtail, K, pA, strideA, vB, vC + Mbody); break;
+                    case 6: kernel<6, false>(Mtail, K, pA, strideA, vB, vC + Mbody); break;
+                    default:
+                        assert(false); // impossible since (K <= 6*kStep)
+                }
             }
         }
     }
@@ -1454,6 +1531,13 @@ struct GemAvB {
                     float * vecC) {
         int M = matA.dims[0];
         int K = matA.dims[1];
+
+        constexpr int kStep = 32;
+
+        assert(K >= 32);
+        int Ktails = K % kStep;
+        int Kbody = K - Ktails;
+        int Kbackoff = (kStep - Ktails);
 
         if (K % 32) {
             if (K > Bpadded.dims[1])
