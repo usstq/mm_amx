@@ -25,7 +25,8 @@ target=a.out
 
 # g++ ./test.cpp -O2 -lpthread -march=native -lstdc++
 
-COMMON_OPTS="-DENABLE_NUMA -I$SCRIPT_DIR/include -lpthread -march=native -std=c++14 -lstdc++ -lnuma -fopenmp"
+MARCH_OPTS="-mno-avx256-split-unaligned-load -mno-avx256-split-unaligned-store"
+COMMON_OPTS="-DENABLE_NUMA -I$SCRIPT_DIR/include -lpthread -march=native -std=c++14 -lstdc++ -lnuma -fopenmp $MARCH_OPTS"
 
 $CXX $source -O2 $COMMON_OPTS -S -masm=intel -fverbose-asm  -o _main.s &&
 cat _main.s | c++filt > main.s &&

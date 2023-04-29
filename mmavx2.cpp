@@ -13,12 +13,7 @@
 
 #include "misc.hpp"
 #include "kernels_avx2.hpp"
-#include "thread_pool.hpp"
 #include "timeit.hpp"
-
-#include "test_bw.hpp"
-
-#include "thread_pool.hpp"
 #include <omp.h>
 // https://raw.githubusercontent.com/intel/perfmon/main/SPR/events/sapphirerapids_core.json
 timeit benchmark;
@@ -33,6 +28,10 @@ timeit benchmark;
     }
 );
 */
+
+// vfmadd132ps ymm(8 floats)  Throughput (CPI)=0.5
+const double vfmaddOpsPerCycle = 16;
+
 
 int OMP_NT = omp_thread_count();
 
@@ -73,7 +72,6 @@ struct MatmulMTOMP {
     }
 };
 
-
 void amx_Matmul_perf_float(int M, int K, int N, int times = -1000) {
     tensor2D<float> A(M, K);
     tensor2D<float> B(K, N);
@@ -85,8 +83,8 @@ void amx_Matmul_perf_float(int M, int K, int N, int times = -1000) {
     std::cout << __func__ << " [" << M << "," << K << "," << N << "] ";
 
     C0=0;
-    //matmul(A, B, C0, &Bias(0,0), [](float x){        return std::max(x, 0.0f);    });
-    matmul(A, B, C0);
+    matmul(A, B, C0, &Bias[0], [](float x){        return std::max(x, 0.0f);    });
+    //matmul(A, B, C0);
     mm(A, B, C, pp);
     if (C0 == C) {
         std::cout << ANSIcolor("1;32") << "Match!\n" << ANSIcolor();
@@ -101,7 +99,7 @@ void amx_Matmul_perf_float(int M, int K, int N, int times = -1000) {
         mm(A, B, C, pp);
     },
     double(M * N) * K * 2,
-    FP32PeakGopsPerCore * 1e9);
+    vfmaddOpsPerCycle * 4.3e9);   // 4.3GHz
 }
 
 int main(int argc, const char *argv[]) {
@@ -112,9 +110,13 @@ int main(int argc, const char *argv[]) {
     std::cout << ANSIcolor("31") << "OMP_NT = " << OMP_NT << std::endl << ANSIcolor();
 
     // amx_Matmul_perf_float(128, 384, 51864);
+    amx_Matmul_perf_float(128, 384, 51864, -1000);
 
     amx_Matmul_perf_float(126, 384, 51872, -1000);
+    amx_Matmul_perf_float(126+6, 384, 51872, -1000);
+    amx_Matmul_perf_float(128, 384, 51872, -1000);
     
+
     //[1,64,384] x [384, 384]
     amx_Matmul_perf_float(66, 384, 384, -1000);
     

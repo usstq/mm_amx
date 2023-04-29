@@ -32,9 +32,6 @@ matmul:
 #include "numa.h"
 #endif
 
-//#define FORCE_INLINE inline __attribute__((always_inline))
-//#define FORCE_INLINE 
-
 namespace amx_kernel {
 
 namespace functional {

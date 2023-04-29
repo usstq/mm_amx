@@ -120,13 +120,6 @@ constexpr int64_t next_size() {
     return nsize;
 }
 
-inline int omp_thread_count() {
-    int n = 0;
-    #pragma omp parallel reduction(+:n)
-    n += 1;
-    return n;
-}
-
 void test_all_bw(double duration){
     auto test = [&](int64_t size) {
         auto OMP_NT = omp_thread_count();

@@ -275,6 +275,33 @@ std::ostream & logger() {
     return log_level == 0 ? null_stream : std::cout;
 }
 
+template <typename T, typename Q>
+inline void splitter(const T& n, const Q& team, const Q& tid, T& n_start, T& n_end) {
+    if (team <= 1 || n == 0) {
+        n_start = 0;
+        n_end = n;
+    } else {
+        T n1 = (n + (T)team - 1) / (T)team;
+        T n2 = n1 - 1;
+        T T1 = n - n2 * (T)team;
+        n_end = (T)tid < T1 ? n1 : n2;
+        n_start = (T)tid <= T1 ? tid * n1 : T1 * n1 + ((T)tid - T1) * n2;
+    }
+
+    n_end += n_start;
+}
+
+inline int omp_thread_count() {
+    int n = 0;
+    #pragma omp parallel reduction(+:n)
+    n += 1;
+    return n;
+}
+
+
+#define FORCE_INLINE inline __attribute__((always_inline))
+//#define FORCE_INLINE 
+
 #ifdef ENABLE_NUMA
 static auto USE_NUMA = readenv("USE_NUMA");
 #endif

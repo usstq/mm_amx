@@ -117,6 +117,9 @@ struct tensor2D {
         if (sizeof(T) == 2) {
             *reinterpret_cast<uint16_t*>(data.get() + dims[0] * padded_dim1) = NAN1;
         }
+        if (sizeof(T) == 4) {
+            *reinterpret_cast<uint32_t*>(data.get() + dims[0] * padded_dim1) = (INF << 16) + 1;
+        }
     }
 
     T & operator[](int i) {

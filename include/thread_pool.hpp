@@ -155,23 +155,6 @@ private:
     std::deque<std::atomic<int>> nt_flags;
 };
 
-template <typename T, typename Q>
-inline void splitter(const T& n, const Q& team, const Q& tid, T& n_start, T& n_end) {
-    if (team <= 1 || n == 0) {
-        n_start = 0;
-        n_end = n;
-    } else {
-        T n1 = (n + (T)team - 1) / (T)team;
-        T n2 = n1 - 1;
-        T T1 = n - n2 * (T)team;
-        n_end = (T)tid < T1 ? n1 : n2;
-        n_start = (T)tid <= T1 ? tid * n1 : T1 * n1 + ((T)tid - T1) * n2;
-    }
-
-    n_end += n_start;
-}
-
-
 void test_parallel_nt() {
     ThreadPool thp;
     thp.Start();
