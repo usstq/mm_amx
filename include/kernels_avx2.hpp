@@ -232,7 +232,7 @@ struct Matmul {
         // determine blocking scheme
         int elesz = sizeof(uint16_t);
         int L2 = (256+32)*1024; // Coffee Lake 256K L2/core
-        int slice_size = 6*rndup(K, 16)*elesz;
+        int slice_size = 6 * K *elesz;
         int mc = L2/slice_size - 1;
 
         // if 1 32xK slice cannot fit L2, use 1 slice at least
