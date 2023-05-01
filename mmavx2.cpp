@@ -15,6 +15,7 @@
 #include "kernels_avx2.hpp"
 #include "timeit.hpp"
 #include <omp.h>
+#include "test_bw.hpp"
 // https://raw.githubusercontent.com/intel/perfmon/main/SPR/events/sapphirerapids_core.json
 timeit benchmark;
 /*
@@ -38,9 +39,9 @@ int OMP_NT = omp_thread_count();
 struct MatmulMTOMP {
     std::vector<std::shared_ptr<avx2::Matmul>> ops;
     bool transposeB = false;
-    MatmulMTOMP() {
+    MatmulMTOMP(bool constB = false, bool transposeB = false) {
         for(int i = 0; i < OMP_NT; i++)
-            ops.push_back(std::make_shared<avx2::Matmul>());
+            ops.push_back(std::make_shared<avx2::Matmul>(constB, transposeB));
     }
 
     template<typename P>
@@ -75,31 +76,70 @@ struct MatmulMTOMP {
 void amx_Matmul_perf_float(int M, int K, int N, int times = -1000) {
     tensor2D<float> A(M, K);
     tensor2D<float> B(K, N);
+    tensor2D<float> Br = B.Tr();
     tensor2D<float> C(M, N);
     tensor2D<float> C0(M, N);
     tensor2D<float> Bias(1, N);
     avx2::PP::AddbiasRelu pp(&Bias[0]);
-    MatmulMTOMP mm;
+    MatmulMTOMP fc(true, false);
+    MatmulMTOMP mm(false, false);
+    //MatmulMTOMP mmTr(false, true);
     std::cout << __func__ << " [" << M << "," << K << "," << N << "] ";
 
     C0=0;
     matmul(A, B, C0, &Bias[0], [](float x){        return std::max(x, 0.0f);    });
     //matmul(A, B, C0);
-    mm(A, B, C, pp);
+    fc(A, B, C, pp);
     if (C0 == C) {
-        std::cout << ANSIcolor("1;32") << "Match!\n" << ANSIcolor();
+        std::cout << ANSIcolor("1;32") << "fc-Match!" << ANSIcolor();
         //std::cout << C << std::endl;
     } else {
-        std::cout << ANSIcolor("1;31") << "Mismatch!\n" << ANSIcolor();
-        std::cout << C0 << std::endl;
-        std::cout << C << std::endl;
+        std::cout << ANSIcolor("1;31") << "fc-Mismatch!" << ANSIcolor();
+        logger() << C0 << std::endl;
+        logger() << C << std::endl;
     }
+    
+    fc(A, B, C, pp);
 
-    benchmark(times, [&](){
+    mm(A, B, C, pp);
+    if (C0 == C) {
+        std::cout << ANSIcolor("1;32") << "mm-Match!" << ANSIcolor();
+        //std::cout << C << std::endl;
+    } else {
+        std::cout << ANSIcolor("1;31") << "mm-Mismatch!" << ANSIcolor();
+        logger() << C0 << std::endl;
+        logger() << C << std::endl;
+    }
+/*
+    mmTr(A, Br, C, pp);
+    if (C0 == C) {
+        std::cout << ANSIcolor("1;32") << "mmTr-Match!" << ANSIcolor();
+        //std::cout << C << std::endl;
+    } else {
+        std::cout << ANSIcolor("1;31") << "mmTr-Mismatch!" << ANSIcolor();
+        logger() << C0 << std::endl;
+        logger() << C << std::endl;
+    }
+*/
+    std::cout << std::endl;
+
+    //benchmark.set_peak_metric_per_second(vfmaddOpsPerCycle * 4.3e9); // 4.3GHz
+
+    benchmark.tag("fc")(times, [&](){
+        fc(A, B, C, pp);
+    },
+    double(M * N) * K * 2, vfmaddOpsPerCycle * 4.3e9);
+
+    benchmark.tag("mm")(times, [&](){
         mm(A, B, C, pp);
     },
-    double(M * N) * K * 2,
-    vfmaddOpsPerCycle * 4.3e9);   // 4.3GHz
+    double(M * N) * K * 2);
+/*
+    benchmark.tag("mmTr")(times, [&](){
+        mmTr(A, Br, C, pp);
+    },
+    double(M * N) * K * 2);
+*/
 }
 
 int main(int argc, const char *argv[]) {
@@ -108,6 +148,8 @@ int main(int argc, const char *argv[]) {
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
     std::cout << ANSIcolor("31") << "omp_get_num_threads() = " << omp_get_num_threads() << std::endl << ANSIcolor();
     std::cout << ANSIcolor("31") << "OMP_NT = " << OMP_NT << std::endl << ANSIcolor();
+
+    //test_all_bw(3);
 
     // amx_Matmul_perf_float(128, 384, 51864);
     amx_Matmul_perf_float(128, 384, 51864, -1000);
