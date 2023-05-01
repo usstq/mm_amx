@@ -57,6 +57,50 @@ namespace functional {
         row6 = _mm256_permute2f128_ps(__tt2, __tt6, 0x31);
         row7 = _mm256_permute2f128_ps(__tt3, __tt7, 0x31);
     }
+
+    inline void transpose_16xK_ps(float * pBdst, float *pBsrc, int strideB, int K) {
+        for(int k = 0; k < K; k+=8, pBsrc+=8) {
+            {
+                auto b0 = _mm256_loadu_ps(pBsrc);
+                auto b1 = _mm256_loadu_ps(pBsrc + strideB);
+                auto b2 = _mm256_loadu_ps(pBsrc + strideB*2);
+                auto b3 = _mm256_loadu_ps(pBsrc + strideB*3);
+                auto b4 = _mm256_loadu_ps(pBsrc + strideB*4);
+                auto b5 = _mm256_loadu_ps(pBsrc + strideB*5);
+                auto b6 = _mm256_loadu_ps(pBsrc + strideB*6);
+                auto b7 = _mm256_loadu_ps(pBsrc + strideB*7);
+                functional::transpose8_ps(b0, b1, b2, b3, b4, b5, b6, b7);
+                _mm256_storeu_ps(pBdst, b0);
+                _mm256_storeu_ps(pBdst + 8*2, b1);
+                _mm256_storeu_ps(pBdst + 8*4, b2);
+                _mm256_storeu_ps(pBdst + 8*6, b3);
+                _mm256_storeu_ps(pBdst + 8*8, b4);
+                _mm256_storeu_ps(pBdst + 8*10, b5);
+                _mm256_storeu_ps(pBdst + 8*12, b6);
+                _mm256_storeu_ps(pBdst + 8*14, b7);
+            }
+            {
+                auto b0 = _mm256_loadu_ps(pBsrc + strideB*8);
+                auto b1 = _mm256_loadu_ps(pBsrc + strideB*9);
+                auto b2 = _mm256_loadu_ps(pBsrc + strideB*10);
+                auto b3 = _mm256_loadu_ps(pBsrc + strideB*11);
+                auto b4 = _mm256_loadu_ps(pBsrc + strideB*12);
+                auto b5 = _mm256_loadu_ps(pBsrc + strideB*13);
+                auto b6 = _mm256_loadu_ps(pBsrc + strideB*14);
+                auto b7 = _mm256_loadu_ps(pBsrc + strideB*15);
+                functional::transpose8_ps(b0, b1, b2, b3, b4, b5, b6, b7);
+                _mm256_storeu_ps(pBdst + 8, b0);
+                _mm256_storeu_ps(pBdst + 8*3, b1);
+                _mm256_storeu_ps(pBdst + 8*5, b2);
+                _mm256_storeu_ps(pBdst + 8*7, b3);
+                _mm256_storeu_ps(pBdst + 8*9, b4);
+                _mm256_storeu_ps(pBdst + 8*11, b5);
+                _mm256_storeu_ps(pBdst + 8*13, b6);
+                _mm256_storeu_ps(pBdst + 8*15, b7);
+            }
+            pBdst += 8*16;
+        }
+    }
 }
 namespace PP {
     struct AddbiasRelu {
@@ -105,6 +149,22 @@ FORCE_INLINE void loop2D(int M, int N, int mc, F f) {
                 int valid_m = std::min(M - m, bM);
                 f(m, n, valid_m, valid_n);
             }
+        }
+    }
+}
+
+/**************************************
+ * loop order: column by column, in case
+ * where B needs dynamic transpose, this
+ * loop order can keep B slice hot in cache
+ */
+template<int bM, int bN, class F>
+FORCE_INLINE void loop2D_ColumnMajor(int M, int N, F f) {
+    for(int n=0; n<N; n += bN) {
+        int valid_n = std::min(N - n, bN);
+        for(int m=0; m<M; m += bM) {
+            int valid_m = std::min(M - m, bM);
+            f(m, n, valid_m, valid_n);
         }
     }
 }
@@ -232,52 +292,13 @@ struct Matmul {
                 int nsrc = (valid_n <= 8) ? (n1 - 8) : ((valid_n < 16) ? (n1 - 16) : n0 + n);
                 auto * pBdst = &internalB(n/16, 0);
                 auto * pBsrc = &matB(nsrc, 0);
-                for(int k = 0; k < K; k+=8, pBsrc+=8) {
-                    {
-                        auto b0 = _mm256_loadu_ps(pBsrc);
-                        auto b1 = _mm256_loadu_ps(pBsrc + strideB);
-                        auto b2 = _mm256_loadu_ps(pBsrc + strideB*2);
-                        auto b3 = _mm256_loadu_ps(pBsrc + strideB*3);
-                        auto b4 = _mm256_loadu_ps(pBsrc + strideB*4);
-                        auto b5 = _mm256_loadu_ps(pBsrc + strideB*5);
-                        auto b6 = _mm256_loadu_ps(pBsrc + strideB*6);
-                        auto b7 = _mm256_loadu_ps(pBsrc + strideB*7);
-                        functional::transpose8_ps(b0, b1, b2, b3, b4, b5, b6, b7);
-                        _mm256_storeu_ps(pBdst, b0);
-                        _mm256_storeu_ps(pBdst + 8*2, b1);
-                        _mm256_storeu_ps(pBdst + 8*4, b2);
-                        _mm256_storeu_ps(pBdst + 8*6, b3);
-                        _mm256_storeu_ps(pBdst + 8*8, b4);
-                        _mm256_storeu_ps(pBdst + 8*10, b5);
-                        _mm256_storeu_ps(pBdst + 8*12, b6);
-                        _mm256_storeu_ps(pBdst + 8*14, b7);
-                    }
-                    {
-                        auto b0 = _mm256_loadu_ps(pBsrc + strideB*8);
-                        auto b1 = _mm256_loadu_ps(pBsrc + strideB*9);
-                        auto b2 = _mm256_loadu_ps(pBsrc + strideB*10);
-                        auto b3 = _mm256_loadu_ps(pBsrc + strideB*11);
-                        auto b4 = _mm256_loadu_ps(pBsrc + strideB*12);
-                        auto b5 = _mm256_loadu_ps(pBsrc + strideB*13);
-                        auto b6 = _mm256_loadu_ps(pBsrc + strideB*14);
-                        auto b7 = _mm256_loadu_ps(pBsrc + strideB*15);
-                        functional::transpose8_ps(b0, b1, b2, b3, b4, b5, b6, b7);
-                        _mm256_storeu_ps(pBdst + 8, b0);
-                        _mm256_storeu_ps(pBdst + 8*3, b1);
-                        _mm256_storeu_ps(pBdst + 8*5, b2);
-                        _mm256_storeu_ps(pBdst + 8*7, b3);
-                        _mm256_storeu_ps(pBdst + 8*9, b4);
-                        _mm256_storeu_ps(pBdst + 8*11, b5);
-                        _mm256_storeu_ps(pBdst + 8*13, b6);
-                        _mm256_storeu_ps(pBdst + 8*15, b7);
-                    }
-                    pBdst += 8*16;
-                }
+                functional::transpose_16xK_ps(pBdst, pBsrc, strideB, K);
             });
         }
     }
 
     bool use_internalB = false;
+    bool use_dynTransB = false;
     template<typename P>
     void operator()(tensor2D<float> & matA,
                     tensor2D<float> & matB,
@@ -297,12 +318,15 @@ struct Matmul {
         int strideB;
         auto strideC = matC.stride/sizeof(float);
 
-        if ((constB && internalB.capacity == 0) || (!constB && transposeB)) {
+        use_dynTransB = (!constB && transposeB);
+        if (use_dynTransB) {
+            // dynamically transpose 16 rows of matB into internalB
+            internalB.resize(1, rndup(K, 8) * 16);
+            use_internalB = true;
+        } else if (constB && internalB.capacity == 0) {
             reorderB(matB, n0, n1);
             use_internalB = true;
-        }
-
-        if (!constB && !transposeB) {
+        } else if (!constB && !transposeB) {
             // use B matrix directly w/o copy it every time, because
             // read B matrix is inevitable, direct access can avoid writting
             // internalB again.
@@ -317,10 +341,14 @@ struct Matmul {
         // do a 6x16 result, use 6x(2x8)=12 256bits register
         auto lambda_kernel_6x16 = [&](int m, int n, int valid_m, int valid_n) {
             auto * pA = &matA(m, 0);
+            int ndst = (valid_n <= 8) ? (n1 - 8) : ((valid_n < 16) ? (n1 - 16) : n0 + n);
+            auto * pB = use_dynTransB ? &internalB[0] : (use_internalB ? &internalB(n >> 4, 0) : &matB(0, ndst));
+            auto * pC = &matC(m, ndst);
+            if (use_dynTransB && m == 0) {
+                // dynamically transpose 16 rows of matB into internalB
+                functional::transpose_16xK_ps(&internalB[0], &matB(ndst, 0), matB.stride/sizeof(float), K);
+            }
             if (valid_n <= 8) {
-                int ndst = n1 - 8;
-                auto * pC = &matC(m, ndst);
-                auto * pB = use_internalB ? &internalB(n >> 4, 0) : &matB(0, ndst);
                 switch (valid_m)
                 {
                     case 6: kernel_6x16<6, 8>(pA, strideA, pB, strideB, pC, strideC, K, ndst, pp); break;
@@ -331,9 +359,6 @@ struct Matmul {
                     case 1: kernel_6x16<1, 8>(pA, strideA, pB, strideB, pC, strideC, K, ndst, pp); break;
                 }
             } else {
-                int ndst = valid_n < 16 ? (n1 - 16) : (n0 + n);
-                auto * pC = &matC(m, ndst);
-                auto * pB = use_internalB ? &internalB(n >> 4, 0) : &matB(0, ndst);
                 switch (valid_m)
                 {
                     case 6: kernel_6x16<6, 16>(pA, strideA, pB, strideB, pC, strideC, K, ndst, pp); break;
@@ -346,6 +371,7 @@ struct Matmul {
             }
         };
 
+        /*
         // determine blocking scheme
         int elesz = sizeof(uint16_t);
         int L2 = (256+32)*1024; // Coffee Lake 256K L2/core
@@ -357,7 +383,9 @@ struct Matmul {
             mc = 1;
 
         //std::cout << "mc=" << mc << std::endl;
-        loop2D<6, 16>(M, N, mc, lambda_kernel_6x16);
+        //loop2D<6, 16>(M, N, mc, lambda_kernel_6x16);
+        */
+        loop2D_ColumnMajor<6, 16>(M, N, lambda_kernel_6x16);
     }
 };
 

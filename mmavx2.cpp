@@ -152,6 +152,8 @@ int main(int argc, const char *argv[]) {
     //test_all_bw(3);
 
     // amx_Matmul_perf_float(128, 384, 51864);
+    amx_Matmul_perf_float(128, 384, 1024, -1000);
+
     amx_Matmul_perf_float(128, 384, 51864, -1000);
 
     amx_Matmul_perf_float(128, 385, 51864, -1000);
