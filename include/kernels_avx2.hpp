@@ -219,7 +219,6 @@ struct Matmul {
                 }
             });
         } else {
-            assert(false);
             // transpose B(NxK) is costly for non-constB:
             //   - it consumes lots of instructions
             //   - it takes more than 8 HW registers (possibly 9 is enough),
@@ -227,19 +226,52 @@ struct Matmul {
             // thus we only want to do it once, due to limited register resource,
             // we cannot archieve that with on-the-fly transpose. so we transpose it
             // into a temp buffer at once
-            internalB.resize((N + 15)/16, K*16);
+            internalB.resize((N + 15)/16, rndup(K, 8) *16);
             loop2D_no_bM<16>(1, N, [&](int m, int n, int valid_m, int valid_n) {
                 // align to right border of B at N tails
-                int nsrc = (valid_n <= 8) ? (N - 8) : ((valid_n < 16) ? (N - 16) : n);
+                int nsrc = (valid_n <= 8) ? (n1 - 8) : ((valid_n < 16) ? (n1 - 16) : n0 + n);
                 auto * pBdst = &internalB(n/16, 0);
-                auto * pBsrc = &matB(0, n0 + nsrc);
-                for(int k = 0; k < K; k++) {
-                    auto b0 = _mm256_loadu_ps(pBsrc);
-                    auto b1 = _mm256_loadu_ps(pBsrc + 8);
-                    _mm256_storeu_ps(pBdst, b0);
-                    _mm256_storeu_ps(pBdst + 8, b1);
-                    pBsrc += strideB;
-                    pBdst += 16;
+                auto * pBsrc = &matB(nsrc, 0);
+                for(int k = 0; k < K; k+=8, pBsrc+=8) {
+                    {
+                        auto b0 = _mm256_loadu_ps(pBsrc);
+                        auto b1 = _mm256_loadu_ps(pBsrc + strideB);
+                        auto b2 = _mm256_loadu_ps(pBsrc + strideB*2);
+                        auto b3 = _mm256_loadu_ps(pBsrc + strideB*3);
+                        auto b4 = _mm256_loadu_ps(pBsrc + strideB*4);
+                        auto b5 = _mm256_loadu_ps(pBsrc + strideB*5);
+                        auto b6 = _mm256_loadu_ps(pBsrc + strideB*6);
+                        auto b7 = _mm256_loadu_ps(pBsrc + strideB*7);
+                        functional::transpose8_ps(b0, b1, b2, b3, b4, b5, b6, b7);
+                        _mm256_storeu_ps(pBdst, b0);
+                        _mm256_storeu_ps(pBdst + 8*2, b1);
+                        _mm256_storeu_ps(pBdst + 8*4, b2);
+                        _mm256_storeu_ps(pBdst + 8*6, b3);
+                        _mm256_storeu_ps(pBdst + 8*8, b4);
+                        _mm256_storeu_ps(pBdst + 8*10, b5);
+                        _mm256_storeu_ps(pBdst + 8*12, b6);
+                        _mm256_storeu_ps(pBdst + 8*14, b7);
+                    }
+                    {
+                        auto b0 = _mm256_loadu_ps(pBsrc + strideB*8);
+                        auto b1 = _mm256_loadu_ps(pBsrc + strideB*9);
+                        auto b2 = _mm256_loadu_ps(pBsrc + strideB*10);
+                        auto b3 = _mm256_loadu_ps(pBsrc + strideB*11);
+                        auto b4 = _mm256_loadu_ps(pBsrc + strideB*12);
+                        auto b5 = _mm256_loadu_ps(pBsrc + strideB*13);
+                        auto b6 = _mm256_loadu_ps(pBsrc + strideB*14);
+                        auto b7 = _mm256_loadu_ps(pBsrc + strideB*15);
+                        functional::transpose8_ps(b0, b1, b2, b3, b4, b5, b6, b7);
+                        _mm256_storeu_ps(pBdst + 8, b0);
+                        _mm256_storeu_ps(pBdst + 8*3, b1);
+                        _mm256_storeu_ps(pBdst + 8*5, b2);
+                        _mm256_storeu_ps(pBdst + 8*7, b3);
+                        _mm256_storeu_ps(pBdst + 8*9, b4);
+                        _mm256_storeu_ps(pBdst + 8*11, b5);
+                        _mm256_storeu_ps(pBdst + 8*13, b6);
+                        _mm256_storeu_ps(pBdst + 8*15, b7);
+                    }
+                    pBdst += 8*16;
                 }
             });
         }
@@ -271,7 +303,9 @@ struct Matmul {
         }
 
         if (!constB && !transposeB) {
-            // use B matrix directly w/o copy,
+            // use B matrix directly w/o copy it every time, because
+            // read B matrix is inevitable, direct access can avoid writting
+            // internalB again.
             use_internalB = false;
         }
 

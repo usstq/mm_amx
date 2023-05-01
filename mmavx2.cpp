@@ -39,7 +39,7 @@ int OMP_NT = omp_thread_count();
 struct MatmulMTOMP {
     std::vector<std::shared_ptr<avx2::Matmul>> ops;
     bool transposeB = false;
-    MatmulMTOMP(bool constB = false, bool transposeB = false) {
+    MatmulMTOMP(bool constB = false, bool transposeB = false) : transposeB(transposeB) {
         for(int i = 0; i < OMP_NT; i++)
             ops.push_back(std::make_shared<avx2::Matmul>(constB, transposeB));
     }
@@ -83,12 +83,13 @@ void amx_Matmul_perf_float(int M, int K, int N, int times = -1000) {
     avx2::PP::AddbiasRelu pp(&Bias[0]);
     MatmulMTOMP fc(true, false);
     MatmulMTOMP mm(false, false);
-    //MatmulMTOMP mmTr(false, true);
+    MatmulMTOMP mmTr(false, true);
     std::cout << __func__ << " [" << M << "," << K << "," << N << "] ";
 
     C0=0;
     matmul(A, B, C0, &Bias[0], [](float x){        return std::max(x, 0.0f);    });
     //matmul(A, B, C0);
+    C = 0;
     fc(A, B, C, pp);
     if (C0 == C) {
         std::cout << ANSIcolor("1;32") << "fc-Match!" << ANSIcolor();
@@ -98,9 +99,8 @@ void amx_Matmul_perf_float(int M, int K, int N, int times = -1000) {
         logger() << C0 << std::endl;
         logger() << C << std::endl;
     }
-    
-    fc(A, B, C, pp);
 
+    C = 0;
     mm(A, B, C, pp);
     if (C0 == C) {
         std::cout << ANSIcolor("1;32") << "mm-Match!" << ANSIcolor();
@@ -110,7 +110,8 @@ void amx_Matmul_perf_float(int M, int K, int N, int times = -1000) {
         logger() << C0 << std::endl;
         logger() << C << std::endl;
     }
-/*
+
+    C = 0;
     mmTr(A, Br, C, pp);
     if (C0 == C) {
         std::cout << ANSIcolor("1;32") << "mmTr-Match!" << ANSIcolor();
@@ -120,7 +121,7 @@ void amx_Matmul_perf_float(int M, int K, int N, int times = -1000) {
         logger() << C0 << std::endl;
         logger() << C << std::endl;
     }
-*/
+
     std::cout << std::endl;
 
     //benchmark.set_peak_metric_per_second(vfmaddOpsPerCycle * 4.3e9); // 4.3GHz
@@ -134,12 +135,11 @@ void amx_Matmul_perf_float(int M, int K, int N, int times = -1000) {
         mm(A, B, C, pp);
     },
     double(M * N) * K * 2);
-/*
+
     benchmark.tag("mmTr")(times, [&](){
         mmTr(A, Br, C, pp);
     },
     double(M * N) * K * 2);
-*/
 }
 
 int main(int argc, const char *argv[]) {
@@ -153,6 +153,8 @@ int main(int argc, const char *argv[]) {
 
     // amx_Matmul_perf_float(128, 384, 51864);
     amx_Matmul_perf_float(128, 384, 51864, -1000);
+
+    amx_Matmul_perf_float(128, 385, 51864, -1000);
 
     amx_Matmul_perf_float(126, 384, 51872, -1000);
     amx_Matmul_perf_float(126+6, 384, 51872, -1000);
