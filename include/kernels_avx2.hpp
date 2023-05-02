@@ -208,32 +208,32 @@ struct Matmul {
             c0 = _mm256_fmadd_ps(a, b0, c0); \
             if (valid_n == 16) c1 = _mm256_fmadd_ps(a, b1, c1);
 
-        for(int k = 0; k < K; k++, pB += strideB) {
+        for(int k = 0; k < K; k++, pB += strideB, pA++) {
             b0 = _mm256_loadu_ps(pB);
             if (valid_n == 16) b1 = _mm256_loadu_ps(pB + 8);
 
             if (valid_m > 0) {
-                auto a0 = _mm256_set1_ps(pA[k + 0*strideA]);
+                auto a0 = _mm256_set1_ps(pA[0]);
                 FMADD(a0, b0, b1, c00, c01);
             }
             if (valid_m > 1) {
-                auto a1 = _mm256_set1_ps(pA[k + 1*strideA]);
+                auto a1 = _mm256_set1_ps(pA[1*strideA]);
                 FMADD(a1, b0, b1, c10, c11);
             }
             if (valid_m > 2) {
-                auto a2 = _mm256_set1_ps(pA[k + 2*strideA]);
+                auto a2 = _mm256_set1_ps(pA[2*strideA]);
                 FMADD(a2, b0, b1, c20, c21);
             }
             if (valid_m > 3) {
-                auto a3 = _mm256_set1_ps(pA[k + 3*strideA]);
+                auto a3 = _mm256_set1_ps(pA[3*strideA]);
                 FMADD(a3, b0, b1, c30, c31);
             }
             if (valid_m > 4) {
-                auto a4 = _mm256_set1_ps(pA[k + 4*strideA]);
+                auto a4 = _mm256_set1_ps(pA[4*strideA]);
                 FMADD(a4, b0, b1, c40, c41);
             }
             if (valid_m > 5) {
-                auto a5 = _mm256_set1_ps(pA[k + 5*strideA]);
+                auto a5 = _mm256_set1_ps(pA[5*strideA]);
                 FMADD(a5, b0, b1, c50, c51);
             }
         }
@@ -322,6 +322,7 @@ struct Matmul {
         if (use_dynTransB) {
             // dynamically transpose 16 rows of matB into internalB
             internalB.resize(1, rndup(K, 8) * 16);
+            internalB = 0;
             use_internalB = true;
         } else if (constB && internalB.capacity == 0) {
             reorderB(matB, n0, n1);

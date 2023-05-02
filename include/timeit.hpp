@@ -148,8 +148,13 @@ struct linux_perf_event {
 struct timeit {
     const char * app_version;
     std::vector<std::shared_ptr<linux_perf_event>> events;
+    int override_expect_times_milliseconds;
 
     timeit(const std::vector<std::tuple<uint32_t, uint32_t, const char *>> & type_config_names = {}) {
+        override_expect_times_milliseconds = 0;
+        if (std::getenv("TIMES")) {
+            override_expect_times_milliseconds = atoi(std::getenv("TIMES"));
+        }
         for(auto & tc : type_config_names) {
             events.emplace_back(new linux_perf_event(std::get<0>(tc), std::get<1>(tc), std::get<2>(tc)));
         }
@@ -225,6 +230,8 @@ struct timeit {
                       double opsPerCall = 0,
                       double peakOpsPerSecond = 0,
                       const char * unit = "Ops") {
+        if (override_expect_times_milliseconds)
+            expect_times_milliseconds = override_expect_times_milliseconds;
         int times;
         // cache warm-up
         std::cout << "warm-up..." << std::flush;

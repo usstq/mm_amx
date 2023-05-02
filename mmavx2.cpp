@@ -86,6 +86,19 @@ void amx_Matmul_perf_float(int M, int K, int N, int times = -1000) {
     MatmulMTOMP mmTr(false, true);
     std::cout << __func__ << " [" << M << "," << K << "," << N << "] ";
 
+    // projection based on memory bandwidth
+    double CacheBW_BpS = (710.0/6)  *1024*1024*1024; // L2 cache bandwidth ()
+    double DDRBW_BpS = (63.0/6)*1024*1024*1024;
+
+    // access A/B/C at lease once, in DDR bandwidth
+    auto latDDR = (A.capacity + double(B.capacity + C.capacity)/OMP_NT)/DDRBW_BpS;
+    // for each output point, 2*K reads from cache
+    auto latL2 = (M*N)*(2*K)*sizeof(float)/OMP_NT/CacheBW_BpS;
+    auto latL1 = (M*N)*(2*K)*sizeof(float)/OMP_NT/CacheBW_BpS;
+    auto latALU = (M*N/OMP_NT)*(K/8)/(2 * (OMP_NT > 1 ? 4.229e9 : 4.677e9)); // fmadd tput:0.5 @ 4GHz
+    std::cout << " Proj: MEM=" << (latDDR + latL2) * 1e3 << " ms (" << latDDR*1e3 << " + " << latL2*1e3 << ")"
+              << " ALU=" << latALU*1e3 << " ms" << std::endl;
+
     C0=0;
     matmul(A, B, C0, &Bias[0], [](float x){        return std::max(x, 0.0f);    });
     //matmul(A, B, C0);
