@@ -164,6 +164,31 @@ int main(int argc, const char *argv[]) {
 
     //test_all_bw(3);
 
+    if (0) {
+        avx2::PP::None nonepp;
+        constexpr int M = 14;
+        constexpr int N = 8;
+        int K = 1920;
+        tensor2D<float> A(6, K);
+        tensor2D<float> B(K, N, true);
+        tensor2D<float> C(6, N, true);
+        auto * pA = &A[0];
+        auto * pB = &B[0];
+        auto * pC = &C[0];
+        auto strideA = A.stride/sizeof(float);
+        auto strideB = B.stride/sizeof(float);
+        auto strideC = C.stride/sizeof(float);
+        auto latALU = (M*N)*(K/8)/(2 * 4.677e9);
+        auto latAVG = benchmark.tag("fc")(-10000, [&](){
+            //avx2::kernel_6x16<M, N>(pA, strideA, pB, strideB, pC, strideC, K, 0, nonepp);
+            //avx2::kernel_4x24<M, N>(pA, strideA, pB, strideB, pC, strideC, K, 0, nonepp);
+            //avx2::kernel_14x8<M, N>(pA, strideA, pB, strideB, pC, strideC, K, 0, nonepp);
+        });
+        std::cout << "Proj: ALU=" << latALU * 1e6 << " us " << latAVG*100/latALU << " %" << std::endl;
+        
+        return 0;
+    }
+
     // amx_Matmul_perf_float(128, 384, 51864);
     amx_Matmul_perf_float(128, 384, 1024, -1000);
 

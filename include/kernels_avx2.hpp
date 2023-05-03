@@ -102,7 +102,18 @@ namespace functional {
         }
     }
 }
+
 namespace PP {
+    struct None {
+        None() { };
+
+        template<int start=0, typename ... INT>
+        void prepare(int n0, INT ... ns) {}
+
+        template<typename ... M256>
+        FORCE_INLINE void exec(M256& ... vs) {}
+    };
+
     struct AddbiasRelu {
         float * bias;
         AddbiasRelu(float * bias) : bias(bias) {
@@ -110,21 +121,51 @@ namespace PP {
 
         __m256 bias0;
         __m256 bias1;
+        __m256 bias2;
+        __m256 bias3;
         __m256 zero;
-        FORCE_INLINE void prepare(int n) {
-            // prepare 2x8 biases
+
+        template<int start>
+        void prepare() {
+            // prepare zero
             zero = _mm256_setzero_ps();
-            bias0 = _mm256_loadu_ps(bias + n);
-            bias1 = _mm256_loadu_ps(bias + n + 8);
         }
 
-        FORCE_INLINE void exec(__m256 & v0, __m256 & v1) {
-            // bias
-            v0 = _mm256_add_ps(v0, bias0);
-            v1 = _mm256_add_ps(v1, bias1);
-            // relu
-            v0 = _mm256_max_ps(v0, zero);
-            v1 = _mm256_max_ps(v1, zero);
+        template<int start=0, typename ... INT>
+        void prepare(int n0, INT ... ns) {
+            // prepare biases
+            if (start == 0) bias0 = _mm256_loadu_ps(bias + n0);
+            if (start == 1) bias1 = _mm256_loadu_ps(bias + n0);
+            if (start == 2) bias2 = _mm256_loadu_ps(bias + n0);
+            if (start == 3) bias3 = _mm256_loadu_ps(bias + n0);
+            prepare<start+1>(ns...);
+        }
+
+        void relu(){}
+
+        template<typename ... M256>
+        void relu(__m256 & vfirst, M256& ... vs) {
+            vfirst = _mm256_max_ps(vfirst, zero);
+            relu(vs...);
+        }
+
+        // terminator
+        template<int start>
+        void add_bias() {}
+
+        template<int start=0, typename ... M256>
+        void add_bias(__m256 & vfirst, M256& ... vs) {
+            if (start == 0) vfirst = _mm256_add_ps(vfirst, bias0);
+            if (start == 1) vfirst = _mm256_add_ps(vfirst, bias1);
+            if (start == 2) vfirst = _mm256_add_ps(vfirst, bias2);
+            if (start == 3) vfirst = _mm256_add_ps(vfirst, bias3);
+            add_bias<start + 1>(vs...);
+        }
+
+        template<typename ... M256>
+        FORCE_INLINE void exec(M256& ... vs) {
+            add_bias(vs...);
+            relu(vs...);
         }
     };
 }
@@ -169,6 +210,166 @@ FORCE_INLINE void loop2D_ColumnMajor(int M, int N, F f) {
     }
 }
 
+#if 0
+
+// A: 14xK   B:Kx8 (no-transpose)  C: 14x8
+template<int valid_m, int valid_n, typename PP>
+void kernel_14x8(float * pA, int strideA,
+                 float * pB, int strideB,
+                 float * pC, int strideC,
+                 int K, int n,
+                 PP pp) {
+    static_assert(valid_n == 8);
+    __m256 c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13;
+    __m256 b0;
+
+    c0 = _mm256_setzero_ps();
+    c1 = _mm256_setzero_ps();
+    c2 = _mm256_setzero_ps();
+    c3 = _mm256_setzero_ps();
+    c4 = _mm256_setzero_ps();
+    c5 = _mm256_setzero_ps();
+    c6 = _mm256_setzero_ps();
+    c7 = _mm256_setzero_ps();
+    c8 = _mm256_setzero_ps();
+    c9 = _mm256_setzero_ps();
+    c10 = _mm256_setzero_ps();
+    c11 = _mm256_setzero_ps();
+    c12 = _mm256_setzero_ps();
+    c13 = _mm256_setzero_ps();
+
+    #define FMADD(n) \
+        if (valid_m > n) { \
+            auto a = _mm256_set1_ps(pA[n*strideA]); \
+            c##n = _mm256_fmadd_ps(a, b0, c##n); \
+        }
+
+    for(int k = 0; k < K; k++, pB += strideB, pA++) {
+        b0 = _mm256_loadu_ps(pB);
+        //_mm_prefetch(pB + 64, _MM_HINT_T0);
+
+        FMADD(0);
+        FMADD(1);
+        FMADD(2);
+        FMADD(3);
+        FMADD(4);
+        FMADD(5);
+        FMADD(6);
+        FMADD(7);
+        FMADD(8);
+        FMADD(9);
+        FMADD(10);
+        FMADD(11);
+        FMADD(12);
+        FMADD(13);
+    }
+
+    pp.prepare(n);
+
+    #define STORE(n) \
+        if (valid_m > n) { \
+            pp.exec(c##n);  \
+            _mm256_storeu_ps(pC, c##n);  \
+            pC += strideC; \
+        }
+
+    STORE(0);
+    STORE(1);
+    STORE(2);
+    STORE(3);
+    STORE(4);
+    STORE(5);
+    STORE(6);
+    STORE(7);
+    STORE(8);
+    STORE(9);
+    STORE(10);
+    STORE(11);
+    STORE(12);
+    STORE(13);
+
+    #undef FMADD
+    #undef STORE
+};
+
+// A: 4xK   B:Kx24 (no-transpose)  C: 4x24
+template<int valid_m, int valid_n, typename PP>
+void kernel_4x24(float * pA, int strideA,
+                 float * pB, int strideB,
+                 float * pC, int strideC,
+                 int K, int n,
+                 PP pp) {
+    __m256 c00, c01, c02;
+    __m256 c10, c11, c12;
+    __m256 c20, c21, c22;
+    __m256 c30, c31, c32;
+    __m256 b0, b1, b2;
+
+    #define SETZERO(c0, c1, c2) \
+        c0 = _mm256_setzero_ps();  \
+        if (valid_n > 8) c1 = _mm256_setzero_ps(); \
+        if (valid_n > 16) c2 = _mm256_setzero_ps();
+
+    SETZERO(c00, c01, c02);
+    if (valid_m > 1) { SETZERO(c10, c11, c12); }
+    if (valid_m > 2) { SETZERO(c20, c21, c22); }
+    if (valid_m > 3) { SETZERO(c30, c31, c32); }
+
+    #define FMADD(a, b0, b1, b2, c0, c1, c2) \
+        c0 = _mm256_fmadd_ps(a, b0, c0); \
+        if (valid_n > 8) c1 = _mm256_fmadd_ps(a, b1, c1); \
+        if (valid_n > 16) c2 = _mm256_fmadd_ps(a, b2, c2);
+
+    for(int k = 0; k < K; k++, pB += strideB, pA++) {
+        b0 = _mm256_loadu_ps(pB);
+        if (valid_n > 8) b1 = _mm256_loadu_ps(pB + 8);
+        if (valid_n > 16) b2 = _mm256_loadu_ps(pB + 16);
+
+        //_mm_prefetch(pB + 64, _MM_HINT_T0);
+
+        if (valid_m > 0) {
+            auto a0 = _mm256_set1_ps(pA[0]);
+            FMADD(a0, b0, b1, b2, c00, c01, c02);
+        }
+        if (valid_m > 1) {
+            auto a1 = _mm256_set1_ps(pA[1*strideA]);
+            FMADD(a1, b0, b1, b2, c10, c11, c12);
+        }
+        if (valid_m > 2) {
+            auto a2 = _mm256_set1_ps(pA[2*strideA]);
+            FMADD(a2, b0, b1, b2, c20, c21, c22);
+        }
+        if (valid_m > 3) {
+            auto a3 = _mm256_set1_ps(pA[3*strideA]);
+            FMADD(a3, b0, b1, b2, c30, c31, c32);
+        }
+    }
+
+    if (valid_n > 16)
+        pp.prepare(n, n+8, n+16);
+    else if (valid_n > 8)
+        pp.prepare(n, n+8);
+    else
+        pp.prepare(n);
+
+    #define STORE(c0, c1, c2) \
+        pp.exec(c0, c1, c2);  \
+        _mm256_storeu_ps(pC, c0);  \
+        if (valid_n > 8) _mm256_storeu_ps(pC + 8, c1);  \
+        if (valid_n > 16) _mm256_storeu_ps(pC + 16, c2);  \
+        pC += strideC;
+
+    STORE(c00, c01, c02);
+    if (valid_m > 1) { STORE(c10, c11, c12); }
+    if (valid_m > 2) { STORE(c20, c21, c22); }
+    if (valid_m > 3) { STORE(c30, c31, c32); }
+
+    #undef SETZERO
+    #undef FMADD
+    #undef STORE
+};
+#endif
+
 struct Matmul {
     tensor2D<float> internalB;
 
@@ -178,11 +379,11 @@ struct Matmul {
 
     // A: 6xK   B:Kx16 (no-transpose)  C: 6x16
     template<int valid_m, int valid_n, typename PP>
-    void kernel_6x16(float * pA, int strideA,
-                     float * pB, int strideB,
-                     float * pC, int strideC,
-                     int K, int n,
-                     PP pp) {
+    static void kernel_6x16(float * pA, int strideA,
+                            float * pB, int strideB,
+                            float * pC, int strideC,
+                            int K, int n,
+                            PP pp) {
         static_assert(valid_m > 0 && valid_m < 7);
         static_assert(valid_n == 8 || valid_n == 16);
         __m256 c00, c01;
@@ -212,6 +413,8 @@ struct Matmul {
             b0 = _mm256_loadu_ps(pB);
             if (valid_n == 16) b1 = _mm256_loadu_ps(pB + 8);
 
+            //_mm_prefetch(pB + 64, _MM_HINT_T0);
+
             if (valid_m > 0) {
                 auto a0 = _mm256_set1_ps(pA[0]);
                 FMADD(a0, b0, b1, c00, c01);
@@ -238,12 +441,15 @@ struct Matmul {
             }
         }
 
-        pp.prepare(n);
+        if (valid_n > 8)
+            pp.prepare(n, n+8);
+        else
+            pp.prepare(n);
 
         #define STORE(c0, c1) \
             pp.exec(c0, c1);  \
             _mm256_storeu_ps(pC, c0);  \
-           if (valid_n == 16) _mm256_storeu_ps(pC + 8, c1);  \
+            if (valid_n == 16) _mm256_storeu_ps(pC + 8, c1);  \
             pC += strideC;
 
         STORE(c00, c01);
@@ -252,8 +458,10 @@ struct Matmul {
         if (valid_m > 3) { STORE(c30, c31); }
         if (valid_m > 4) { STORE(c40, c41); }
         if (valid_m > 5) { STORE(c50, c51); }
+        #undef SETZERO
+        #undef FMADD
+        #undef STORE
     };
-
 
     void reorderB(tensor2D<float> & matB, int n0, int n1) {
         // transposeB : B_NxK
