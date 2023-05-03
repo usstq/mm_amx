@@ -17,18 +17,18 @@
 #include <omp.h>
 #include "test_bw.hpp"
 // https://raw.githubusercontent.com/intel/perfmon/main/SPR/events/sapphirerapids_core.json
-timeit benchmark;
-/*
+timeit benchmark
 (
     {
-        {PERF_TYPE_RAW, 0x3c, "CPU_CLK_UNHALTED.THREAD"},
+        {PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES, "HW_CYCLES"},
+        //{PERF_TYPE_RAW, 0x3c, "CPU_CLK_UNHALTED.THREAD"},
         //{PERF_TYPE_RAW, 0x81d0, "MEM_LOAD_RETIRED.ALL_LOADS"},
         //{PERF_TYPE_HW_CACHE, 0x10002, "LLC_load_misses"},
         //{PERF_TYPE_HW_CACHE, 0x2, "LLC_loads"},
         //{PERF_TYPE_RAW, 0x02b1, "UOPS_EXECUTED.CORE"},
     }
 );
-*/
+
 
 // vfmadd132ps ymm(8 floats)  Throughput (CPI)=0.5
 const double vfmaddOpsPerCycle = 16;
@@ -166,9 +166,9 @@ int main(int argc, const char *argv[]) {
 
     if (0) {
         avx2::PP::None nonepp;
-        constexpr int M = 14;
-        constexpr int N = 8;
-        int K = 1920;
+        constexpr int M = 6;
+        constexpr int N = 16;
+        int K = 1920*8;
         tensor2D<float> A(6, K);
         tensor2D<float> B(K, N, true);
         tensor2D<float> C(6, N, true);
@@ -180,12 +180,14 @@ int main(int argc, const char *argv[]) {
         auto strideC = C.stride/sizeof(float);
         auto latALU = (M*N)*(K/8)/(2 * 4.677e9);
         auto latAVG = benchmark.tag("fc")(-10000, [&](){
-            //avx2::kernel_6x16<M, N>(pA, strideA, pB, strideB, pC, strideC, K, 0, nonepp);
+            avx2::Matmul::kernel_6x16<M, N>(pA, strideA, pB, strideB, pC, strideC, K, 0, nonepp);
             //avx2::kernel_4x24<M, N>(pA, strideA, pB, strideB, pC, strideC, K, 0, nonepp);
             //avx2::kernel_14x8<M, N>(pA, strideA, pB, strideB, pC, strideC, K, 0, nonepp);
         });
         std::cout << "Proj: ALU=" << latALU * 1e6 << " us " << latAVG*100/latALU << " %" << std::endl;
         
+        if (benchmark.perf_counters.size())
+            std::cout << "Cycles per iteration in kernel: " << (double)benchmark.perf_counters[0]/K  << std::endl;
         return 0;
     }
 

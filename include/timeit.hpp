@@ -100,7 +100,8 @@ struct linux_perf_event {
 
         fd = perf_event_open(&attr, 0, -1, -1, 0);
         if (fd < 0) {
-            perror("perf_event_open");
+            perror("perf_event_open, consider:  echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid");
+            abort();
             return;
         }
         buf = (struct perf_event_mmap_page*)mmap(NULL, sysconf(_SC_PAGESIZE), PROT_READ, MAP_SHARED, fd, 0);
@@ -108,6 +109,7 @@ struct linux_perf_event {
             perror("mmap");
             close(fd);
             fd = -1;
+            abort();
             return;
         }
         std::ios::fmtflags f(std::cout.flags());
@@ -211,6 +213,8 @@ struct timeit {
         preset_peakOpsPerSecond = peak_per_second;
     }
 
+    std::vector<uint64_t> perf_counters;
+
     template<typename Callable>
     double operator()(const Callable & c,
                       double opsPerCall = 0,
@@ -270,14 +274,16 @@ struct timeit {
                     << peakOpsPerSecond/1e9 << " G" << unit << ")";
         }
 
+        perf_counters.resize(perf_counters0.size());
         for(int i = 0; i<perf_counters0.size(); i++) {
-            auto cnt = (perf_counters1[i] - perf_counters0[i])/times;
-            std::cout << ", " << events[i]->name << " = " << cnt;
+            perf_counters[i] = (perf_counters1[i] - perf_counters0[i])/times;
+            std::cout << ", " << events[i]->name << " = " << perf_counters[i];
         }
 
         std::cout << ANSIcolor() << std::endl;
         return avg_latency;
     }
+
 };
 
 

@@ -412,8 +412,8 @@ struct Matmul {
         for(int k = 0; k < K; k++, pB += strideB, pA++) {
             b0 = _mm256_loadu_ps(pB);
             if (valid_n == 16) b1 = _mm256_loadu_ps(pB + 8);
-
-            //_mm_prefetch(pB + 64, _MM_HINT_T0);
+            //if (pB < pBEnd) pB += strideB;
+            //_mm_prefetch(pB + 512, _MM_HINT_T0);
 
             if (valid_m > 0) {
                 auto a0 = _mm256_set1_ps(pA[0]);
@@ -505,8 +505,6 @@ struct Matmul {
         }
     }
 
-    bool use_internalB = false;
-    bool use_dynTransB = false;
     template<typename P>
     void operator()(tensor2D<float> & matA,
                     tensor2D<float> & matB,
@@ -523,59 +521,68 @@ struct Matmul {
         assert(N <= matC.dims[1]);
 
         auto strideA = matA.stride/sizeof(float);
-        int strideB;
+        auto strideB = matB.stride/sizeof(float);
         auto strideC = matC.stride/sizeof(float);
 
-        use_dynTransB = (!constB && transposeB);
-        if (use_dynTransB) {
-            // dynamically transpose 16 rows of matB into internalB
+        auto use_dynTransB = false;
+        auto use_dynReorderB = false;
+
+        if (constB) {
+            if (internalB.capacity == 0)
+                reorderB(matB, n0, n1);
+        } else {
+            // dynamically transpose/reorder 16 columns of matB into internalB
             internalB.resize(1, rndup(K, 8) * 16);
             internalB = 0;
-            use_internalB = true;
-        } else if (constB && internalB.capacity == 0) {
-            reorderB(matB, n0, n1);
-            use_internalB = true;
-        } else if (!constB && !transposeB) {
-            // use B matrix directly w/o copy it every time, because
-            // read B matrix is inevitable, direct access can avoid writting
-            // internalB again.
-            use_internalB = false;
+            use_dynTransB = transposeB;
+            use_dynReorderB = !transposeB;
         }
 
-        if (use_internalB)
-            strideB = 16;
-        else
-            strideB = matB.stride/sizeof(float);
+        constexpr int strideBi = 16;
 
         // do a 6x16 result, use 6x(2x8)=12 256bits register
         auto lambda_kernel_6x16 = [&](int m, int n, int valid_m, int valid_n) {
             auto * pA = &matA(m, 0);
             int ndst = (valid_n <= 8) ? (n1 - 8) : ((valid_n < 16) ? (n1 - 16) : n0 + n);
-            auto * pB = use_dynTransB ? &internalB[0] : (use_internalB ? &internalB(n >> 4, 0) : &matB(0, ndst));
+            auto * pB = (use_dynTransB || use_dynReorderB) ? &internalB[0] : &internalB(n >> 4, 0);
             auto * pC = &matC(m, ndst);
             if (use_dynTransB && m == 0) {
                 // dynamically transpose 16 rows of matB into internalB
-                functional::transpose_16xK_ps(&internalB[0], &matB(ndst, 0), matB.stride/sizeof(float), K);
+                functional::transpose_16xK_ps(&internalB[0], &matB(ndst, 0), strideB, K);
+            }
+            if (use_dynReorderB && m == 0) {
+                // dynamically reorder B matrix into continous internalB
+                auto * pBdst = &internalB[0];
+                auto * pBsrc = &matB(0, ndst);
+                for(int k = 0; k < K; k++) {
+                    auto b0 = _mm256_loadu_ps(pBsrc);
+                    auto b1 = _mm256_loadu_ps(pBsrc + 8);
+                    _mm_prefetch(pBsrc + 32*strideB, _MM_HINT_T1);
+                    _mm256_storeu_ps(pBdst, b0);
+                    _mm256_storeu_ps(pBdst + 8, b1);
+                    pBsrc += strideB;
+                    pBdst += strideBi;
+                }
             }
             if (valid_n <= 8) {
                 switch (valid_m)
                 {
-                    case 6: kernel_6x16<6, 8>(pA, strideA, pB, strideB, pC, strideC, K, ndst, pp); break;
-                    case 5: kernel_6x16<5, 8>(pA, strideA, pB, strideB, pC, strideC, K, ndst, pp); break;
-                    case 4: kernel_6x16<4, 8>(pA, strideA, pB, strideB, pC, strideC, K, ndst, pp); break;
-                    case 3: kernel_6x16<3, 8>(pA, strideA, pB, strideB, pC, strideC, K, ndst, pp); break;
-                    case 2: kernel_6x16<2, 8>(pA, strideA, pB, strideB, pC, strideC, K, ndst, pp); break;
-                    case 1: kernel_6x16<1, 8>(pA, strideA, pB, strideB, pC, strideC, K, ndst, pp); break;
+                    case 6: kernel_6x16<6, 8>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
+                    case 5: kernel_6x16<5, 8>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
+                    case 4: kernel_6x16<4, 8>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
+                    case 3: kernel_6x16<3, 8>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
+                    case 2: kernel_6x16<2, 8>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
+                    case 1: kernel_6x16<1, 8>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
                 }
             } else {
                 switch (valid_m)
                 {
-                    case 6: kernel_6x16<6, 16>(pA, strideA, pB, strideB, pC, strideC, K, ndst, pp); break;
-                    case 5: kernel_6x16<5, 16>(pA, strideA, pB, strideB, pC, strideC, K, ndst, pp); break;
-                    case 4: kernel_6x16<4, 16>(pA, strideA, pB, strideB, pC, strideC, K, ndst, pp); break;
-                    case 3: kernel_6x16<3, 16>(pA, strideA, pB, strideB, pC, strideC, K, ndst, pp); break;
-                    case 2: kernel_6x16<2, 16>(pA, strideA, pB, strideB, pC, strideC, K, ndst, pp); break;
-                    case 1: kernel_6x16<1, 16>(pA, strideA, pB, strideB, pC, strideC, K, ndst, pp); break;
+                    case 6: kernel_6x16<6, 16>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
+                    case 5: kernel_6x16<5, 16>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
+                    case 4: kernel_6x16<4, 16>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
+                    case 3: kernel_6x16<3, 16>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
+                    case 2: kernel_6x16<2, 16>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
+                    case 1: kernel_6x16<1, 16>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
                 }
             }
         };
