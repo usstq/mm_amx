@@ -10,6 +10,7 @@
 #include <cassert>
 #include <cstring>
 #include <thread>
+#include <cmath>
 
 #include "misc.hpp"
 #include "kernels_avx2.hpp"
@@ -155,12 +156,37 @@ void amx_Matmul_perf_float(int M, int K, int N, int times = -1000) {
     double(M * N) * K * 2);
 }
 
+int test_exp() {
+    float x[8] = {
+        0.1f, 12.2f, 3.4f, 80.0f,
+        -0.1f, -12.2f, -3.4f, -80.0f,
+    };
+    float y[8];
+    auto m256x = _mm256_loadu_ps(x);
+    avx2::functional::exp_ps(m256x);
+    _mm256_storeu_ps(y, m256x);
+    int errors = 0;
+    for(int i=0;i<8;i++) {
+        auto ref = expf(x[i]);
+        if (std::abs((y[i] - ref)/ref) > 0.0001f) {
+            errors++;
+            std::cout << ANSIcolor("31") << "error: " << y[i] << "   ref:" << expf(x[i]) << ANSIcolor() << std::endl;
+        }
+    }
+    if (errors == 0) {
+        std::cout << ANSIcolor("32") << __func__ << " Pass" << ANSIcolor() << std::endl;
+    }
+    return 0;
+}
+
 int main(int argc, const char *argv[]) {
     benchmark.set_app(argv[0]);
 
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
     std::cout << ANSIcolor("31") << "omp_get_num_threads() = " << omp_get_num_threads() << std::endl << ANSIcolor();
     std::cout << ANSIcolor("31") << "OMP_NT = " << OMP_NT << std::endl << ANSIcolor();
+
+    return test_exp();
 
     //test_all_bw(3);
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <cstring>
 #include <iostream>
 #include <functional>
 #ifdef ENABLE_NUMA

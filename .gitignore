@@ -1,0 +1,6 @@
+*.so
+*.s
+*.out
+torch-ext/build
+torch-ext/dist
+torch-ext/*.egg-info

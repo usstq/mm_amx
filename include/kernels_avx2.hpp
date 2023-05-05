@@ -101,6 +101,74 @@ namespace functional {
             pBdst += 8*16;
         }
     }
+
+    inline void exp_ps(__m256 & src) {
+        static __m256 exp_ln_flt_min_f = _mm256_castsi256_ps(_mm256_set1_epi32(0xc2aeac50));    // log(FLT_MIN)
+        static __m256 exp_ln_flt_max_f = _mm256_castsi256_ps(_mm256_set1_epi32(0x42b17218));    // log(FLT_MAX)
+        static __m256 exp_log2ef = _mm256_castsi256_ps(_mm256_set1_epi32(0x3fb8aa3b));          // log2(e)
+        static __m256 half = _mm256_castsi256_ps(_mm256_set1_epi32(0x3f000000));                // 0.5f
+        static __m256 ln2f = _mm256_castsi256_ps(_mm256_set1_epi32(0x3f317218));                // ln(2)
+        static __m256 one = _mm256_castsi256_ps(_mm256_set1_epi32(0x3f800000));                 // 1.0f
+        static __m256i exponent_bias = _mm256_set1_epi32(0x0000007f);                           // 127
+        static constexpr int n_mantissa_bits = 23;
+        static __m256 exp_pol1 = _mm256_castsi256_ps(_mm256_set1_epi32(0x3f7ffffb));            // p1 = 0.999999701f
+        static __m256 exp_pol2 = _mm256_castsi256_ps(_mm256_set1_epi32(0x3efffee3));            // p2 = 0.499991506f
+        static __m256 exp_pol3 = _mm256_castsi256_ps(_mm256_set1_epi32(0x3e2aad40));            // p3 = 0.166676521f
+        static __m256 exp_pol4 = _mm256_castsi256_ps(_mm256_set1_epi32(0x3d2b9d0d));            // p4 = 0.0418978221f
+        static __m256 exp_pol5 = _mm256_castsi256_ps(_mm256_set1_epi32(0x3c07cfce));            // p5 = 0.00828929059f
+        static __m256 two = _mm256_castsi256_ps(_mm256_set1_epi32(0x40000000));                 // 2
+        // exp(x) =
+        // = exp(n * ln(2) + r) // divide x by ln(2) and get quot and rem
+        // = 2^n * exp(r)       // simplify the exp(n*ln(2)) expression
+
+        // get mask of values lower than log(FLT_MIN) to zero them in the output
+        auto zero_mask = _mm256_cmp_ps(src, exp_ln_flt_min_f, _CMP_LT_OS);
+
+        // clip src
+        src = _mm256_min_ps(src, exp_ln_flt_max_f);
+        src = _mm256_max_ps(src, exp_ln_flt_min_f);
+
+        // aux1 : r
+        auto aux1 = src;
+
+        // calculate exp(x)
+        // fx = x * log2(e) + 0.5
+        src = _mm256_mul_ps(src, exp_log2ef);
+        src = _mm256_add_ps(src, half);
+
+        // tmp = floorf(fx)
+        src = _mm256_floor_ps(src);
+
+        // aux1 = x - fx * ln2
+        aux1 = _mm256_fnmadd_ps(src, ln2f, aux1);
+        
+        // We do not count 2^n here, because n can reach 128 and 2^128 is not
+        // representable by fp32, so to get around this problem, instead of computing
+        // 2^n * exp(r) will be counted 2*2^(n-1)*exp(r), because 2^127
+        // and 2 are numbers representable in fp32.
+
+        // compute 2^(n-1)
+        src = _mm256_sub_ps(src, one);
+        auto aux2_i = _mm256_cvtps_epi32(src);
+        aux2_i = _mm256_add_epi32(aux2_i, exponent_bias);
+        aux2_i = _mm256_slli_epi32 (aux2_i, n_mantissa_bits);
+
+        // set zeroes at those points which were < log(FLT_MIN)
+        auto zero = _mm256_setzero_ps();
+        auto aux2 = _mm256_blendv_ps(_mm256_castsi256_ps(aux2_i), zero, zero_mask);
+
+        // compute polynomial
+        src = exp_pol5;
+        src = _mm256_fmadd_ps(src, aux1, exp_pol4);
+        src = _mm256_fmadd_ps(src, aux1, exp_pol3);
+        src = _mm256_fmadd_ps(src, aux1, exp_pol2);
+        src = _mm256_fmadd_ps(src, aux1, exp_pol1);
+        src = _mm256_fmadd_ps(src, aux1, one);
+
+        // y = y * 2^n
+        src = _mm256_mul_ps(src, aux2);
+        src = _mm256_mul_ps(src, two);
+    }
 }
 
 namespace PP {
