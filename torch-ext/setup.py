@@ -11,7 +11,10 @@ setup(name='mha_opt',
       ext_modules=[
         cpp_extension.CppExtension(
                     'mha_opt', ['mha_opt.cpp'],
-                    extra_compile_args=['-fopenmp'],
+                    extra_compile_args=[ '-fopenmp',
+                                        '-mno-avx256-split-unaligned-load',
+                                        '-mno-avx256-split-unaligned-store',
+                                        '-march=native'],
                     extra_link_args=['-lgomp'])
       ],
       include_dirs=['../include'],

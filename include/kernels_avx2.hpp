@@ -102,6 +102,24 @@ namespace functional {
         }
     }
 
+    inline void hmax(__m256 & x) {
+        __m256 y;                       //x:  0 1 2 3   4 5 6 7
+        y = _mm256_permute_ps(x, 0x39); //y:  1 2 3 0   5 6 7 4
+        x = _mm256_max_ps(x, y);        //X:  01 12 23 30  45 56 67 74
+        y = _mm256_permute_ps(x, 0x4e); //y:  23 30 01 12  67 74 45 56
+        x = _mm256_max_ps(x, y);             //x: 0123 x x x   4567 x x x 
+        y = _mm256_permute2f128_ps(x, x, 1); //y: 4567 x x x  0123 x x x
+        x = _mm256_max_ps(x, y);             //x: 01234567 x x x x x x x
+    }
+    inline void hsum(__m256 & x) {
+        __m256 y;                       //x:  0 1 2 3   4 5 6 7
+        y = _mm256_permute_ps(x, 0x39); //y:  1 2 3 0   5 6 7 4
+        x = _mm256_add_ps(x, y);        //X:  01 12 23 30  45 56 67 74
+        y = _mm256_permute_ps(x, 0x4e); //y:  23 30 01 12  67 74 45 56
+        x = _mm256_add_ps(x, y);             //x: 0123 x x x   4567 x x x 
+        y = _mm256_permute2f128_ps(x, x, 1); //y: 4567 x x x  0123 x x x
+        x = _mm256_add_ps(x, y);             //x: 01234567 x x x x x x x
+    }
     inline void exp_ps(__m256 & src) {
         static __m256 exp_ln_flt_min_f = _mm256_castsi256_ps(_mm256_set1_epi32(0xc2aeac50));    // log(FLT_MIN)
         static __m256 exp_ln_flt_max_f = _mm256_castsi256_ps(_mm256_set1_epi32(0x42b17218));    // log(FLT_MAX)
@@ -168,6 +186,60 @@ namespace functional {
         // y = y * 2^n
         src = _mm256_mul_ps(src, aux2);
         src = _mm256_mul_ps(src, two);
+    }
+    
+    void softmax(float * v, int N) {
+        static __m256 one = _mm256_castsi256_ps(_mm256_set1_epi32(0x3f800000));                 // 1.0f
+        static __m256 lower_32 = _mm256_castsi256_ps(_mm256_set_epi32(0,0,0,0,0,0,0,-1));
+        auto x_max = _mm256_set1_ps(std::numeric_limits<float>::lowest());
+        int i;
+        for(i = 0; (i+8) <= N; i+=8) {
+            auto x = _mm256_loadu_ps(v + i);
+            x_max = _mm256_max_ps(x_max, x);
+        }
+        // tails
+        for(;i<N;i++) {
+            auto x = _mm256_broadcast_ss(v + i);
+            x_max = _mm256_max_ps(x_max, x);
+        }
+        avx2::functional::hmax(x_max);
+
+        // softmax
+        auto sum_exp = _mm256_setzero_ps();
+        for(i = 0; (i+8) <= N; i+=8) {
+            auto x = _mm256_loadu_ps(v + i);
+            x = _mm256_sub_ps(x, x_max);
+            avx2::functional::exp_ps(x);         // exp(x-x_max)
+            sum_exp = _mm256_add_ps(sum_exp, x); // sum(exp(x-x_max))
+            _mm256_storeu_ps(v + i, x);          // save exp(x-x_max)
+        }
+
+        if (i < N) {
+            auto sum_exp_tail = _mm256_setzero_ps();
+            for(;i<N;i++) {
+                auto x = _mm256_broadcast_ss(v + i);
+                x = _mm256_sub_ps(x, x_max);
+                avx2::functional::exp_ps(x);
+                sum_exp_tail = _mm256_add_ps(sum_exp_tail, x);
+                v[i] = _mm256_cvtss_f32(x);
+            }
+            sum_exp_tail = _mm256_and_ps(sum_exp_tail, lower_32);// only lowest f32 is valid sum
+            sum_exp = _mm256_add_ps(sum_exp, sum_exp_tail); // add tail
+        }
+        avx2::functional::hsum(sum_exp);
+        auto reciprocal_sum_exp = _mm256_div_ps(one, sum_exp);     // 1/sum_exp
+
+        // divide
+        for(i = 0; (i+8) <= N; i+=8) {
+            auto x = _mm256_loadu_ps(v + i);
+            x = _mm256_mul_ps(x, reciprocal_sum_exp);
+            _mm256_storeu_ps(v + i, x);
+        }
+        for(;i<N;i++) {
+            auto x = _mm256_broadcast_ss(v + i);
+            x = _mm256_mul_ps(x, reciprocal_sum_exp);
+            v[i] = _mm256_cvtss_f32(x);
+        }
     }
 }
 
@@ -446,14 +518,16 @@ struct Matmul {
     Matmul(bool constB = false, bool transposeB = false) : constB(constB), transposeB(transposeB) {};
 
     // A: 6xK   B:Kx16 (no-transpose)  C: 6x16
-    template<int valid_m, int valid_n, typename PP>
+    // when (valid_n < 8)||(valid_n > 8 && valid_n < 16)
+    // _mm256_maskstore_ps() is used to avoid write beyond
+    // the begin of C buffer
+    template<int valid_m, bool valid_n_gt8, typename PP>
     static void kernel_6x16(float * pA, int strideA,
                             float * pB, int strideB,
                             float * pC, int strideC,
                             int K, int n,
                             PP pp) {
         static_assert(valid_m > 0 && valid_m < 7);
-        static_assert(valid_n == 8 || valid_n == 16);
         __m256 c00, c01;
         __m256 c10, c11;
         __m256 c20, c21;
@@ -464,7 +538,7 @@ struct Matmul {
 
         #define SETZERO(c0, c1) \
             c0 = _mm256_setzero_ps();  \
-            if (valid_n == 16) c1 = _mm256_setzero_ps();
+            if (valid_n_gt8) c1 = _mm256_setzero_ps();
 
         SETZERO(c00, c01);
         if (valid_m > 1) { SETZERO(c10, c11); }
@@ -475,11 +549,11 @@ struct Matmul {
 
         #define FMADD(a, b0, b1, c0, c1) \
             c0 = _mm256_fmadd_ps(a, b0, c0); \
-            if (valid_n == 16) c1 = _mm256_fmadd_ps(a, b1, c1);
+            if (valid_n_gt8) c1 = _mm256_fmadd_ps(a, b1, c1);
 
         for(int k = 0; k < K; k++, pB += strideB, pA++) {
             b0 = _mm256_loadu_ps(pB);
-            if (valid_n == 16) b1 = _mm256_loadu_ps(pB + 8);
+            if (valid_n_gt8) b1 = _mm256_loadu_ps(pB + 8);
             //if (pB < pBEnd) pB += strideB;
             //_mm_prefetch(pB + 512, _MM_HINT_T0);
 
@@ -509,7 +583,7 @@ struct Matmul {
             }
         }
 
-        if (valid_n > 8)
+        if (valid_n_gt8)
             pp.prepare(n, n+8);
         else
             pp.prepare(n);
@@ -517,7 +591,7 @@ struct Matmul {
         #define STORE(c0, c1) \
             pp.exec(c0, c1);  \
             _mm256_storeu_ps(pC, c0);  \
-            if (valid_n == 16) _mm256_storeu_ps(pC + 8, c1);  \
+            if (valid_n_gt8) _mm256_storeu_ps(pC + 8, c1);  \
             pC += strideC;
 
         STORE(c00, c01);
@@ -526,9 +600,12 @@ struct Matmul {
         if (valid_m > 3) { STORE(c30, c31); }
         if (valid_m > 4) { STORE(c40, c41); }
         if (valid_m > 5) { STORE(c50, c51); }
+        #undef STORE
+
+
+
         #undef SETZERO
         #undef FMADD
-        #undef STORE
     };
 
     void reorderB(tensor2D<float> & matB, int n0, int n1) {
@@ -542,7 +619,7 @@ struct Matmul {
             internalB.resize((N + 15)/16, K*16);
             loop2D_no_bM<16>(1, N, [&](int m, int n, int valid_m, int valid_n) {
                 // align to right border of B at N tails
-                int nsrc = (valid_n <= 8) ? (n1 - 8) : ((valid_n < 16) ? (n1 - 16) : n0 + n);
+                int nsrc = (valid_n <= 8) ? (n1 - 8) : ((valid_n < 16) ? (n1 - 16) : (n0 + n));
                 auto * pBdst = &internalB(n/16, 0);
                 auto * pBsrc = &matB(0, nsrc);
                 for(int k = 0; k < K; k++) {
@@ -565,7 +642,7 @@ struct Matmul {
             internalB.resize((N + 15)/16, rndup(K, 8) *16);
             loop2D_no_bM<16>(1, N, [&](int m, int n, int valid_m, int valid_n) {
                 // align to right border of B at N tails
-                int nsrc = (valid_n <= 8) ? (n1 - 8) : ((valid_n < 16) ? (n1 - 16) : n0 + n);
+                int nsrc = (valid_n <= 8) ? (n1 - 8) : ((valid_n < 16) ? (n1 - 16) : (n0 + n));
                 auto * pBdst = &internalB(n/16, 0);
                 auto * pBsrc = &matB(nsrc, 0);
                 functional::transpose_16xK_ps(pBdst, pBsrc, strideB, K);
@@ -592,6 +669,8 @@ struct Matmul {
         auto strideB = matB.stride/sizeof(float);
         auto strideC = matC.stride/sizeof(float);
 
+        //std::cout << "Matmul:  transposeB=" << transposeB << "  M,K,N=" << M << "," << K << "," << N << "  strideA,B,C=" << strideA << "," << strideB << "," << strideC << std::endl;
+
         auto use_dynTransB = false;
         auto use_dynReorderB = false;
 
@@ -611,7 +690,7 @@ struct Matmul {
         // do a 6x16 result, use 6x(2x8)=12 256bits register
         auto lambda_kernel_6x16 = [&](int m, int n, int valid_m, int valid_n) {
             auto * pA = &matA(m, 0);
-            int ndst = (valid_n <= 8) ? (n1 - 8) : ((valid_n < 16) ? (n1 - 16) : n0 + n);
+            int ndst = (valid_n <= 8) ? (n1 - 8) : ((valid_n < 16) ? (n1 - 16) : (n0 + n));
             auto * pB = (use_dynTransB || use_dynReorderB) ? &internalB[0] : &internalB(n >> 4, 0);
             auto * pC = &matC(m, ndst);
             if (use_dynTransB && m == 0) {
@@ -632,25 +711,29 @@ struct Matmul {
                     pBdst += strideBi;
                 }
             }
+            // when valid_n < 8, the store of row if c0 is shifted left so it won't access beyond the end of row
+            // but if at the same time n1 < 8 (ndst < 0), it may store beyond the head of the row, so _mm256_maskstore_ps/vmaskmovps
+            // has to be used to prevent it (this instruction is slower than _mm256_storeu_ps/vmovups in terms of
+            // both throughput & latency)
             if (valid_n <= 8) {
                 switch (valid_m)
                 {
-                    case 6: kernel_6x16<6, 8>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
-                    case 5: kernel_6x16<5, 8>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
-                    case 4: kernel_6x16<4, 8>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
-                    case 3: kernel_6x16<3, 8>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
-                    case 2: kernel_6x16<2, 8>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
-                    case 1: kernel_6x16<1, 8>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
+                    case 6: kernel_6x16<6, false>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
+                    case 5: kernel_6x16<5, false>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
+                    case 4: kernel_6x16<4, false>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
+                    case 3: kernel_6x16<3, false>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
+                    case 2: kernel_6x16<2, false>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
+                    case 1: kernel_6x16<1, false>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
                 }
             } else {
                 switch (valid_m)
                 {
-                    case 6: kernel_6x16<6, 16>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
-                    case 5: kernel_6x16<5, 16>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
-                    case 4: kernel_6x16<4, 16>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
-                    case 3: kernel_6x16<3, 16>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
-                    case 2: kernel_6x16<2, 16>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
-                    case 1: kernel_6x16<1, 16>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
+                    case 6: kernel_6x16<6, true>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
+                    case 5: kernel_6x16<5, true>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
+                    case 4: kernel_6x16<4, true>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
+                    case 3: kernel_6x16<3, true>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
+                    case 2: kernel_6x16<2, true>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
+                    case 1: kernel_6x16<1, true>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
                 }
             }
         };

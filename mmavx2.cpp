@@ -179,6 +179,116 @@ int test_exp() {
     return 0;
 }
 
+int test_hmax() {
+    float x[8] = {
+        0.1f, 12.2f, 3.4f, 80.0f,
+        -0.1f, -12.2f, -3.4f, -80.0f,
+    };
+    float y[8];
+    int errors = 0;
+    for(int i=0; i<8; i++) {
+        x[i] = 654.123f;
+        auto m256x = _mm256_loadu_ps(x);
+        avx2::functional::hmax(m256x);
+        _mm256_storeu_ps(y, m256x);
+        for(int k=0;k<8;k++) {
+            if (y[k] != x[i]) {
+                errors++;
+                std::cout << ANSIcolor("31") << "error: " << y[k] << " != max " << x[i] << ANSIcolor() << std::endl;
+            }
+        }
+        x[i] = i;
+    }
+    if (errors == 0) {
+        std::cout << ANSIcolor("32") << __func__ << " Pass" << ANSIcolor() << std::endl;
+    }
+    return 0;
+}
+
+int test_softmax() {
+    tensor2D<float> x;
+    tensor2D<float> y0;
+    tensor2D<float> y1;
+
+    auto softmax_ref = [&](tensor2D<float>& x, tensor2D<float>& y) {
+        float x_max = std::numeric_limits<float>::lowest();
+        for(int i = 0; i < x.dims[1]; i++) {
+            x_max = std::max(x_max, x[i]);
+        }
+        y = x.clone();
+        float sum = 0;
+        for(int i = 0; i < x.dims[1]; i++) {
+            y[i] = expf(x[i]-x_max);
+            sum += y[i];
+        }
+        for(int i = 0; i < x.dims[1]; i++) {
+            y[i] = y[i]/sum;
+        }
+    };
+    int errors = 0;
+    for(int N = 1; N < 129; N++) {
+        x.resize(1, N);
+        x.fill_rnd();
+        softmax_ref(x, y0);
+        y1 = x.clone();
+        avx2::functional::softmax(&y1[0], N);
+        for(int i=0;i<N;i++) {
+            if (abs((y0[i] - y1[i])/y0[i]) > 0.0001f) {
+                errors ++;
+                std::cout << "#" << i << "/" << N << ":  " <<y0[i] << " vs " << y1[i] << " diff " << (y0[i] - y1[i]) << std::endl;
+            }
+        }
+    }
+    if (errors == 0) {
+        std::cout << ANSIcolor("32") << __func__ << " Pass" << ANSIcolor() << std::endl;
+    }
+    return 0;
+}
+
+// confirmed, _mm256_maskstore_ps support dest address unaligned to 256bits
+int test_vmaskmovps_alignment () {
+    float data[8] = {0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 0.6f, 0.7f, 0.8f};
+    int32_t mask[8] = {-1, 0, -1, 0, -1, 0, -1, 0};
+    float data_masked[8] = {0.1f, 0, 0.3f, 0, 0.5f, 0, 0.7f, 0};
+    float data_cmp[8];
+
+    float a[64];
+
+    auto ymm = _mm256_loadu_ps(data);
+    auto ymm_mask = _mm256_loadu_si256((__m256i const *)mask);
+    int errors = 0;
+    for(int i=0;i<64-8;i++) {
+        for(int k=0;k<64;k++) {
+            a[k] = k;
+        }
+        _mm256_maskstore_ps(a + i, ymm_mask, ymm);
+        
+        for(int k=0;k<64;k++) {
+            int offset = k-i;
+            float expect = k;
+            if (offset >=0 && offset <8 && ((offset & 1) == 0))  expect = data[offset];
+            if (a[k] != expect) {
+                errors++;
+                std::cout << "when i==" << i << " a[" << k << "] is " << a[k] << ", expect " << expect << std::endl; 
+            }
+        }
+
+        // _mm256_maskload_ps also support
+        auto ymm_load = _mm256_maskload_ps(a + i, ymm_mask);
+        _mm256_storeu_ps(data_cmp, ymm_load);
+        for(int k=0;k<8;k++) {
+            if (data_cmp[k] != data_masked[k]) {
+                errors++;
+            }
+        }
+    }
+    if (errors == 0) {
+        std::cout << ANSIcolor("32") << __func__ << " Pass" << ANSIcolor() << std::endl;
+    }else{
+        std::cout << ANSIcolor("31") << __func__ << " Failed" << ANSIcolor() << std::endl;
+    }
+    return 0;
+}
 int main(int argc, const char *argv[]) {
     benchmark.set_app(argv[0]);
 
@@ -186,14 +296,17 @@ int main(int argc, const char *argv[]) {
     std::cout << ANSIcolor("31") << "omp_get_num_threads() = " << omp_get_num_threads() << std::endl << ANSIcolor();
     std::cout << ANSIcolor("31") << "OMP_NT = " << OMP_NT << std::endl << ANSIcolor();
 
-    return test_exp();
-
+    //return test_vmaskmovps_alignment();
+    //return test_exp();
+    //return test_hmax();
+    //return test_softmax();
     //test_all_bw(3);
 
     if (0) {
         avx2::PP::None nonepp;
         constexpr int M = 6;
         constexpr int N = 16;
+        constexpr bool Ngt8 = N>8;
         int K = 1920*8;
         tensor2D<float> A(6, K);
         tensor2D<float> B(K, N, true);
@@ -206,7 +319,7 @@ int main(int argc, const char *argv[]) {
         auto strideC = C.stride/sizeof(float);
         auto latALU = (M*N)*(K/8)/(2 * 4.677e9);
         auto latAVG = benchmark.tag("fc")(-10000, [&](){
-            avx2::Matmul::kernel_6x16<M, N>(pA, strideA, pB, strideB, pC, strideC, K, 0, nonepp);
+            avx2::Matmul::kernel_6x16<M, Ngt8>(pA, strideA, pB, strideB, pC, strideC, K, 0, nonepp);
             //avx2::kernel_4x24<M, N>(pA, strideA, pB, strideB, pC, strideC, K, 0, nonepp);
             //avx2::kernel_14x8<M, N>(pA, strideA, pB, strideB, pC, strideC, K, 0, nonepp);
         });
