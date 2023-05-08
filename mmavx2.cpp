@@ -319,7 +319,7 @@ int main(int argc, const char *argv[]) {
         auto strideC = C.stride/sizeof(float);
         auto latALU = (M*N)*(K/8)/(2 * 4.677e9);
         auto latAVG = benchmark.tag("fc")(-10000, [&](){
-            avx2::Matmul::kernel_6x16<M, Ngt8>(pA, strideA, pB, strideB, pC, strideC, K, 0, nonepp);
+            avx2::Matmul::kernel_6x16<M, Ngt8>(pA, strideA, pB, strideB, pC, strideC, K, 0, _mm256_set1_epi32(-1), nonepp);
             //avx2::kernel_4x24<M, N>(pA, strideA, pB, strideB, pC, strideC, K, 0, nonepp);
             //avx2::kernel_14x8<M, N>(pA, strideA, pB, strideB, pC, strideC, K, 0, nonepp);
         });
@@ -331,6 +331,8 @@ int main(int argc, const char *argv[]) {
     }
 
     // amx_Matmul_perf_float(128, 384, 51864);
+    amx_Matmul_perf_float(128, 384, 2, -1000);
+
     amx_Matmul_perf_float(128, 384, 1024, -1000);
 
     amx_Matmul_perf_float(128, 384, 51864, -1000);

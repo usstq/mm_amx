@@ -525,7 +525,7 @@ struct Matmul {
     static void kernel_6x16(float * pA, int strideA,
                             float * pB, int strideB,
                             float * pC, int strideC,
-                            int K, int n,
+                            int K, int n, __m256i n_mask,
                             PP pp) {
         static_assert(valid_m > 0 && valid_m < 7);
         __m256 c00, c01;
@@ -588,21 +588,36 @@ struct Matmul {
         else
             pp.prepare(n);
 
-        #define STORE(c0, c1) \
-            pp.exec(c0, c1);  \
-            _mm256_storeu_ps(pC, c0);  \
-            if (valid_n_gt8) _mm256_storeu_ps(pC + 8, c1);  \
-            pC += strideC;
+        if (n < 0) {
+            // use `vmaskmovps` in first store to prevent access beyond the begin
+            #define STORE(c0, c1) \
+                pp.exec(c0, c1);  \
+                _mm256_maskstore_ps(pC, n_mask, c0); \
+                if (valid_n_gt8) _mm256_storeu_ps(pC + 8, c1);  \
+                pC += strideC;
 
-        STORE(c00, c01);
-        if (valid_m > 1) { STORE(c10, c11); }
-        if (valid_m > 2) { STORE(c20, c21); }
-        if (valid_m > 3) { STORE(c30, c31); }
-        if (valid_m > 4) { STORE(c40, c41); }
-        if (valid_m > 5) { STORE(c50, c51); }
-        #undef STORE
+            STORE(c00, c01);
+            if (valid_m > 1) { STORE(c10, c11); }
+            if (valid_m > 2) { STORE(c20, c21); }
+            if (valid_m > 3) { STORE(c30, c31); }
+            if (valid_m > 4) { STORE(c40, c41); }
+            if (valid_m > 5) { STORE(c50, c51); }
+            #undef STORE
+        } else {
+            #define STORE(c0, c1) \
+                pp.exec(c0, c1);  \
+                _mm256_storeu_ps(pC, c0);  \
+                if (valid_n_gt8) _mm256_storeu_ps(pC + 8, c1);  \
+                pC += strideC;
 
-
+            STORE(c00, c01);
+            if (valid_m > 1) { STORE(c10, c11); }
+            if (valid_m > 2) { STORE(c20, c21); }
+            if (valid_m > 3) { STORE(c30, c31); }
+            if (valid_m > 4) { STORE(c40, c41); }
+            if (valid_m > 5) { STORE(c50, c51); }
+            #undef STORE
+        }
 
         #undef SETZERO
         #undef FMADD
@@ -687,6 +702,16 @@ struct Matmul {
 
         constexpr int strideBi = 16;
 
+        //
+        __m256i n_mask;
+        int32_t i32_n_mask[8];
+        if (N & 7) {
+            auto n_invalid = 8 - (N&7);
+            memset(i32_n_mask, 0xFF, sizeof(i32_n_mask));
+            for(int i = 0; i<n_invalid; i++) i32_n_mask[i] = 0;
+            n_mask = _mm256_loadu_si256((__m256i const *)i32_n_mask);
+        }
+
         // do a 6x16 result, use 6x(2x8)=12 256bits register
         auto lambda_kernel_6x16 = [&](int m, int n, int valid_m, int valid_n) {
             auto * pA = &matA(m, 0);
@@ -718,22 +743,22 @@ struct Matmul {
             if (valid_n <= 8) {
                 switch (valid_m)
                 {
-                    case 6: kernel_6x16<6, false>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
-                    case 5: kernel_6x16<5, false>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
-                    case 4: kernel_6x16<4, false>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
-                    case 3: kernel_6x16<3, false>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
-                    case 2: kernel_6x16<2, false>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
-                    case 1: kernel_6x16<1, false>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
+                    case 6: kernel_6x16<6, false>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, n_mask, pp); break;
+                    case 5: kernel_6x16<5, false>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, n_mask, pp); break;
+                    case 4: kernel_6x16<4, false>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, n_mask, pp); break;
+                    case 3: kernel_6x16<3, false>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, n_mask, pp); break;
+                    case 2: kernel_6x16<2, false>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, n_mask, pp); break;
+                    case 1: kernel_6x16<1, false>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, n_mask, pp); break;
                 }
             } else {
                 switch (valid_m)
                 {
-                    case 6: kernel_6x16<6, true>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
-                    case 5: kernel_6x16<5, true>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
-                    case 4: kernel_6x16<4, true>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
-                    case 3: kernel_6x16<3, true>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
-                    case 2: kernel_6x16<2, true>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
-                    case 1: kernel_6x16<1, true>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, pp); break;
+                    case 6: kernel_6x16<6, true>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, n_mask, pp); break;
+                    case 5: kernel_6x16<5, true>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, n_mask, pp); break;
+                    case 4: kernel_6x16<4, true>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, n_mask, pp); break;
+                    case 3: kernel_6x16<3, true>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, n_mask, pp); break;
+                    case 2: kernel_6x16<2, true>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, n_mask, pp); break;
+                    case 1: kernel_6x16<1, true>(pA, strideA, pB, strideBi, pC, strideC, K, ndst, n_mask, pp); break;
                 }
             }
         };
