@@ -241,6 +241,57 @@ namespace functional {
             v[i] = _mm256_cvtss_f32(x);
         }
     }
+
+    // gelu_erf_minimax_approx_compute_vector_fwd in oneDNN
+    //   x*0.5*(1+erf(x/sqrt(2))) = x*0.5*(1 + x*Polynomial(x^2))
+    inline __m256 gelu_erf_minmax_approx(__m256 & x) {
+        auto x2 = _mm256_mul_ps(x, x); // x^2
+        
+        auto x_positive = _mm256_castsi256_ps(_mm256_and_si256(_mm256_castps_si256(x), _mm256_set1_epi32(0x7FFFFFFF)));    // clear sign mask
+        auto x_half = _mm256_mul_ps(x, _mm256_set1_ps(0.5f));
+
+        auto poly = _mm256_castsi256_ps(_mm256_set1_epi32(0x1f1c83fd));
+        poly = _mm256_fmadd_ps(poly, x2, _mm256_castsi256_ps(_mm256_set1_epi32(0xa3198977))); // poly * x^2 + xxx
+        poly = _mm256_fmadd_ps(poly, x2, _mm256_castsi256_ps(_mm256_set1_epi32(0x268a7927)));
+        poly = _mm256_fmadd_ps(poly, x2, _mm256_castsi256_ps(_mm256_set1_epi32(0xa998c963)));
+        poly = _mm256_fmadd_ps(poly, x2, _mm256_castsi256_ps(_mm256_set1_epi32(0x2c67ddb2)));
+        poly = _mm256_fmadd_ps(poly, x2, _mm256_castsi256_ps(_mm256_set1_epi32(0xaf013b2c)));
+        poly = _mm256_fmadd_ps(poly, x2, _mm256_castsi256_ps(_mm256_set1_epi32(0x315d4a4f)));
+        poly = _mm256_fmadd_ps(poly, x2, _mm256_castsi256_ps(_mm256_set1_epi32(0xb3969b11)));
+        poly = _mm256_fmadd_ps(poly, x2, _mm256_castsi256_ps(_mm256_set1_epi32(0x35a776e9)));
+        poly = _mm256_fmadd_ps(poly, x2, _mm256_castsi256_ps(_mm256_set1_epi32(0xb79b0914)));
+        poly = _mm256_fmadd_ps(poly, x2, _mm256_castsi256_ps(_mm256_set1_epi32(0x3970b255)));
+        poly = _mm256_fmadd_ps(poly, x2, _mm256_castsi256_ps(_mm256_set1_epi32(0xbb1b7399)));
+        poly = _mm256_fmadd_ps(poly, x2, _mm256_castsi256_ps(_mm256_set1_epi32(0x3ca3621f)));
+        poly = _mm256_fmadd_ps(poly, x2, _mm256_castsi256_ps(_mm256_set1_epi32(0xbe082bc7)));
+        poly = _mm256_fmadd_ps(poly, x2, _mm256_castsi256_ps(_mm256_set1_epi32(0x3f4c4228)));
+
+        // 1.0f + erf(x * inv_sqrt2) = 1.0f + x * P(x^2)
+        poly = _mm256_fmadd_ps(poly, x, _mm256_set1_ps(1.0f));
+        // x*0.5*(1 + x*Polynomial(x^2))
+        poly = _mm256_mul_ps(poly, x_half);
+
+        // combine:
+        // zone_id
+        //  1 -inf; -saturation_lbound           : 0.0f
+        //  2 -saturation_lbound; -linear_ubound : x*0.5*(1 + x*Polynomial(x^2))
+        //  3 -linear_ubound, linear_ubound         : x*0.5
+        //  4 linear_ubound : saturation_lbound     : x*0.5*(1 + x*Polynomial(x^2))
+        //  5 saturation_lbound: +inf               : x
+        constexpr int neg_saturation_lbound = 0xc0a00000;
+        constexpr int linear_ubound = 0x33800000;
+        constexpr int saturation_lbound = 0x40a00000;
+
+        auto mask_x_not_zone1 = _mm256_cmp_ps(x, _mm256_castsi256_ps(_mm256_set1_epi32(neg_saturation_lbound)), _CMP_NLT_UQ);
+        x = _mm256_blendv_ps(_mm256_setzero_ps(), x, mask_x_not_zone1); // not_zone1 => keep x
+
+        auto mask_x_in_zone5 = _mm256_cmp_ps(x_positive, _mm256_castsi256_ps(_mm256_set1_epi32(saturation_lbound)), _CMP_NLE_UQ);
+        poly = _mm256_blendv_ps(poly, x, mask_x_in_zone5);
+
+        auto mask_x_in_zone3 = _mm256_cmp_ps(x_positive, _mm256_castsi256_ps(_mm256_set1_epi32(linear_ubound)), _CMP_LE_OQ);
+        poly = _mm256_blendv_ps(poly, x_half, mask_x_in_zone3);
+        return poly;
+    }
 }
 
 namespace PP {
@@ -254,9 +305,16 @@ namespace PP {
         FORCE_INLINE void exec(M256& ... vs) {}
     };
 
-    struct AddbiasRelu {
+    enum Act {
+        Act_NONE = 0,
+        Act_RELU = 1,
+        Act_GELU = 2,
+    };
+
+    template<Act act>
+    struct AddbiasAct {
         float * bias;
-        AddbiasRelu(float * bias) : bias(bias) {
+        AddbiasAct(float * bias) : bias(bias) {
         };
 
         __m256 bias0;
@@ -289,6 +347,14 @@ namespace PP {
             relu(vs...);
         }
 
+        void gelu(){}
+
+        template<typename ... M256>
+        void gelu(__m256 & vfirst, M256& ... vs) {
+            vfirst = functional::gelu_erf_minmax_approx(vfirst);
+            gelu(vs...);
+        }
+
         // terminator
         template<int start>
         void add_bias() {}
@@ -305,7 +371,10 @@ namespace PP {
         template<typename ... M256>
         FORCE_INLINE void exec(M256& ... vs) {
             add_bias(vs...);
-            relu(vs...);
+            if (act == Act_RELU)
+                relu(vs...);
+            if (act == Act_GELU)
+                gelu(vs...);
         }
     };
 }

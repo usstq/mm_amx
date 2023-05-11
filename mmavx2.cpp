@@ -74,6 +74,7 @@ struct MatmulMTOMP {
     }
 };
 
+template<avx2::PP::Act act = avx2::PP::Act_GELU>
 void amx_Matmul_perf_float(int M, int K, int N, int times = -1000) {
     tensor2D<float> A(M, K);
     tensor2D<float> B(K, N);
@@ -81,7 +82,7 @@ void amx_Matmul_perf_float(int M, int K, int N, int times = -1000) {
     tensor2D<float> C(M, N);
     tensor2D<float> C0(M, N);
     tensor2D<float> Bias(1, N);
-    avx2::PP::AddbiasRelu pp(&Bias[0]);
+    avx2::PP::AddbiasAct<act> pp(&Bias[0]);
     MatmulMTOMP fc(true, false);
     MatmulMTOMP mm(false, false);
     MatmulMTOMP mmTr(false, true);
@@ -101,7 +102,13 @@ void amx_Matmul_perf_float(int M, int K, int N, int times = -1000) {
               << " ALU=" << latALU*1e3 << " ms" << std::endl;
 
     C0=0;
-    matmul(A, B, C0, &Bias[0], [](float x){        return std::max(x, 0.0f);    });
+    matmul(A, B, C0, &Bias[0], [](float x){
+        if (act == avx2::PP::Act_GELU)
+            return x*0.5f*float(1 + std::erf(x/std::sqrt(2)));
+        if (act == avx2::PP::Act_RELU)
+            return std::max(x, 0.0f);
+        return x;
+    });
     //matmul(A, B, C0);
     C = 0;
     fc(A, B, C, pp);
