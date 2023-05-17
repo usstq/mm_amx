@@ -39,7 +39,7 @@ static inline float _mm256_reduce_add_ps(__m256 x) {
     return _mm_cvtss_f32(x32);
 }
 
-static float sum(float* src, size_t ele_num) {
+static inline float sum(float* src, size_t ele_num) {
     size_t i = 0;
     __m256 s;
     s = _mm256_xor_ps(s, s);
@@ -56,7 +56,7 @@ static float sum(float* src, size_t ele_num) {
     return _mm256_reduce_add_ps(s);
 }
 
-static float sum_power2(float* src, float mean, size_t ele_num) {
+static inline float sum_power2(float* src, float mean, size_t ele_num) {
     size_t i = 0;
     __m256 s, zero;
     s = _mm256_xor_ps(s, s);
@@ -78,7 +78,7 @@ static float sum_power2(float* src, float mean, size_t ele_num) {
     return _mm256_reduce_add_ps(s);
 }
 
-static void mvn(float* src, float mean, float var, size_t ele_num, float* dst) {
+static inline void mvn(float* src, float mean, float var, size_t ele_num, float* dst) {
     size_t i = 0;
     auto m = _mm256_set1_ps(mean);
     auto v = _mm256_set1_ps(var);
@@ -100,7 +100,7 @@ static void mvn(float* src, float mean, float var, size_t ele_num, float* dst) {
     }
 }
 
-inline void mvn_line(float* src, size_t ele_num, float eps, bool inside_sqrt, float *dst) {
+inline void mvn_line(float* src, size_t ele_num, float eps, bool inside_sqrt, float* dst) {
     // mean
     float mean = sum(src, ele_num) / ele_num;
     // var
@@ -108,4 +108,44 @@ inline void mvn_line(float* src, size_t ele_num, float eps, bool inside_sqrt, fl
     var = 1.0f / (inside_sqrt ? std::sqrt(var + eps) : std::sqrt(var) + eps);
     // mvn
     mvn(src, mean, var, ele_num, dst);
+}
+
+static inline void mvn_scale_bias(float* src, float mean, float var, size_t ele_num, float* dst, float* scale, float* bias) {
+    size_t i = 0;
+    auto m = _mm256_set1_ps(mean);
+    auto v = _mm256_set1_ps(var);
+    for (; i < ele_num / 8 * 8; i += 8) {
+        auto a0_f = _mm256_loadu_ps(src);
+        auto b = _mm256_loadu_ps(bias);
+        auto s = _mm256_loadu_ps(scale);
+        a0_f = _mm256_sub_ps(a0_f, m);
+        a0_f = _mm256_mul_ps(a0_f, v);
+        a0_f = _mm256_fmadd_ps(a0_f, s, b);
+        _mm256_storeu_si256(reinterpret_cast<__m256i *>(dst), (__m256i)a0_f);
+
+        src += 8;
+        dst += 8;
+        bias += 8;
+        scale += 8;
+    }
+    if (i != ele_num) {
+        auto msk = get_mask(ele_num - i);
+        auto a0_f = _mm256_maskload_ps(src, msk);
+        auto b = _mm256_maskload_ps(bias, msk);
+        auto s = _mm256_maskload_ps(scale, msk);
+        a0_f = _mm256_sub_ps(a0_f, m);
+        a0_f = _mm256_mul_ps(a0_f, v);
+        a0_f = _mm256_fmadd_ps(a0_f, s, b);
+        _mm256_maskstore_ps(dst, msk, a0_f);
+    }
+}
+
+inline void mvn_line_scale_bias(float* src, size_t ele_num, float eps, bool inside_sqrt, float *dst, float* scale, float* bias) {
+    // mean
+    float mean = sum(src, ele_num) / ele_num;
+    // var
+    float var = sum_power2(src, mean, ele_num) / ele_num;
+    var = 1.0f / (inside_sqrt ? std::sqrt(var + eps) : std::sqrt(var) + eps);
+    // mvn
+    mvn_scale_bias(src, mean, var, ele_num, dst, scale, bias);
 }

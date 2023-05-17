@@ -42,10 +42,12 @@ int test_mvn() {
     tensor2D<float> x;
     tensor2D<float> y0;
     tensor2D<float> y1;
+    tensor2D<float> bias;
+    tensor2D<float> scale;
     float eps = 1e-5;
     bool inside_sqrt = true;
 
-    auto mvn_ref = [&](tensor2D<float>& x, tensor2D<float>& y) {
+    auto mvn_ref = [&](tensor2D<float>& x, tensor2D<float>& y, tensor2D<float>& scale, tensor2D<float>& bias) {
         float x_max = std::numeric_limits<float>::lowest();
         float sum = 0;
         auto ele_num = x.dims[1];
@@ -60,17 +62,21 @@ int test_mvn() {
         float var = sum_power2 / ele_num;
         var = 1.0f / (inside_sqrt ? std::sqrt(var + eps) : std::sqrt(var) + eps);
         for(int i = 0; i < x.dims[1]; i++) {
-            y[i] = (x[i] - mean) * var;
+            y[i] = (x[i] - mean) * var * scale[i] + bias[i];
         }
     };
     int errors = 0;
     for(int N = 1; N < 129; N++) {
         x.resize(1, N);
         x.fill_rnd();
+        bias.resize(1, N);
+        bias.fill_rnd();
+        scale.resize(1, N);
+        scale.fill_rnd();
         y0 = x.clone();
         y1 = x.clone();
-        mvn_ref(x, y0);
-        mvn_line(&x[0], N, eps, inside_sqrt, &y1[0]);
+        mvn_ref(x, y0, scale, bias);
+        mvn_line_scale_bias(&x[0], N, eps, inside_sqrt, &y1[0], &scale[0], &bias[0]);
         for(int i=0;i<N;i++) {
             if (abs((y0[i] - y1[i])/y0[i]) > 0.0001f) {
                 errors ++;
