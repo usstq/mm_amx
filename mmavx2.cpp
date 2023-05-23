@@ -74,7 +74,7 @@ struct MatmulMTOMP {
     }
 };
 
-template<avx2::PP::Act act = avx2::PP::Act_GELU>
+template<avx2::PP::Act act = avx2::PP::Act_RELU>
 void amx_Matmul_perf_float(int M, int K, int N, int times = -1000) {
     tensor2D<float> A(M, K);
     tensor2D<float> B(K, N);
