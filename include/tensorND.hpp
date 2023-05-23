@@ -367,9 +367,9 @@ public:
         return t;
     }
 
-    static inline pybind11::array_t<T> to_array(tensorND<T, RMAX> && t) {
+    pybind11::array_t<T> to_array() {
         // steal ownership of the data from t
-        auto * new_t = new tensorND<T, RMAX>(std::move(t));
+        auto * new_t = new tensorND<T, RMAX>(std::move(*this));
 
         // capsule object holding reference to the C++ class
         pybind11::capsule free_when_done(new_t, [](void *f) {

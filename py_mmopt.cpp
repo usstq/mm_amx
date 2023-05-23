@@ -70,7 +70,7 @@ PYBIND11_MODULE(mmopt, m)
         t.for_each([&](size_t idx, int * coord){
             t(coord) = idx;
         });
-        return tensorND<float>::to_array(std::move(t));
+        return t.to_array();
     });
 
     m.def("f", []() {
