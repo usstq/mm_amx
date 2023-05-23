@@ -54,9 +54,11 @@ struct tensorND {
 
     tensorND() = default;
 
-    tensorND(tensorND<T, RMAX> & other) = delete;
+    // ownership of the data cannot be transfered but only stealed
+    // since we choose to use raw pointer instead of shared_ptr.
+    tensorND(tensorND<T, RMAX>& other) = delete;
 
-    tensorND(tensorND<T, RMAX> && other) {
+    tensorND(tensorND<T, RMAX>&& other) {
         // steal ownership from other
         data = other.data;
         ndim = other.ndim;
@@ -83,11 +85,11 @@ struct tensorND {
 
     template<typename ST>
     tensorND(void* _data, std::initializer_list<ST> _shape, std::initializer_list<ST> _strides) :
-    tensorND(_data, std::begin(_shape), std::end(_shape), std::begin(_strides), std::end(_strides)) {}
+        tensorND(_data, std::begin(_shape), std::end(_shape), std::begin(_strides), std::end(_strides)) {}
 
     template<typename Container>
-    tensorND(void* _data, const Container & _shape, const Container & _strides) :
-    tensorND(_data, std::begin(_shape), std::end(_shape), std::begin(_strides), std::end(_strides)) {}
+    tensorND(void* _data, const Container& _shape, const Container& _strides) :
+        tensorND(_data, std::begin(_shape), std::end(_shape), std::begin(_strides), std::end(_strides)) {}
 
     template<typename ITSHAPE, typename ITSTRIDES>
     tensorND(void* _data, ITSHAPE itshape0, ITSHAPE itshape1, ITSTRIDES itstrides0, ITSTRIDES itstrides1) {
@@ -109,7 +111,7 @@ struct tensorND {
     }
 
     template<typename ST>
-    tensorND(const std::initializer_list<ST> & _shape, bool compact) {
+    tensorND(const std::initializer_list<ST>& _shape, bool compact) {
         capacity = 0;
         resize(_shape, compact);
     }
@@ -121,11 +123,11 @@ struct tensorND {
     }
 
     template<typename ST>
-    void resize(const std::initializer_list<ST> & _shape, bool compact) {
+    void resize(const std::initializer_list<ST>& _shape, bool compact) {
         resize<std::initializer_list<ST>, 0>(_shape, compact);
     }
 
-    template<typename Container, int tag=0>
+    template<typename Container, int tag = 0>
     void resize(const Container& _shape, bool compact) {
         assert(_shape.size() <= RMAX);
         ndim = _shape.size();
@@ -223,8 +225,14 @@ struct tensorND {
         assert(sizeof...(idxs) == ndim);
         ret.data = data;
         ret.ndim = 0;
+        ret.capacity = 0; // Slice do not own the data
         get_subview<0, 0>(ret, idxs...);
         return ret;
+    }
+
+    // overloaded Slice to create a clone without take ownership of the data
+    tensorND<T> Slice() {
+        return tensorND<T>(data, shape, shape + ndim, strides, strides + ndim);
     }
 
     std::string toString() {
@@ -335,53 +343,53 @@ public:
     static inline void bind2py(pybind11::handle m)
     {
         pybind11::class_<tensorND<T>>(m, "tensorND", pybind11::buffer_protocol())
-            .def_buffer([](tensorND<T> &t) -> pybind11::buffer_info {
-                return pybind11::buffer_info( reinterpret_cast<void*>(t.data),        /* Pointer to buffer */
-                                        sizeof(T),                          /* Size of one scalar */
-                                        pybind11::format_descriptor<T>::format(), /* Python struct-style format descriptor */
-                                        t.ndim,                                 /* Number of dimensions */
-                                        {t.shape, t.shape + t.ndim},            /* Buffer dimensions */
-                                        {t.strides, t.strides + t.ndim},
-                                        false
-                                    );
-            })
-            .def(pybind11::init([](std::vector<int64_t> a, bool b){
-                return new tensorND<T>(a, b);
-            }))
-            .def(pybind11::init([](pybind11::buffer b) {
-                // from object support buffer protocol
-                pybind11::buffer_info info = b.request();
-                if (info.format != pybind11::format_descriptor<T>::format())
-                    throw std::runtime_error("Incompatible format: expected a float array!");
-                return new tensorND<float>(static_cast<T *>(info.ptr), info.shape, info.strides);
-            }))
-            .def("__repr__", &tensorND<T>::toString);    
+            .def_buffer([](tensorND<T>& t) -> pybind11::buffer_info {
+            return pybind11::buffer_info(reinterpret_cast<void*>(t.data),        /* Pointer to buffer */
+                sizeof(T),                          /* Size of one scalar */
+                pybind11::format_descriptor<T>::format(), /* Python struct-style format descriptor */
+                t.ndim,                                 /* Number of dimensions */
+                { t.shape, t.shape + t.ndim },            /* Buffer dimensions */
+                { t.strides, t.strides + t.ndim },
+                false
+            );
+                })
+            .def(pybind11::init([](std::vector<int64_t> a, bool b) {
+                    return new tensorND<T>(a, b);
+                }))
+                    .def(pybind11::init([](pybind11::buffer b) {
+                    // from object support buffer protocol
+                    pybind11::buffer_info info = b.request();
+                    if (info.format != pybind11::format_descriptor<T>::format())
+                        throw std::runtime_error("Incompatible format: expected a float array!");
+                    return new tensorND<float>(static_cast<T*>(info.ptr), info.shape, info.strides);
+                        }))
+                    .def("__repr__", &tensorND<T>::toString);
     }
 
-    static inline tensorND<T, RMAX> from_array(pybind11::array_t<T> & arr) {
-        const auto * itshape0 = arr.shape();
-        const auto * itstrides0 = arr.strides();
-        tensorND<T, RMAX> t(static_cast<T *>(arr.data()),
-                            itshape0, itshape0 + arr.ndim,
-                            itstrides0, itstrides0 + arr.ndim);
+    static inline tensorND<T, RMAX> from_array(pybind11::array_t<T>& arr) {
+        const auto* itshape0 = arr.shape();
+        const auto* itstrides0 = arr.strides();
+        tensorND<T, RMAX> t(static_cast<T*>(arr.data()),
+            itshape0, itshape0 + arr.ndim,
+            itstrides0, itstrides0 + arr.ndim);
         return t;
     }
 
     pybind11::array_t<T> to_array() {
         // steal ownership of the data from t
-        auto * new_t = new tensorND<T, RMAX>(std::move(*this));
+        auto* new_t = new tensorND<T, RMAX>(std::move(*this));
 
         // capsule object holding reference to the C++ class
-        pybind11::capsule free_when_done(new_t, [](void *f) {
-            auto * foo = reinterpret_cast<tensorND<T, RMAX> *>(f);
+        pybind11::capsule free_when_done(new_t, [](void* f) {
+            auto* foo = reinterpret_cast<tensorND<T, RMAX>*>(f);
             delete foo;
-        });
+            });
 
         // wraps tensor data as numpy array, referencing C++ class
         // which is responsible for freeing data
         return pybind11::array_t<T>(
-            {new_t->shape, new_t->shape + new_t->ndim},     // shape
-            {new_t->strides, new_t->strides + new_t->ndim}, // C-style contiguous strides
+            { new_t->shape, new_t->shape + new_t->ndim },     // shape
+            { new_t->strides, new_t->strides + new_t->ndim }, // C-style contiguous strides
             new_t->data,        // the data pointer
             free_when_done);    // numpy array references this parent
     }
