@@ -1,8 +1,13 @@
 
 #pragma once
 
-#include "block_iter.hpp"
-#include "tensor2D.hpp"
+#include "tensorND.hpp"
+#include <memory>
+#include <cstring>
+#include <cstdlib>
+#include <iostream>
+#include <functional>
+
 #ifdef _WIN32
 #include <intrin.h>
 #else
@@ -698,7 +703,7 @@ void kernel_4x24(float * pA, int strideA,
 #endif
 
 struct Matmul {
-    tensor2D<float> internalB;
+    tensorND<float> internalB;
 
     bool constB;
     bool transposeB;
@@ -810,15 +815,15 @@ struct Matmul {
         #undef FMADD
     };
 
-    void reorderB(tensor2D<float> & matB, int n0, int n1) {
+    void reorderB(tensorND<float> & matB, int n0, int n1) {
         // transposeB : B_NxK
         //
-        int K = matB.dims[transposeB ? 1 : 0];
+        int K = matB.shape[transposeB ? 1 : 0];
         int N = n1 - n0;
-        auto strideB = matB.stride/sizeof(float);
+        auto strideB = matB.strides[0]/sizeof(float);
         if (!transposeB) {
             // N tails in internalB matrix is aligned to right border of B
-            internalB.resize((N + 15)/16, K*16);
+            internalB.resize({(N + 15)/16, K*16}, false);
             loop2D_no_bM<16>(1, N, [&](int m, int n, int valid_m, int valid_n) {
                 // align to right border of B at N tails
                 int nsrc = (valid_n <= 8) ? (n1 - 8) : ((valid_n < 16) ? (n1 - 16) : (n0 + n));
@@ -841,7 +846,7 @@ struct Matmul {
             // thus we only want to do it once, due to limited register resource,
             // we cannot archieve that with on-the-fly transpose. so we transpose it
             // into a temp buffer at once
-            internalB.resize((N + 15)/16, rndup(K, 8) *16);
+            internalB.resize({(N + 15)/16, rndup(K, 8) *16}, false);
             loop2D_no_bM<16>(1, N, [&](int m, int n, int valid_m, int valid_n) {
                 // align to right border of B at N tails
                 int nsrc = (valid_n <= 8) ? (n1 - 8) : ((valid_n < 16) ? (n1 - 16) : (n0 + n));
@@ -853,23 +858,23 @@ struct Matmul {
     }
 
     template<typename P>
-    void operator()(tensor2D<float> & matA,
-                    tensor2D<float> & matB,
-                    tensor2D<float> & matC,
+    void operator()(tensorND<float> & matA,
+                    tensorND<float> & matB,
+                    tensorND<float> & matC,
                     int n0, int n1,
                     P pp) {
-        int M = matA.dims[0];
-        int K = matA.dims[1];
+        int M = matA.shape[0];
+        int K = matA.shape[1];
         int N = n1 - n0;
         
-        assert(K == matB.dims[transposeB ? 1:0]);
-        assert(N <= matB.dims[transposeB ? 0:1]);
-        assert(M == matC.dims[0]);
-        assert(N <= matC.dims[1]);
+        assert(K == matB.shape[transposeB ? 1:0]);
+        assert(N <= matB.shape[transposeB ? 0:1]);
+        assert(M == matC.shape[0]);
+        assert(N <= matC.shape[1]);
 
-        auto strideA = matA.stride/sizeof(float);
-        auto strideB = matB.stride/sizeof(float);
-        auto strideC = matC.stride/sizeof(float);
+        auto strideA = matA.strides[0]/sizeof(float);
+        auto strideB = matB.strides[0]/sizeof(float);
+        auto strideC = matC.strides[0]/sizeof(float);
 
         //std::cout << "Matmul:  transposeB=" << transposeB << "  M,K,N=" << M << "," << K << "," << N << "  strideA,B,C=" << strideA << "," << strideB << "," << strideC << std::endl;
 
@@ -881,8 +886,10 @@ struct Matmul {
                 reorderB(matB, n0, n1);
         } else {
             // dynamically transpose/reorder 16 columns of matB into internalB
-            internalB.resize(1, rndup(K, 8) * 16);
-            internalB = 0;
+            if (internalB.resize({1, rndup(K, 8) * 16}, false)) {
+                // make sure the physical pages are really allocated
+                internalB = 0;
+            }
             use_dynTransB = transposeB;
             use_dynReorderB = !transposeB;
         }

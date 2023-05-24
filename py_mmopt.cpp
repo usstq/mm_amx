@@ -55,6 +55,7 @@ PYBIND11_MODULE(mmopt, m)
     m.def("h", [](tensorND<float> & t, float x) {
         t.for_each([&](size_t idx, int * coord){
             t(coord) = x;
+            return true;
         });
     });
 
@@ -62,6 +63,7 @@ PYBIND11_MODULE(mmopt, m)
         tensorND<float> t({4,5}, false);
         t.for_each([&](size_t idx, int * coord){
             t(coord) = idx;
+            return true;
         });
         return t;
     });
@@ -69,6 +71,7 @@ PYBIND11_MODULE(mmopt, m)
         tensorND<float> t({4,5}, false);
         t.for_each([&](size_t idx, int * coord){
             t(coord) = idx;
+            return true;
         });
         return t.to_array();
     });

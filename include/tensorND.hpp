@@ -21,7 +21,7 @@ inline void* aligned_malloc(size_t size, size_t align) {
 #else 
     if (posix_memalign(&result, align, size)) result = nullptr;
 #endif
-    std::cerr << "tensorND allocate " << result << std::endl;
+    //std::cerr << "tensorND allocate " << result << std::endl;
     return result;
 }
 
@@ -31,7 +31,7 @@ inline void aligned_free(void* ptr) {
 #else 
     free(ptr);
 #endif
-    std::cerr << "tensorND freeing  " << ptr << std::endl;
+    //std::cerr << "tensorND freeing  " << ptr << std::endl;
 }
 
 struct slice {
@@ -42,6 +42,9 @@ struct slice {
     slice(int i0, int i1) : i0(i0), i1(i1) {}   // normal
 };
 
+struct fullslice {
+
+};
 template<typename T, int RMAX = 8>
 struct tensorND {
     constexpr static size_t cache_line_size = 64;
@@ -70,7 +73,7 @@ struct tensorND {
     }
 
     template<typename ST>
-    tensorND(void* _data, std::initializer_list<ST> _shape) {
+    tensorND(void* _data, const std::initializer_list<ST> _shape) {
         assert(_shape.size() <= RMAX);
         ndim = _shape.size();
         data = reinterpret_cast<T*>(_data);
@@ -83,12 +86,12 @@ struct tensorND {
         capacity = 0;
     }
 
-    template<typename ST>
-    tensorND(void* _data, std::initializer_list<ST> _shape, std::initializer_list<ST> _strides) :
+    template<typename ST1, typename ST2>
+    tensorND(void* _data, const std::initializer_list<ST1> _shape, const std::initializer_list<ST2> _strides) :
         tensorND(_data, std::begin(_shape), std::end(_shape), std::begin(_strides), std::end(_strides)) {}
 
-    template<typename Container>
-    tensorND(void* _data, const Container& _shape, const Container& _strides) :
+    template<typename Container1, typename Container2>
+    tensorND(void* _data, const Container1& _shape, const Container2& _strides) :
         tensorND(_data, std::begin(_shape), std::end(_shape), std::begin(_strides), std::end(_strides)) {}
 
     template<typename ITSHAPE, typename ITSTRIDES>
@@ -105,15 +108,15 @@ struct tensorND {
     }
 
     template<typename Container>
-    tensorND(const Container& _shape, bool compact) {
+    tensorND(const Container& _shape, bool compact = false) {
         capacity = 0;
         resize(_shape, compact);
     }
 
     template<typename ST>
-    tensorND(const std::initializer_list<ST>& _shape, bool compact) {
+    tensorND(const std::initializer_list<ST>& _shape, bool compact = false) {
         capacity = 0;
-        resize(_shape, compact);
+        resize<std::initializer_list<ST>, 0>(_shape, compact);
     }
 
     ~tensorND() {
@@ -123,12 +126,12 @@ struct tensorND {
     }
 
     template<typename ST>
-    void resize(const std::initializer_list<ST>& _shape, bool compact) {
-        resize<std::initializer_list<ST>, 0>(_shape, compact);
+    bool resize(const std::initializer_list<ST>& _shape, bool compact) {
+        return resize<std::initializer_list<ST>, 0>(_shape, compact);
     }
 
     template<typename Container, int tag = 0>
-    void resize(const Container& _shape, bool compact) {
+    bool resize(const Container& _shape, bool compact) {
         assert(_shape.size() <= RMAX);
         ndim = _shape.size();
         std::copy(_shape.begin(), _shape.end(), shape);
@@ -158,17 +161,60 @@ struct tensorND {
             if (data && capacity) aligned_free(data);
             data = reinterpret_cast<T*>(aligned_malloc(total, cache_line_size));
             capacity = total;
+            return true;
         }
+        return false;
     }
 
+    template<typename ST>
+    tensorND<T, RMAX> Transpose(const std::initializer_list<ST>& order) {
+        tensorND<T, RMAX> dst;
+        std::vector<ST> dst_shape;
+        for(auto & ord : order)
+            dst_shape.push_back(shape[ord]);
+        dst.resize(dst_shape, false);
 
+        int dst_coord[RMAX];
+        for_each([&](size_t idx, int *coord){
+            int idst = 0;
+            for(auto & ord : order) dst_coord[idst++] = coord[ord];
+            dst(dst_coord) = (*this)(coord);
+            return true;
+        });
+        return dst;
+    }
+
+    bool operator==(tensorND<T, RMAX>& rhs) {
+        if (ndim != rhs.ndim) return false;
+        for(int i = 0; i<ndim; i++)
+            if (shape[i] != rhs.shape[i])
+                return false;
+
+        return for_each([&](size_t idx, int *coord){
+            return rhs(coord) == (*this)(coord);
+        });
+    }
+    tensorND<T, RMAX>& operator=(T v) {
+        if (capacity && data) {
+            for(int i = 0; i<capacity/sizeof(T); i++) {
+                data[i] = v;
+            }
+        } else {
+            for_each([&](size_t idx, int * coord){
+                (*this)(coord) = v;
+                return true;
+            });
+        }
+        return *this;
+    }
 
     template<typename F>
-    void for_each(F f) {
+    bool for_each(F f) {
         int coord[RMAX] = { 0 };
         size_t idx = 0;
         while (1) {
-            f(idx, coord);
+            if (!f(idx, coord))
+                return false;
 
             // increase 1D linear index
             idx++;
@@ -185,6 +231,7 @@ struct tensorND {
             }
             if (carry) break;
         }
+        return true;
     }
 
     // TODO: data[idx] may access paddings  
@@ -205,8 +252,8 @@ struct tensorND {
         return at_byte_offset(offset);
     }
 
-    template<class IDX>
-    T& operator()(IDX* coord) {
+    template<class IDX, typename std::enable_if<std::is_pointer<typename std::remove_reference<IDX>::type>::value, bool>::type = true>
+    T& operator()(IDX & coord) {
         size_t offset = 0;
         for (int i = 0; i < ndim; i++)
             offset += coord[i] * strides[i];
@@ -316,10 +363,25 @@ private:
         get_subview<isrc + 1, idst + 1>(t, idxs...);
     }
 
+    template<int isrc, int idst, typename TV, typename ... IDX>
+    void get_subview(TV& t, fullslice i0, IDX ... idxs) const {
+        t.shape[idst] = shape[isrc];
+        t.strides[idst] = strides[isrc];
+        t.ndim++;
+        get_subview<isrc + 1, idst + 1>(t, idxs...);
+    }
+
     template<int isrc, int idst, typename TV>
     void get_subview(TV& t, slice i0) const {
         t.data = reinterpret_cast<T*>(reinterpret_cast<int8_t*>(t.data) + i0.i0 * strides[isrc]);
         t.shape[idst] = std::min(shape[isrc], i0.i1) - i0.i0;
+        t.strides[idst] = strides[isrc];
+        t.ndim++;
+    }
+
+    template<int isrc, int idst, typename TV>
+    void get_subview(TV& t, fullslice i0) const {
+        t.shape[idst] = shape[isrc];
         t.strides[idst] = strides[isrc];
         t.ndim++;
     }
@@ -397,3 +459,32 @@ public:
 #endif
 
 };
+
+template<typename TAB, typename TC>
+void matmul(tensorND<TAB> & A,
+            tensorND<TAB> & B,
+            tensorND<TC> & C,
+            float * bias = nullptr,
+            std::function<float(float)> act = {}) {
+    int M = C.shape[0];
+    int N = C.shape[1];
+    int K = A.shape[1];
+    assert(B.shape[0] == K);
+    assert(B.shape[1] == N);
+    for(int m = 0; m < M; m++) {
+        for(int n = 0; n < N; n++) {
+            float sum = C(m,n);
+            for(int k = 0; k < K; k++) {
+                sum += static_cast<float>(A(m,k)) * static_cast<float>(B(k,n));
+            }
+            if (bias) {
+                sum += bias[n];
+            }
+            if (act) {
+                sum = act(sum);
+            }
+            C(m,n) = sum;
+        }
+    }
+}
+

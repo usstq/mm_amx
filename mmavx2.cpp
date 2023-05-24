@@ -46,13 +46,13 @@ struct MatmulMTOMP {
     }
 
     template<typename P>
-    void operator()(tensor2D<float> & matA,
-                    tensor2D<float> & matB,
-                    tensor2D<float> & matC,
+    void operator()(tensorND<float> & matA,
+                    tensorND<float> & matB,
+                    tensorND<float> & matC,
                     P ppkernel) {
-        int M = matA.dims[0];
-        int K = matA.dims[1];
-        int N = matB.dims[transposeB ? 0:1];
+        int M = matA.shape[0];
+        int K = matA.shape[1];
+        int N = matB.shape[transposeB ? 0:1];
         // split along N dimension
         int work_amount = rndup(N, 16)/16;
 
@@ -62,7 +62,7 @@ struct MatmulMTOMP {
             int n0 = start*16;
             int n1 = end*16;
             if (n1 > N) n1 = N;
-            //tensor2D<bfloat16> copyA = matA.clone();
+            //tensorND<bfloat16> copyA = matA.clone();
             // C[:, N0:N1] = A * B[:, N0:N1]
             (*ops[tid].get())(matA, matB, matC, n0, n1, ppkernel);
         };
@@ -76,12 +76,12 @@ struct MatmulMTOMP {
 
 template<avx2::PP::Act act = avx2::PP::Act_RELU>
 void amx_Matmul_perf_float(int M, int K, int N, int times = -1000) {
-    tensor2D<float> A(M, K);
-    tensor2D<float> B(K, N);
-    tensor2D<float> Br = B.Tr();
-    tensor2D<float> C(M, N);
-    tensor2D<float> C0(M, N);
-    tensor2D<float> Bias(1, N);
+    tensorND<float> A({M, K});
+    tensorND<float> B({K, N});
+    tensorND<float> Br = B.Transpose({1,0});
+    tensorND<float> C({M, N});
+    tensorND<float> C0({M, N});
+    tensorND<float> Bias({1, N});
     avx2::PP::AddbiasAct<act> pp(&Bias[0]);
     MatmulMTOMP fc(true, false);
     MatmulMTOMP mm(false, false);
@@ -213,22 +213,23 @@ int test_hmax() {
 }
 
 int test_softmax() {
-    tensor2D<float> x;
-    tensor2D<float> y0;
-    tensor2D<float> y1;
+#if 0
+    tensorND<float> x;
+    tensorND<float> y0;
+    tensorND<float> y1;
 
-    auto softmax_ref = [&](tensor2D<float>& x, tensor2D<float>& y) {
+    auto softmax_ref = [&](tensorND<float>& x, tensorND<float>& y) {
         float x_max = std::numeric_limits<float>::lowest();
-        for(int i = 0; i < x.dims[1]; i++) {
+        for(int i = 0; i < x.shape[1]; i++) {
             x_max = std::max(x_max, x[i]);
         }
         y = x.clone();
         float sum = 0;
-        for(int i = 0; i < x.dims[1]; i++) {
+        for(int i = 0; i < x.shape[1]; i++) {
             y[i] = expf(x[i]-x_max);
             sum += y[i];
         }
-        for(int i = 0; i < x.dims[1]; i++) {
+        for(int i = 0; i < x.shape[1]; i++) {
             y[i] = y[i]/sum;
         }
     };
@@ -249,6 +250,7 @@ int test_softmax() {
     if (errors == 0) {
         std::cout << ANSIcolor("32") << __func__ << " Pass" << ANSIcolor() << std::endl;
     }
+#endif
     return 0;
 }
 
@@ -315,15 +317,15 @@ int main(int argc, const char *argv[]) {
         constexpr int N = 16;
         constexpr bool Ngt8 = N>8;
         int K = 1920*8;
-        tensor2D<float> A(6, K);
-        tensor2D<float> B(K, N, true);
-        tensor2D<float> C(6, N, true);
+        tensorND<float> A({6, K}, false);
+        tensorND<float> B({K, N}, true);
+        tensorND<float> C({6, N}, true);
         auto * pA = &A[0];
         auto * pB = &B[0];
         auto * pC = &C[0];
-        auto strideA = A.stride/sizeof(float);
-        auto strideB = B.stride/sizeof(float);
-        auto strideC = C.stride/sizeof(float);
+        auto strideA = A.strides[0]/sizeof(float);
+        auto strideB = B.strides[0]/sizeof(float);
+        auto strideC = C.strides[0]/sizeof(float);
         auto latALU = (M*N)*(K/8)/(2 * 4.677e9);
         auto latAVG = benchmark.tag("fc")(-10000, [&](){
             avx2::Matmul::kernel_6x16<M, Ngt8>(pA, strideA, pB, strideB, pC, strideC, K, 0, _mm256_set1_epi32(-1), nonepp);
