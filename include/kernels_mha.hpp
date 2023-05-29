@@ -1,5 +1,6 @@
 #include "kernels_avx2.hpp"
 #include <vector>
+#include <deque>
 
 #ifndef PARALLEL_NT_STATIC
 template <typename F>
@@ -9,11 +10,24 @@ void parallel_nt_static_dummy(const F& func) {
 #define PARALLEL_NT_STATIC(...) parallel_nt_static_dummy(__VA_ARGS__)
 #endif
 
+std::ostream & operator<<(std::ostream & os, __m256 ymm) {
+    float dump[8];
+    _mm256_storeu_ps(dump, ymm);
+    const char * sep="";
+    os << "__m256[";
+    for(int i=0;i<8;i++) {
+        os << sep << dump[i];
+        sep = ",";
+    }
+    os << "]";
+    return os;
+}
+
 template<typename ... Args>
 static inline void log(Args&& ... args) {
     std::stringstream ss;
-    int dummy[] = {(ss << std::forward<Args>(args), 0)...};
-    UNUSED(dummy);
+    int dummy[] = {(ss << std::forward<Args>(args) << " ", 0)...};
+    (void)(dummy);
     ss << std::endl;
     std::cout << ss.str();
 }
@@ -51,7 +65,7 @@ inline void splitter1d(const T& n, const Q& team, const Q& tid, T& n_start, T& n
 struct MHA2Kernels {
     std::vector<std::shared_ptr<avx2::Matmul>> ops_qk;
     std::vector<std::shared_ptr<avx2::Matmul>> ops_wv;
-    std::vector<tensorND<float>> all_qk;
+    std::deque<tensorND<float>> all_qk;
     tensorND<float> sub_states;
     tensorND<float> qk_max;
     tensorND<float> qk_sum;
@@ -64,6 +78,7 @@ struct MHA2Kernels {
         PARALLEL_NT_STATIC([&](int i, int n){
             NT = n;
         });
+        std::cout << "MHA2: NT=" << NT << " bN=" << bN << std::endl;
         for(int i = 0; i < NT; i++) {
             ops_qk.push_back(std::make_shared<avx2::Matmul>(false, true));
             ops_wv.push_back(std::make_shared<avx2::Matmul>(false, false));
@@ -89,24 +104,44 @@ struct MHA2Kernels {
             //wv0 {B, M, H, K}
             static int sss = 0;
             // if (N > bN) sss ++;
-            if (with_causal_mask || (N < bN) || (sss & 3)==2) {
-                const size_t work_amount = size_t(B)*H;
+            if (with_causal_mask || (N < bN) || M > 1 || (sss & 3)==2) {
+                const size_t work_amount = (size_t) B * H * M;
                 PARALLEL_NT_STATIC([&](int ithr, int nthr) {
-                    size_t start{0}, end{0}, h;
+                    size_t start{0}, end{0};
                     splitter1d(work_amount, nthr, ithr, start, end);
-                    for(size_t bh = start; bh < end; bh++) {
-                        auto b = offset2coord(bh, H, h);
-                        //  q[b, 0:M, h, K] => MxK
+                    size_t bh0, mb0;
+                    size_t bh1, mb1;
+                    if (start == end) return;
+                    bh0 = offset2coord(start, M, mb0);
+                    bh1 = offset2coord(end, M, mb1);
+                    auto m_start = mb0;
+                    auto m_end = std::min(size_t(M), mb1);
+
+                    // first head
+                    auto m0 = m_start;
+                    auto m1 = m0;
+                    // bh = b*H + h
+                    for(auto bh = bh0; bh <= bh1; bh++) {
+                        // determine m1 for current head
+                        m1 = (bh == bh1) ? m_end : M;
+                        if (m1 <= m0) break;
+
+                        //  q[b, m0:m1, h, K] => (m1-m0)xK
                         //  k[b, h, 0:N, K] => NxK
                         //  v[b, h, 0:N, K] => NxK
-                        // wv[b, 0:M, h, K] => MxK
-                        tensorND<float> q = q0.Slice(b, fullslice(), h, fullslice());
+                        // wv[b, m0:m1, h, K] => (m1-m0)xK
+                        auto b = bh/H;
+                        auto h = bh - b*H;
+                        tensorND<float> q = q0.Slice(b, slice(m0, m1), h, fullslice());
                         tensorND<float> k = k0.Slice(b, h, fullslice(), fullslice());
                         tensorND<float> v = v0.Slice(b, h, fullslice(), fullslice());
-                        tensorND<float> wv = wv0.Slice(b, fullslice(), h, fullslice());
-                        one_head_attention(ithr, q, k, v, wv, 0, with_causal_mask);
+                        tensorND<float> wv = wv0.Slice(b, slice(m0, m1), h, fullslice());
+                        one_head_attention(ithr, q, k, v, wv, m0, with_causal_mask);
+
+                        // m0 for next head is always 0
+                        m0 = 0;
                     }
-                });
+                });                
             } else {
                 // no with_kv_cache, no with_causal_mask
                 //
@@ -121,6 +156,7 @@ struct MHA2Kernels {
                 qk_max.resize({B, H, num_sub_states, M}, false);
                 qk_sum.resize({B, H, num_sub_states, M}, false);
 
+                //log(" B,M,N,H,nb,K=", B,M,N,H,num_sub_states,K);
                 //auto _prof1 = Profile("substate");
                 PARALLEL_NT_STATIC([&](int ithr, int nthr) {
                     // each work item is doing  M x bN sub-states encoding
@@ -162,10 +198,14 @@ struct MHA2Kernels {
                         // qk_max [b,h,nb,M]
                         tensorND<float> wv = wv0.Slice(b, fullslice(), h, fullslice());
 
+
                         // qk_max: [b, h, 0:num_sub_states, 0:M]
                         // qk_sum: [b, h, 0:num_sub_states, 0:M]
                         auto p_qk_max = qk_max.Slice(b, h, fullslice(), fullslice());  // num_sub_states x M
                         auto p_qk_sum = qk_sum.Slice(b, h, fullslice(), fullslice());  // num_sub_states x M
+                        
+                        //log("b,h,p_qk_max=",b,h,p_qk_max);
+                        //log("b,h,p_qk_sum=",b,h,p_qk_sum);
                         for (int m = 0; m < M; m++) {
                             float * p_wv = &wv(m, 0);
                             // get weights of sub-states :
@@ -179,6 +219,7 @@ struct MHA2Kernels {
                                 auto sub_max = _mm256_broadcast_ss(&p_qk_max(nb,m));
                                 tmax = _mm256_max_ps(tmax, sub_max);
                             }
+                            //log("b,h,m,max=",b,h,m, tmax);
 
                             auto tsum = _mm256_setzero_ps();
                             for (int nb = 0; nb < num_sub_states; nb++) {
@@ -192,6 +233,7 @@ struct MHA2Kernels {
                                 //p_qk_sum[nb*M + m] *= std::exp(p_qk_max[nb*M + m] - tmax);
                                 //tsum += p_qk_sum[nb*M + m];
                             }
+                            //log("       tsum=",tsum);
 
                             static __m256 one = _mm256_castsi256_ps(_mm256_set1_epi32(0x3f800000)); // 1.0f
                             auto tweight_recip = _mm256_div_ps(one, tsum);                          // 1/sum_exp

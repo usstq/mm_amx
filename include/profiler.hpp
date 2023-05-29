@@ -141,15 +141,16 @@ public:
 
             fw << dump_text.str();
 
-            fw << R"({
-                "name": "Profiler End",
-                "ph": "i",
-                "s": "g",
-                "pid": "Traces",
-                "tid": "Trace OV Profiler",
-                "ts":)"
-            << tsc_to_usec(__rdtsc()) << "}",
-                fw << "]\n";
+            if (tsc_ticks_per_second)
+                fw << R"({
+                    "name": "Profiler End",
+                    "ph": "i",
+                    "s": "g",
+                    "pid": "Traces",
+                    "tid": "Trace OV Profiler",
+                    "ts":)"
+                        << tsc_to_usec(__rdtsc()) << "}";
+            fw << "]\n";
             fw << "}\n";
             fw.close();
             std::cout << "==== Profile data is dumpped into " << dump_file_name << "\n";

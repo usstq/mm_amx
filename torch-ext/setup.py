@@ -14,7 +14,9 @@ setup(name='mha_opt',
                     extra_compile_args=[ '-fopenmp',
                                         '-mno-avx256-split-unaligned-load',
                                         '-mno-avx256-split-unaligned-store',
-                                        '-march=native'],
+                                        '-march=native',
+                                        #'-g'
+                                        ],
                     extra_link_args=['-lgomp'])
       ],
       include_dirs=['../include'],

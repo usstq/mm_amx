@@ -4,12 +4,27 @@
  - pybind11, which is how we create Python bindings for our C++ code,
  - Headers that manage the details of interaction between ATen and pybind11.
 */
+#include <omp.h>
+
 #include "misc.hpp"
 #include "kernels_avx2.hpp"
+
+// define PARALLEL_NT_STATIC
+template<typename F>
+void parallel_nt_static_omp(const F& func) {
+    #pragma omp parallel
+    { 
+        func(omp_get_thread_num(), omp_get_num_threads());
+    }
+}
+
+#define PARALLEL_NT_STATIC(...) parallel_nt_static_omp(__VA_ARGS__)
+#include "kernels_mha.hpp"
+
+
 //#include "timeit.hpp"
 #include "profiler.hpp"
 
-#include <omp.h>
 
 #include <torch/extension.h>
 
@@ -45,120 +60,48 @@
  wv = w @ v =>  [B, M, H*K]
 */
 
-struct MHA {
-    std::vector<std::shared_ptr<avx2::Matmul>> ops_qk;
-    std::vector<std::shared_ptr<avx2::Matmul>> ops_wv;
-    int OMP_NT;
-    std::vector<tensor2D<float>> all_qk;
-    avx2::PP::None pp_none;
-
-    MHA() {
-        OMP_NT = omp_thread_count();
-        for(int i = 0; i < OMP_NT; i++) {
-            ops_qk.push_back(std::make_shared<avx2::Matmul>(false, true));
-            ops_wv.push_back(std::make_shared<avx2::Matmul>(false, false));
-            all_qk.emplace_back();
-        }
-    }
-
-    /*
-        q: M x K
-        k: N x K (need transpose)
-        v: N x K
-    */
-    void one_head_attention(tensor2D<float> & q, tensor2D<float> & k, tensor2D<float> & v, tensor2D<float> & wv, bool causal_mask) {
-        auto M = q.dims[0];
-        auto N = k.dims[0];
-        auto K = v.dims[1];
-        
-        int ompi = omp_get_thread_num();
-        auto & qk = all_qk[ompi];
-        qk.resize(M, N);
-        (*ops_qk[ompi])(q, k, qk, 0, N, pp_none);
-
-        // softmax per row
-        if (causal_mask && M > 1) {
-            for(int m = 0; m<M; m++) {
-                int valid_n = std::min(N, m+1);
-                avx2::functional::softmax(&qk(m,0), valid_n);
-                // the rest part is set as zero
-                memset(&qk(m, valid_n), 0, sizeof(float)*(N - valid_n));
-            }
-        } else {
-            for(int m = 0; m<M; m++) {
-                avx2::functional::softmax(&qk(m,0), N);
-            }
-        }
-        // combine
-        (*ops_wv[ompi])(qk, v, wv, 0, K, pp_none);
-    }
-};
-
-void qkv_attention(float * pQ, float * pK, float * pV, float * pWV,
-                   int B, int M, int N, int H, int K, bool causal_mask)
-{
-    static MHA mha;
-
-    int stride_b_q = M*H*K;
-    int stride_b_kv = N*H*K;
-    int stride_bytes_hk = H*K*sizeof(float);
-    int stride_h = K;
-
-    #pragma omp parallel for collapse(2)
-    for(int b = 0; b < B; b++) {
-        for(int h = 0; h < H; h++) {
-            // M can also run in parallel, but since
-            // it's range is small, if we run it in one core, it can share k
-            // q[b, 0:M, h, K] => MxK
-            // k[b, 0:N, h, K] => NxK
-            // v[b, 0:N, h, K] => NxK
-            tensor2D<float> q(M, K, pQ + b*stride_b_q + h*stride_h, stride_bytes_hk);
-            tensor2D<float> k(N, K, pK + b*stride_b_kv + h*stride_h, stride_bytes_hk);
-            tensor2D<float> v(N, K, pV + b*stride_b_kv + h*stride_h, stride_bytes_hk);
-            tensor2D<float> wv(M, K, pWV + b*stride_b_q + h*stride_h, stride_bytes_hk);
-            mha.one_head_attention(q, k, v, wv, causal_mask);
-        }
-    }
-}
+MHA2Kernels mha2;
 
 static ProfilerManager profiler;
-
+/*
+#================================
+#           q : [B, M, H*K]
+#         k&v : [B, H, N, K]
+# attn_output : [B, M, H, K]
+#
+# output_attentions: False
+# attention_mask   : False
+#================================
+*/
 torch::Tensor mha_forward(
     torch::Tensor q,
     torch::Tensor k,
     torch::Tensor v,
     bool causal_mask)
 {
+    AT_ASSERT(q.dim() == 3 && k.dim() == 4 && v.dim() == 4);
+
     int B = q.size(0);
     int M = q.size(1);
     int HK = q.size(2);
-    int N = k.size(1);
-
-    auto prof = profiler.Profile("mha", B, M, N, HK);
-    int ndims = q.dim();
-    AT_ASSERT(ndims == 3);
-    AT_ASSERT(k.dim() == ndims);
-    AT_ASSERT(v.dim() == ndims);
-
-    float * pQ = q.data_ptr<float>();
-    float * pK = k.data_ptr<float>();
-    float * pV = v.data_ptr<float>();
-
-    AT_ASSERT(B == k.size(0));
-    AT_ASSERT(HK == k.size(2));
-
-    AT_ASSERT(B == v.size(0));
-    AT_ASSERT(N == v.size(1));
-    AT_ASSERT(HK == v.size(2));
-
-    int K = 64;
+    int N = k.size(2);
+    int K = k.size(3);
     int H = HK / K;
-    AT_ASSERT(HK == H*K);
 
-    auto wv = q.new_empty({B, M, HK});
-    float * pWV =  wv.data_ptr<float>();
-    qkv_attention(pQ, pK, pV, pWV,
-                  B, M, N, H, K, causal_mask);
+    AT_ASSERT(HK == H*K &&
+              B == k.size(0) && B == v.size(0) &&
+              H == k.size(1) && H == v.size(1) &&
+              N == k.size(2) && N == v.size(2) &&
+              K == k.size(3) && K == v.size(3));
+
+    auto wv = q.new_empty({B, M, H*K});
+    //auto prof = profiler.Profile("mha", B, M, N, HK);
+    tensorND<float> tq(q.data_ptr<float>(), {B, M, H, K});
+    tensorND<float> tk(k.data_ptr<float>(), {B, H, N, K});
+    tensorND<float> tv(v.data_ptr<float>(), {B, H, N, K});
+    tensorND<float> twv(wv.data_ptr<float>(), {B, M, H, K});
+
+    mha2(tq, tk, tv, twv, true, causal_mask);
     return wv;
 }
 
@@ -174,6 +117,7 @@ bool opt_mlp = false;
  x2: [B, M, H*K]
 */
 static int OMP_NT = omp_thread_count();
+#if 0
 
 struct MLP {
     std::vector<std::shared_ptr<avx2::Matmul>> ops_fc1;
@@ -193,10 +137,10 @@ struct MLP {
               float * y) {
         // w1: K1xK0, need transpose, split on K1
         // w2: K2xK1, need transpose, split on K2
-        tensor2D<float> mX(M, K0, x, K0*sizeof(float));
-        tensor2D<float> mY(M, K2, y, K2*sizeof(float));
-        tensor2D<float> mW1(K1, K0, w1, K0*sizeof(float));
-        tensor2D<float> mW2(K2, K1, w2, K1*sizeof(float));
+        tensorND<float> mX(M, K0, x, K0*sizeof(float));
+        tensorND<float> mY(M, K2, y, K2*sizeof(float));
+        tensorND<float> mW1(K1, K0, w1, K0*sizeof(float));
+        tensorND<float> mW2(K2, K1, w2, K1*sizeof(float));
 
         mTemp.resize(M, K1);
 
@@ -267,15 +211,15 @@ struct event {
         d = std::move(profiler.Profile(name));
     }
 };
-
+#endif
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("mha_forward", &mha_forward, "MHA forward");
+/*
     py::class_<MLP>(m, "MLP")
         .def(py::init<>())
         .def("forward", &MLP::forward);
-
-    py::class_<event>(m, "event")
-        .def(py::init<const std::string &>());
+*/
+    //py::class_<event>(m, "event").def(py::init<const std::string &>());
 
     m.attr("opt_mha") = pybind11::bool_(opt_mha);
     m.attr("opt_mlp") = pybind11::bool_(opt_mlp);
