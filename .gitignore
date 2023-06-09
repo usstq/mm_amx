@@ -1,6 +1,10 @@
 *.so
 *.s
 *.out
+venv/**
 torch-ext/build
 torch-ext/dist
 torch-ext/*.egg-info
+benchmark/build
+benchmark/dist
+benchmark/*.egg-info

@@ -1,0 +1,4 @@
+mkl-include>=2021.0.0
+mkl-static>=2021.0.0
+onednn-cpu-gomp
+onednn-devel-cpu-gomp
