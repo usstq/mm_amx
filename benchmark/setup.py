@@ -19,7 +19,23 @@ ext_modules = [
         ["mm_bench.cpp"],
         # Example: passing in the version to the compiled code
         define_macros = [('VERSION_INFO', __version__)],
-        ),
+        # it can locate the site-specific include folder(for calling mkl/oneDNN/...)
+        # even for virtualenv environment
+        include_dirs=[
+            f'{sys.prefix}/include',
+            '../include',
+        ],
+        library_dirs=[ f'{sys.prefix}/lib', ],
+        runtime_library_dirs=[ f'{sys.prefix}/lib', ],
+        libraries=[
+            'pthread',
+            'gomp',
+            'dnnl',
+            'mkl_intel_ilp64',
+            'mkl_gnu_thread',
+            'mkl_core',
+        ],
+    ),
 ]
 
 setup(
@@ -29,9 +45,6 @@ setup(
     install_requires = [
         "onednn-cpu-gomp"
     ],
-    # it can locate the site-specific include folder(for calling mkl/oneDNN/...)
-    # even for virtualenv environment
-    include_dirs=[f'{sys.prefix}/include'],
     # Currently, build_ext only provides an optional "highest supported C++
     # level" feature, but in the future it may provide more features.
     cmdclass={"build_ext": build_ext},

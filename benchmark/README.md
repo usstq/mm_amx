@@ -17,6 +17,10 @@ pip install mkl-static>=2021.0.0
 pip show mkl-include -f
 ```
 
+which lib is linked:
+
+https://www.intel.com/content/www/us/en/developer/tools/oneapi/onemkl-link-line-advisor.html
+
 # oneDNN
 
 install through pip
