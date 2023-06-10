@@ -1,6 +1,7 @@
 # Available at setup time due to pyproject.toml
 from pybind11.setup_helpers import Pybind11Extension, build_ext
 from setuptools import setup
+import sys
 
 __version__ = "0.0.1"
 
@@ -28,6 +29,9 @@ setup(
     install_requires = [
         "onednn-cpu-gomp"
     ],
+    # it can locate the site-specific include folder(for calling mkl/oneDNN/...)
+    # even for virtualenv environment
+    include_dirs=[f'{sys.prefix}/include'],
     # Currently, build_ext only provides an optional "highest supported C++
     # level" feature, but in the future it may provide more features.
     cmdclass={"build_ext": build_ext},
