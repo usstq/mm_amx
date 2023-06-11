@@ -82,6 +82,8 @@ struct MatmulMTOMP {
         // split along N dimension
         int work_amount = rndup(N, 32)/32;
 
+        (void)M;
+        (void)K;
         auto kernel = [&](int tid, int cnt) {
             int start, end;
             splitter(work_amount, cnt, tid, start, end);

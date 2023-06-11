@@ -190,7 +190,7 @@ struct tileconfig_t {
     tileconfig_t(int palette, int _startRow, const std::vector<std::pair<int, int>> &_rows_columnsBytes) {
         palette_id = palette;
         startRow = _startRow;
-        int i;
+        unsigned long i;
         for(i = 0; i < 14; i++) {
             reserved[i] = 0;
         }

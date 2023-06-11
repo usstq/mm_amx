@@ -339,7 +339,7 @@ namespace functional {
             // mixed row
             int tails_nz = (src_rows & 3);
             if (tails_nz) {
-                __mmask32 kmask1 = _cvtu32_mask32(0xFFFFFFFF);
+                //__mmask32 kmask1 = _cvtu32_mask32(0xFFFFFFFF);
                 auto a256 = _mm256_setzero_si256(); // must be zero
                 auto b256 = _mm256_setzero_si256(); // when tails_nz > 2
                 auto c256 = _mm256_setzero_si256(); // when tails_nz > 1
@@ -681,7 +681,7 @@ void prefetch_bytes(void *src)
         _mm_prefetch(p + i + advance, sel);
 }
 template <int... tmm>
-void zero_tiles() { int dummy[sizeof...(tmm)] = {(_tile_zero(tmm), 0)...}; }
+void zero_tiles() { int dummy[sizeof...(tmm)] = {(_tile_zero(tmm), 0)...}; (void)(dummy);}
 
 // matmul (FC)
 //
@@ -725,7 +725,7 @@ void loop2D(int M, int N, int mc, F f) {
 // but it works only when (M >= bM)
 template<int bM, int bN, class F>
 void loop2D_opt_Mtail(int M, int N, int mc, F f) {
-    int tailM = (M % (mc*bM)) % bM;
+    //int tailM = (M % (mc*bM)) % bM;
     assert(M > bM);
     for(int m0=0; m0<M; m0 += mc*bM) {
         for(int n=0; n<N; n += bN) {
@@ -1433,7 +1433,7 @@ struct Matmul<ov::bfloat16, int8_t, float> {
         }
 
         // 4 tiles buffC is reused as decompressed bf16 weights 
-        constexpr int prefetch_ahead = 16*1024;
+        //constexpr int prefetch_ahead = 16*1024;
         ov::bfloat16 * pBa = reinterpret_cast<ov::bfloat16*>(&buffC(0,0));
         ov::bfloat16 * pBb = pBa + (16*32)*2;
         auto kernel_2x2 = [&](int m, int n, int valid_m, int valid_n) {
@@ -1529,12 +1529,12 @@ struct GemAvB {
         int M = matA.dims[0];
         int K = matA.dims[1];
 
-        constexpr int kStep = 32;
+        //constexpr int kStep = 32;
 
         assert(K >= 32);
-        int Ktails = K % kStep;
-        int Kbody = K - Ktails;
-        int Kbackoff = (kStep - Ktails);
+        //int Ktails = K % kStep;
+        //int Kbody = K - Ktails;
+        //int Kbackoff = (kStep - Ktails);
 
         if (K % 32) {
             if (K > Bpadded.dims[1])
