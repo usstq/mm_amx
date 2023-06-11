@@ -14,9 +14,15 @@ __version__ = "0.0.1"
 #   Sort input source files if you glob sources to ensure bit-for-bit
 #   reproducible builds (https://github.com/pybind/python_example/pull/53)
 
+'''
+
+
+'''
 ext_modules = [
-    Pybind11Extension("mm_bench",
-        ["mm_bench.cpp"],
+    # https://www.intel.com/content/www/us/en/developer/tools/oneapi/onemkl-link-line-advisor.html
+   
+    Pybind11Extension("mmbench.dnnl",
+        ["mmbench/dnnl.cpp"],
         # Example: passing in the version to the compiled code
         define_macros = [('VERSION_INFO', __version__)],
         # it can locate the site-specific include folder(for calling mkl/oneDNN/...)
@@ -29,18 +35,59 @@ ext_modules = [
         runtime_library_dirs=[ f'{sys.prefix}/lib', ],
         libraries=[
             'pthread',
+            'stdc++',
             'gomp',
             'dnnl',
+        ],
+        extra_compile_args=[ '-fopenmp',],
+    ),
+
+    Pybind11Extension("mmbench.mkl",
+        ["mmbench/mkl.cpp"],
+        # it can locate the site-specific include folder(for calling mkl/oneDNN/...)
+        # even for virtualenv environment
+        include_dirs=[
+            f'{sys.prefix}/include',
+            '../include',
+        ],
+        library_dirs=[ f'{sys.prefix}/lib', ],
+        runtime_library_dirs=[ f'{sys.prefix}/lib', ],
+        libraries=[
+            'pthread',
+            'stdc++',
             'mkl_intel_ilp64',
             'mkl_gnu_thread',
             'mkl_core',
+            'gomp',
         ],
+        extra_compile_args=[ '-fopenmp',],
+    ),
+
+    Pybind11Extension("mmbench.mmamx",
+        ["mmbench/mmamx.cpp"],
+        # Example: passing in the version to the compiled code
+        define_macros = [('VERSION_INFO', __version__)],
+        # it can locate the site-specific include folder(for calling mkl/oneDNN/...)
+        # even for virtualenv environment
+        include_dirs=[
+            f'{sys.prefix}/include',
+            '../include',
+        ],
+        library_dirs=[ f'{sys.prefix}/lib', ],
+        runtime_library_dirs=[ f'{sys.prefix}/lib', ],
+        libraries=[
+            'pthread',
+            'stdc++',
+            'iomp5'
+        ],
+        extra_compile_args=['-fopenmp', '-march=native'],
     ),
 ]
-
+    
 setup(
-    name="mm_bench",
+    name="mmbench",
     version=__version__,
+    #packages=['mm_bench',],
     ext_modules=ext_modules,
     install_requires = [
         "onednn-cpu-gomp"
