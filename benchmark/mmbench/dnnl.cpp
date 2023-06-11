@@ -3,8 +3,9 @@
 
 // MatMul_onednn<dnnl::memory::data_type::bf16>
 // MatMul_onednn<dnnl::memory::data_type::f32>
-struct MatMul_onednn
-{
+struct MatmulTaskDNNL : public MatmulTask {
+    using MatmulTask::MatmulTask;
+
     dnnl::engine eng;
     dnnl::matmul::primitive_desc matmul_pd;
     dnnl::matmul matmul_p;
@@ -12,15 +13,15 @@ struct MatMul_onednn
     dnnl::memory::data_type dt;
 
     // whether use dynamic shape support
-    const bool dyn_mode;
+    bool dyn_mode;
 
-    MatMul_onednn(dnnl::memory::data_type dt, bool dyn_mode) : eng(dnnl::engine::kind::cpu, 0),
-                                                               stream(eng),
-                                                               dt(dt),
-                                                               dyn_mode(dyn_mode)
-    {
-        if (dyn_mode)
-            init_dynamic_primitive();
+    void init() override {
+        eng = dnnl::engine(dnnl::engine::kind::cpu, 0);
+        stream = dnnl::stream(eng);
+        dt = dnnl::memory::data_type::bf16;
+        dyn_mode = false;
+
+        initialize_args();
     }
 
     void init_dynamic_primitive()
@@ -49,40 +50,17 @@ struct MatMul_onednn
         matmul_p = dnnl::matmul(matmul_pd);
     }
 
-    bool m_transa = false;
-    bool m_transb = false;
-    int64_t m_M = 0;
-    int64_t m_N = 0;
-    int64_t m_K = 0;
-    int64_t m_lda = 0;
-    int64_t m_ldb = 0;
-    int64_t m_ldc = 0;
     std::unordered_map<int, dnnl::memory> m_args;
-
     // static shape
-    void update_static_shape(bool transa, bool transb,
-                             int64_t M, int64_t N, int64_t K,
-                             void *A, int64_t lda,
-                             void *B, int64_t ldb,
-                             void *C, int64_t ldc)
+    void initialize_args()
     {
-        if (m_transa == transa && m_transb == transb &&
-            m_M == M && m_N == N && m_K == K &&
-            m_lda == lda && m_ldb == ldb && m_ldc == ldc)
-        {
-            // no shape/strides config changes, just reset pointer
-            m_args[DNNL_ARG_SRC].set_data_handle(A);
-            m_args[DNNL_ARG_WEIGHTS].set_data_handle(B);
-            m_args[DNNL_ARG_DST].set_data_handle(C);
-            return;
-        }
-        dnnl::memory::dims a_shape = {M, K};
-        dnnl::memory::dims b_shape = {K, N};
-        dnnl::memory::dims c_shape = {M, N};
+        dnnl::memory::dims a_shape = {m, k};
+        dnnl::memory::dims b_shape = {k, n};
+        dnnl::memory::dims c_shape = {m, n};
 
-        dnnl::memory::dims a_strides = (!transa) ? dnnl::memory::dims{lda, 1} : dnnl::memory::dims{1, lda};
-        dnnl::memory::dims b_strides = (!transb) ? dnnl::memory::dims{ldb, 1} : dnnl::memory::dims{1, ldb};
-        dnnl::memory::dims c_strides = dnnl::memory::dims{ldc, 1};
+        dnnl::memory::dims a_strides = (!transa) ? dnnl::memory::dims{A.padded_dim1, 1} : dnnl::memory::dims{1, A.padded_dim1};
+        dnnl::memory::dims b_strides = (!transb) ? dnnl::memory::dims{B.padded_dim1, 1} : dnnl::memory::dims{1, B.padded_dim1};
+        dnnl::memory::dims c_strides = dnnl::memory::dims{C.padded_dim1, 1};
 
         dnnl::memory::desc a_md(a_shape, dt, a_strides);
         dnnl::memory::desc b_md(b_shape, dt, b_strides);
@@ -104,75 +82,33 @@ struct MatMul_onednn
         else
         {
             // dynamic mode MatMul primitive only create once
+            init_dynamic_primitive();
         }
 
         std::cout << matmul_pd.impl_info_str() << std::endl;
 
-        dnnl::memory A_m(a_md, eng, A);
-        dnnl::memory B_m(b_md, eng, B);
-        dnnl::memory C_m(c_md, eng, C);
+        dnnl::memory A_m(a_md, eng, &A[0]);
+        dnnl::memory B_m(b_md, eng, &B[0]);
+        dnnl::memory C_m(c_md, eng, &C[0]);
 
         m_args.clear();
         m_args[DNNL_ARG_SRC] = A_m;
         m_args[DNNL_ARG_WEIGHTS] = B_m;
         m_args[DNNL_ARG_DST] = C_m;
         // m_args[DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS] = alpha_m;
-
-        m_transa = transa;
-        m_transb = transb;
-        m_M = M;
-        m_N = N;
-        m_K = K;
-        m_lda = lda;
-        m_ldb = ldb;
-        m_ldc = ldc;
     }
 
-    void run(bool transa, bool transb,
-             int64_t M, int64_t N, int64_t K,
-             void *A, int64_t lda,
-             void *B, int64_t ldb,
-             void *C, int64_t ldc)
-    {
-        // update static shape related resources:
-        //   - primitive (in static shape mode)
-        //   - runtime args for primitive
-        update_static_shape(transa, transb, M, N, K, A, lda, B, ldb, C, ldc);
-
+    void run() override {
         // Execute the MatMul primitive
         matmul_p.execute(stream, m_args);
         stream.wait();
     }
 };
 
-void matmul_bf16_onednn_dyn(
-    bool transa, bool transb, bool constB,
-    int64_t m, int64_t n, int64_t k,
-    void *a, int64_t lda,
-    void *b, int64_t ldb,
-    void *c, int64_t ldc)
-{
-    static MatMul_onednn mm(dnnl::memory::data_type::bf16, true);
-    mm.run(transa, transb, m, n, k, a, lda, b, ldb, c, ldc);
-}
-
-void matmul_bf16_onednn_static(
-    bool transa, bool transb, bool constB,
-    int64_t m, int64_t n, int64_t k,
-    void *a, int64_t lda,
-    void *b, int64_t ldb,
-    void *c, int64_t ldc)
-{
-    static MatMul_onednn mm(dnnl::memory::data_type::bf16, false);
-    mm.run(transa, transb, m, n, k, a, lda, b, ldb, c, ldc);
-}
-
 PYBIND11_MODULE(dnnl, m)
 {
-    m.def("benchmark", [](bool transB, bool constB, int M, int N, int K, float duration, int cache_MB){
-        return benchmark(transB, constB, M, N, K, matmul_bf16_onednn_static, duration, cache_MB);
-    });
-    m.def("benchmark2", [](bool transB, bool constB, int M, int N, int K, float duration, int cache_MB){
-        return benchmark(transB, constB, M, N, K, matmul_bf16_onednn_dyn, duration, cache_MB);
+    m.def("benchmark", [](bool transB, bool constB, int M, int N, int K,float duration, int cache_MB){
+        MatmulTaskDNNL task(false, transB, constB, M, N, K, duration, cache_MB);
+        return task.benchmark();
     });
 }
