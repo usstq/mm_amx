@@ -108,7 +108,7 @@ struct MatmulTaskDNNL : public MatmulTask {
 PYBIND11_MODULE(dnnl, m)
 {
     m.def("benchmark", [](bool transB, bool constB, int M, int N, int K,float duration, int cache_MB){
-        MatmulTaskDNNL task(false, transB, constB, M, N, K, duration, cache_MB);
+        MatmulTaskDNNL task("dnnl", false, transB, constB, M, N, K, duration, cache_MB);
         return task.benchmark();
     });
 }

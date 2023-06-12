@@ -2,19 +2,78 @@ from . import dnnl
 from . import mkl
 from . import mmamx
 
-def run():
+import argparse
+
+
+import time
+from hwcounter import Timer, count, count_end
+tsc_cycles_per_sec = 0
+start = count()
+time.sleep(1)
+tsc_cycles_per_sec = count_end() - start
+print(f"tsc_cycles_per_sec={tsc_cycles_per_sec/1e9} G")
+
+def test_torch(M, N, K, duration, cacheMB):
+    import torch
+    with torch.no_grad():
+        
+        if cacheMB > 0:
+            clrc0 = torch.randn(int(cacheMB/4)).float()
+            clrc1 = torch.randn(int(cacheMB/4)).float()
+        
+        tensor1 = torch.randn(M, K).bfloat16()
+        tensor2 = torch.randn(K, N).bfloat16()
+        tensor3 = torch.randn(M, N).bfloat16()
+        # warmup
+        torch.matmul(tensor1, tensor2, out = tensor3)
+        torch.matmul(tensor1, tensor2, out = tensor3)
+        
+        # estimate repeat times
+        start = count()
+        torch.matmul(tensor1, tensor2, out = tensor3)
+        est_lat = count_end() - start
+        times = int(duration * tsc_cycles_per_sec / est_lat)
+
+        total_cycles = 0
+        for i in range(times):
+            # clear cache
+            if cacheMB > 0:
+                torch.cos(clrc0, out=clrc1)
+
+            start = count()
+            torch.matmul(tensor1, tensor2, out = tensor3)
+            total_cycles += count_end() - start
+        latency = total_cycles/times/tsc_cycles_per_sec
+    return {'correct':True, 'latency_ms' : {latency * 1e3}, 'times' : times}
+
+
+def main(args):
     TransB = False
-    ConstB = False
-    M, N, K = 32, 256, 2560
-    duration = 10
-    cacheMB = 120
+    constb = args.constb
+    M, N, K = 32, 10240, 10240
+    duration = args.duration
+    cacheMB = args.cacheMB
+    
+    print(f"benchmark on M,N,K=[{M},{N},{K}] constb={constb} duration={duration} cacheMB={cacheMB}")
+    
+
     for i in range(2):
-        a = mkl.benchmark(TransB, ConstB, M, N, K , duration, cacheMB)
-        b = dnnl.benchmark(TransB, ConstB, M, N, K , duration, cacheMB)
-        c = mmamx.benchmark(TransB, ConstB, M, N, K , duration, cacheMB)
+        a = mkl.benchmark(TransB, constb, M, N, K , duration, cacheMB)
+        b = dnnl.benchmark(TransB, constb, M, N, K , duration, cacheMB)
+        c = mmamx.benchmark(TransB, constb, M, N, K , duration, cacheMB)
+        d = test_torch(M, N, K, duration, cacheMB)
         print(f"  mkl: {a}")
         print(f" dnnl: {b}")
         print(f"mmaxm: {c}")
+        print(f"torch: {d}")
 
 if __name__ == "__main__":
-    run()
+    parser = argparse.ArgumentParser(
+                    prog='ProgramName',
+                    description='What the program does',
+                    epilog='Text at the bottom of help')
+    parser.add_argument('-c', '--cacheMB', type=int, default=0)
+    parser.add_argument('-d', '--duration', type=float, default=10)
+    parser.add_argument('--constb', action="store_true")
+    args = parser.parse_args()
+    main(args)

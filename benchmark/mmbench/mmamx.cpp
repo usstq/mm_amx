@@ -18,8 +18,8 @@ struct Matmul {
     WeightPrecision wei_prec;
     bool transposeB;
 
-    Matmul(bool _constB = false, bool _transposeB = false, WeightPrecision _wei_prec = Weight_BF16) :
-        mbf16bf16(_constB, _transposeB) {
+    Matmul(bool _constb = false, bool _transposeB = false, WeightPrecision _wei_prec = Weight_BF16) :
+        mbf16bf16(_constb, _transposeB) {
         transposeB = _transposeB;
         wei_prec = _wei_prec;
     }
@@ -63,13 +63,13 @@ struct MatmulMTOMP {
     MatmulMTOMP() = default;
 
     void init(bool _transposeB = false,
-                bool _constB = false,
+                bool _constb = false,
                 Matmul::WeightPrecision _precision=Matmul::Weight_BF16) {
         transposeB = _transposeB;
         rt_precision = _precision;
         OMP_NT = omp_thread_count();
         for(int i = 0; i < OMP_NT; i++)
-            ops.push_back(std::make_shared<Matmul>(_constB, _transposeB, rt_precision));
+            ops.push_back(std::make_shared<Matmul>(_constb, _transposeB, rt_precision));
     }
 
     template<typename T, typename P>
@@ -111,7 +111,7 @@ struct MatmulTaskMMAMX : public MatmulTask {
     MatmulMTOMP mm;
 
     void init() override {
-        mm.init(transb, constB);
+        mm.init(transb, constb);
     }
     void run() override {
         amx_kernel::PP::BiasGeluStore<float, amx_kernel::PP::Steps::NONE> pp0(C);
@@ -124,8 +124,8 @@ PYBIND11_MODULE(mmamx, m)
     static bool initAMX = initXTILE();
     std::cout << "mmamx initAMX=" << initAMX << std::endl;
 
-    m.def("benchmark", [](bool transB, bool constB, int M, int N, int K,float duration, int cache_MB){
-        MatmulTaskMMAMX task(false, transB, constB, M, N, K, duration, cache_MB);
+    m.def("benchmark", [](bool transB, bool constb, int M, int N, int K,float duration, int cache_MB){
+        MatmulTaskMMAMX task("mmamx", false, transB, constb, M, N, K, duration, cache_MB);
         return task.benchmark();
     });
 }

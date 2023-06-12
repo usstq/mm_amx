@@ -7,7 +7,7 @@ struct MatmulTaskMKL : public MatmulTask {
     tensor2D<ov::bfloat16> Bpacked;
 
     void init() override {
-        if (constB) {
+        if (constb) {
             auto sizeB = cblas_gemm_bf16bf16f32_pack_get_size(CblasBMatrix, m, n, k);
 
             Bpacked.resize(1, sizeB/sizeof(ov::bfloat16));
@@ -28,7 +28,7 @@ struct MatmulTaskMKL : public MatmulTask {
         float alpha = 1.0f;
         float beta = 0.0f;
 
-        if (constB) {
+        if (constb) {
             MKL_BF16 *a_mat = reinterpret_cast<MKL_BF16 *>(&A[0]);
             MKL_BF16 *b_mat = reinterpret_cast<MKL_BF16 *>(&Bpacked[0]);
             float *c_mat = reinterpret_cast<float *>(&C[0]);
@@ -59,8 +59,8 @@ struct MatmulTaskMKL : public MatmulTask {
 
 PYBIND11_MODULE(mkl, m)
 {
-    m.def("benchmark", [](bool transB, bool constB, int M, int N, int K,float duration, int cache_MB){
-        MatmulTaskMKL task(false, transB, constB, M, N, K, duration, cache_MB);
+    m.def("benchmark", [](bool transB, bool constb, int M, int N, int K,float duration, int cache_MB){
+        MatmulTaskMKL task("mkl", false, transB, constb, M, N, K, duration, cache_MB);
         return task.benchmark();
     });
 }

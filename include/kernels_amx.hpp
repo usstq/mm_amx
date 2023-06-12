@@ -652,7 +652,7 @@ namespace PP {
                 }
                 if (std::is_same<D, ov::bfloat16>::value) {
                     auto c = _mm512_cvtne2ps_pbh(r1, r0);   // convert to bf16
-                    _mm512_mask_storeu_epi16(pdst, kall, c);   // store bf16
+                    _mm512_mask_storeu_epi16(pdst, kall, reinterpret_cast<__m512i&>(c));   // store bf16
                 }
                 if (std::is_same<D, int8_t>::value) {
                     auto d0 = _mm512_cvtps_epi32(r0);       // convert to dword(i32)
@@ -680,8 +680,16 @@ void prefetch_bytes(void *src)
     for (int i = 0; i < bytes; i+=64)
         _mm_prefetch(p + i + advance, sel);
 }
-template <int... tmm>
-void zero_tiles() { int dummy[sizeof...(tmm)] = {(_tile_zero(tmm), 0)...}; (void)(dummy);}
+
+template<typename C=void>
+void zero_tiles() {
+}
+
+template <int t0, int... tmm>
+void zero_tiles() {
+    _tile_zero(t0);
+    zero_tiles<tmm...>();
+}
 
 // matmul (FC)
 //
@@ -1584,22 +1592,22 @@ struct GemAvB {
                 functional::transpose_m512i_16x16(r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, ra, rb, rc, rd, re, rf);
 
                 // vdpbf16ps
-                regC0 = _mm512_dpbf16_ps(regC0, r0, _mm512_set1_epi32(pBi32[0]));
-                regC1 = _mm512_dpbf16_ps(regC1, r1, _mm512_set1_epi32(pBi32[1]));
-                regC0 = _mm512_dpbf16_ps(regC0, r2, _mm512_set1_epi32(pBi32[2]));
-                regC1 = _mm512_dpbf16_ps(regC1, r3, _mm512_set1_epi32(pBi32[3]));
-                regC0 = _mm512_dpbf16_ps(regC0, r4, _mm512_set1_epi32(pBi32[4]));
-                regC1 = _mm512_dpbf16_ps(regC1, r5, _mm512_set1_epi32(pBi32[5]));
-                regC0 = _mm512_dpbf16_ps(regC0, r6, _mm512_set1_epi32(pBi32[6]));
-                regC1 = _mm512_dpbf16_ps(regC1, r7, _mm512_set1_epi32(pBi32[7]));
-                regC0 = _mm512_dpbf16_ps(regC0, r8, _mm512_set1_epi32(pBi32[8]));
-                regC1 = _mm512_dpbf16_ps(regC1, r9, _mm512_set1_epi32(pBi32[9]));
-                regC0 = _mm512_dpbf16_ps(regC0, ra, _mm512_set1_epi32(pBi32[10]));
-                regC1 = _mm512_dpbf16_ps(regC1, rb, _mm512_set1_epi32(pBi32[11]));
-                regC0 = _mm512_dpbf16_ps(regC0, rc, _mm512_set1_epi32(pBi32[12]));
-                regC1 = _mm512_dpbf16_ps(regC1, rd, _mm512_set1_epi32(pBi32[13]));
-                regC0 = _mm512_dpbf16_ps(regC0, re, _mm512_set1_epi32(pBi32[14]));
-                regC1 = _mm512_dpbf16_ps(regC1, rf, _mm512_set1_epi32(pBi32[15]));
+                regC0 = _mm512_dpbf16_ps(regC0, reinterpret_cast<__m512bh&>(r0), (__m512bh)_mm512_set1_epi32(pBi32[0]));
+                regC1 = _mm512_dpbf16_ps(regC1, reinterpret_cast<__m512bh&>(r1), (__m512bh)_mm512_set1_epi32(pBi32[1]));
+                regC0 = _mm512_dpbf16_ps(regC0, reinterpret_cast<__m512bh&>(r2), (__m512bh)_mm512_set1_epi32(pBi32[2]));
+                regC1 = _mm512_dpbf16_ps(regC1, reinterpret_cast<__m512bh&>(r3), (__m512bh)_mm512_set1_epi32(pBi32[3]));
+                regC0 = _mm512_dpbf16_ps(regC0, reinterpret_cast<__m512bh&>(r4), (__m512bh)_mm512_set1_epi32(pBi32[4]));
+                regC1 = _mm512_dpbf16_ps(regC1, reinterpret_cast<__m512bh&>(r5), (__m512bh)_mm512_set1_epi32(pBi32[5]));
+                regC0 = _mm512_dpbf16_ps(regC0, reinterpret_cast<__m512bh&>(r6), (__m512bh)_mm512_set1_epi32(pBi32[6]));
+                regC1 = _mm512_dpbf16_ps(regC1, reinterpret_cast<__m512bh&>(r7), (__m512bh)_mm512_set1_epi32(pBi32[7]));
+                regC0 = _mm512_dpbf16_ps(regC0, reinterpret_cast<__m512bh&>(r8), (__m512bh)_mm512_set1_epi32(pBi32[8]));
+                regC1 = _mm512_dpbf16_ps(regC1, reinterpret_cast<__m512bh&>(r9), (__m512bh)_mm512_set1_epi32(pBi32[9]));
+                regC0 = _mm512_dpbf16_ps(regC0, reinterpret_cast<__m512bh&>(ra), (__m512bh)_mm512_set1_epi32(pBi32[10]));
+                regC1 = _mm512_dpbf16_ps(regC1, reinterpret_cast<__m512bh&>(rb), (__m512bh)_mm512_set1_epi32(pBi32[11]));
+                regC0 = _mm512_dpbf16_ps(regC0, reinterpret_cast<__m512bh&>(rc), (__m512bh)_mm512_set1_epi32(pBi32[12]));
+                regC1 = _mm512_dpbf16_ps(regC1, reinterpret_cast<__m512bh&>(rd), (__m512bh)_mm512_set1_epi32(pBi32[13]));
+                regC0 = _mm512_dpbf16_ps(regC0, reinterpret_cast<__m512bh&>(re), (__m512bh)_mm512_set1_epi32(pBi32[14]));
+                regC1 = _mm512_dpbf16_ps(regC1, reinterpret_cast<__m512bh&>(rf), (__m512bh)_mm512_set1_epi32(pBi32[15]));
             }
             regC0 = _mm512_add_ps(regC0, regC1);
             _mm512_mask_storeu_ps (vecC + m, kmask, regC0);

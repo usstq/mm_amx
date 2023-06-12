@@ -40,9 +40,10 @@ inline uint64_t second2tsc(double sec) {
 
 
 struct MatmulTask {
+    const char * name;
     bool transa;
     bool transb;
-    bool constB;
+    bool constb;
     int64_t m;
     int64_t n;
     int64_t k;
@@ -55,10 +56,12 @@ struct MatmulTask {
     std::vector<char> clr_cache_src;
     std::vector<char> clr_cache_dst;
     
-    MatmulTask(bool transa, bool transb, bool constB,
+    MatmulTask(const char * name,
+                bool transa, bool transb, bool constb,
                 int64_t m, int64_t n, int64_t k,
                 float duration, int cache_MB):
-        transa(transa), transb(transb), constB(constB),
+        name(name),
+        transa(transa), transb(transb), constb(constb),
         m(m), n(n), k(k),
         duration(duration), cache_MB(cache_MB) {
 
@@ -106,23 +109,24 @@ struct MatmulTask {
     bool subclass_initialized = false;
 
     py::dict benchmark() {
+        py::dict ret;
 
         // initialize subclass(cannot call virtual function in constructor)
         if (!subclass_initialized) {
             init();
             subclass_initialized  = true;
         }
-        py::dict ret;
 
+        int prevent_opt = 0;
         const int warm_up = 2;
         for(int i = 0; i < warm_up; i++) {
-            clear_cache();
+            prevent_opt += clear_cache();
             run();
         }
 
         // roughly measure latency
         auto t0 = __rdtsc();
-        clear_cache();
+        prevent_opt += clear_cache();
         run();
         auto t1 = __rdtsc();
 
@@ -130,10 +134,10 @@ struct MatmulTask {
 
         double avg_latency = 0;
         int64_t times = duration/est_latency;
-        std::cout << " start test times=" << times << std::flush;
+        std::cout << "[" << name << "] start test times=" << times << std::flush;
         auto start = std::chrono::high_resolution_clock::now();
         for(int64_t i = 0; i < times; i++) {
-            clear_cache();
+            prevent_opt += clear_cache();
             auto t0 = __rdtsc();
             run();
             auto t1 = __rdtsc();
@@ -149,6 +153,7 @@ struct MatmulTask {
         ret[pybind11::str("latency_ms")] = avg_latency * 1e3;
         ret[pybind11::str("times")] = times;
         ret[pybind11::str("duration")] = total_latency.count();
+        ret[pybind11::str("prevent_opt")] = prevent_opt;
 
         return ret;
     }
