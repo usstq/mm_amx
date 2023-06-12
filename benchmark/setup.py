@@ -15,8 +15,10 @@ __version__ = "0.0.1"
 #   reproducible builds (https://github.com/pybind/python_example/pull/53)
 
 '''
-
-
+using intel compiler:
+source ~/intel/oneapi/setvars.sh
+export CXX=icx
+export CC=icx
 '''
 ext_modules = [
     # https://www.intel.com/content/www/us/en/developer/tools/oneapi/onemkl-link-line-advisor.html
@@ -87,7 +89,7 @@ ext_modules = [
 setup(
     name="mmbench",
     version=__version__,
-    #packages=['mm_bench',],
+    packages=['mmbench',],
     ext_modules=ext_modules,
     install_requires = [
         "onednn-cpu-gomp"

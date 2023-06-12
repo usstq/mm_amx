@@ -60,11 +60,13 @@ struct MatmulTask {
                 float duration, int cache_MB):
         transa(transa), transb(transb), constB(constB),
         m(m), n(n), k(k),
-        duration(duration), cache_MB(cache_MB),
+        duration(duration), cache_MB(cache_MB) {
 
         // clear cache
-        clr_cache_src(cache_MB*1024*1024, 1),
-        clr_cache_dst(cache_MB*1024*1024, 2) {
+        if (cache_MB > 0) {
+            clr_cache_src.resize(cache_MB*1024*1024, 1);
+            clr_cache_dst.resize(cache_MB*1024*1024, 2);
+        }
 
         // prepare input
         if (transa)
@@ -88,24 +90,28 @@ struct MatmulTask {
         // result
         C.resize(m, n);
         C = 0;
-
-        // derived class init
-        init();
     }
 
-    virtual void init() {
-    }
-
-    virtual void run() {
-        assert(false);
-    }
+    virtual void init() = 0;
+    virtual void run() = 0;
 
     char clear_cache() {
-        memcpy(&clr_cache_dst[0], &clr_cache_src[0], cache_MB*1024*1024);
-        return clr_cache_dst[rand() % (cache_MB*1024*1024)];
+        if (cache_MB > 0) {
+            memcpy(&clr_cache_dst[0], &clr_cache_src[0], cache_MB*1024*1024);
+            return clr_cache_dst[rand() % (cache_MB*1024*1024)];
+        }
+        return ' ';
     }
 
+    bool subclass_initialized = false;
+
     py::dict benchmark() {
+
+        // initialize subclass(cannot call virtual function in constructor)
+        if (!subclass_initialized) {
+            init();
+            subclass_initialized  = true;
+        }
         py::dict ret;
 
         const int warm_up = 2;

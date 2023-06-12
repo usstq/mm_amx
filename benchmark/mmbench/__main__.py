@@ -10,11 +10,10 @@ def run():
     cacheMB = 120
     for i in range(2):
         a = mkl.benchmark(TransB, ConstB, M, N, K , duration, cacheMB)
-        print(a)
-        #b = dnnl.benchmark(TransB, ConstB, M, N, K , duration, cacheMB)
+        b = dnnl.benchmark(TransB, ConstB, M, N, K , duration, cacheMB)
         c = mmamx.benchmark(TransB, ConstB, M, N, K , duration, cacheMB)
         print(f"  mkl: {a}")
-        #print(f" dnnl: {b}")
+        print(f" dnnl: {b}")
         print(f"mmaxm: {c}")
 
 if __name__ == "__main__":

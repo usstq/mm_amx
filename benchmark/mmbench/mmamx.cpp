@@ -79,6 +79,7 @@ struct MatmulMTOMP {
         int M = matA.dims[0];
         int K = matA.dims[1];
         int N = matB.dims[transposeB ? 0:1];
+
         // split along N dimension
         int work_amount = rndup(N, 32)/32;
 
@@ -90,6 +91,7 @@ struct MatmulMTOMP {
             int n0 = start*32;
             int n1 = end*32;
             if (n1 > N) n1 = N;
+            if (n1 <= n0) return;
             //tensor2D<bfloat16> copyA = matA.clone();
             // C[:, N0:N1] = A * B[:, N0:N1]
             (*ops[tid].get())(matA, matB, n0, n1, ppkernel);
@@ -120,7 +122,7 @@ struct MatmulTaskMMAMX : public MatmulTask {
 PYBIND11_MODULE(mmamx, m)
 {
     static bool initAMX = initXTILE();
-    std::cout << "initAMX=" << initAMX << std::endl;
+    std::cout << "mmamx initAMX=" << initAMX << std::endl;
 
     m.def("benchmark", [](bool transB, bool constB, int M, int N, int K,float duration, int cache_MB){
         MatmulTaskMMAMX task(false, transB, constB, M, N, K, duration, cache_MB);
