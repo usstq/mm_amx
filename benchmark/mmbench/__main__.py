@@ -50,7 +50,11 @@ def test_torch(M, N, K, duration, cacheMB, checkCorrect):
 def main(args):
     TransB = False
     constb = args.constb
-    M, N, K = 32, 10240, 10240
+    if (len(args.mnk) == 0):
+        M, N, K = 32, 10240, 10240
+    else:
+        M, N, K = args.mnk[0],args.mnk[1],args.mnk[2]
+
     duration = args.duration
     cacheMB = args.cacheMB
     checkCorrect = args.check
@@ -75,6 +79,8 @@ if __name__ == "__main__":
     parser.add_argument('-d', '--duration', type=float, default=10)
     parser.add_argument('--constb', action="store_true")
     parser.add_argument('--check', action="store_true")
-
+    parser.add_argument('--mnk', nargs="+", type=int)
+    
     args = parser.parse_args()
+    
     main(args)
