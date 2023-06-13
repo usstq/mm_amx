@@ -55,15 +55,17 @@ struct MatmulTask {
     int cache_MB; 
     std::vector<char> clr_cache_src;
     std::vector<char> clr_cache_dst;
-    
+    bool check_correct;
+
     MatmulTask(const char * name,
                 bool transa, bool transb, bool constb,
                 int64_t m, int64_t n, int64_t k,
-                float duration, int cache_MB):
+                float duration, int cache_MB, bool check_correct):
         name(name),
         transa(transa), transb(transb), constb(constb),
         m(m), n(n), k(k),
-        duration(duration), cache_MB(cache_MB) {
+        duration(duration), cache_MB(cache_MB),
+        check_correct(check_correct) {
 
         // clear cache
         if (cache_MB > 0) {
@@ -85,10 +87,12 @@ struct MatmulTask {
         A.fill_rnd();
         B.fill_rnd();
 
-        // reference result
-        C0.resize(m, n);
-        C0=0;
-        matmul(A, B, C0);
+        if (check_correct) {
+            // reference result
+            C0.resize(m, n);
+            C0=0;
+            matmul(A, B, C0);
+        }
 
         // result
         C.resize(m, n);
@@ -149,12 +153,13 @@ struct MatmulTask {
 
         avg_latency = avg_latency / times;
 
-        ret[pybind11::str("correct")] = bool(C == C0);
         ret[pybind11::str("latency_ms")] = avg_latency * 1e3;
         ret[pybind11::str("times")] = times;
         ret[pybind11::str("duration")] = total_latency.count();
         ret[pybind11::str("prevent_opt")] = prevent_opt;
-
+        if (check_correct)
+            ret[pybind11::str("correct")] = bool(C == C0);
+        
         return ret;
     }
 };

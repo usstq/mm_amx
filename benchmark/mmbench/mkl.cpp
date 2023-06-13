@@ -59,8 +59,8 @@ struct MatmulTaskMKL : public MatmulTask {
 
 PYBIND11_MODULE(mkl, m)
 {
-    m.def("benchmark", [](bool transB, bool constb, int M, int N, int K,float duration, int cache_MB){
-        MatmulTaskMKL task("mkl", false, transB, constb, M, N, K, duration, cache_MB);
+    m.def("benchmark", [](bool transB, bool constb, int M, int N, int K,float duration, int cache_MB, bool check_correct){
+        MatmulTaskMKL task("mkl", false, transB, constb, M, N, K, duration, cache_MB, check_correct);
         return task.benchmark();
     });
 }

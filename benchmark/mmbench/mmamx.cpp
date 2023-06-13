@@ -124,8 +124,8 @@ PYBIND11_MODULE(mmamx, m)
     static bool initAMX = initXTILE();
     std::cout << "mmamx initAMX=" << initAMX << std::endl;
 
-    m.def("benchmark", [](bool transB, bool constb, int M, int N, int K,float duration, int cache_MB){
-        MatmulTaskMMAMX task("mmamx", false, transB, constb, M, N, K, duration, cache_MB);
+    m.def("benchmark", [](bool transB, bool constb, int M, int N, int K,float duration, int cache_MB, bool check_correct){
+        MatmulTaskMMAMX task("mmamx", false, transB, constb, M, N, K, duration, cache_MB, check_correct);
         return task.benchmark();
     });
 }

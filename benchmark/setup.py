@@ -17,8 +17,7 @@ __version__ = "0.0.1"
 '''
 using intel compiler:
 source ~/intel/oneapi/setvars.sh
-export CXX=icx
-export CC=icx
+export CXX=icx CC=icx
 '''
 ext_modules = [
     # https://www.intel.com/content/www/us/en/developer/tools/oneapi/onemkl-link-line-advisor.html
