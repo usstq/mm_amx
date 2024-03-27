@@ -140,6 +140,7 @@ inline bool initXTILE() {
     if (0 != status || !(bitmask & XFEATURE_MASK_XTILEDATA)) return false;
 
     // XFEATURE_XTILEDATA set successfully, TMUL usage is allowed
+    std::cout << "initXTILE success!\n";
     return true;
 }
 //===============================================================
@@ -169,7 +170,6 @@ inline void tshow() {
 }
 #endif
 
-#ifdef _tile_stored
 template<typename T0, typename T1>
 std::vector<std::pair<T0, T1>> zip_vector(const std::vector<T0> & v0, const std::vector<T1> & v1) {
     std::vector<std::pair<T0, T1>> ret;
@@ -237,7 +237,7 @@ struct tileconfig_t {
         return out;
     }
 } __attribute__ ((__packed__));
-#endif
+
 
 // default implementation
 template <typename T>

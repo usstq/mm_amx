@@ -24,6 +24,8 @@
 #include <stdlib.h>
 
 #include <omp.h>
+
+
 timeit timer(
     {
         {PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES, "HW_CYCLES"},
@@ -478,8 +480,8 @@ int main(int argc, const char *argv[]) {
 
     //amx_unit_test_gemAvB<float>(901, 96);
     std::cout << "===============================FP32========================\n";
-    amx_unit_test_gemAvB<float>(256, 128);
-    amx_unit_test_gemAvB<float>(256, 128);
+    //amx_unit_test_gemAvB<float>(256, 128);
+    //amx_unit_test_gemAvB<float>(256, 128);
     std::cout << "===============================BF16========================\n";
     amx_unit_test_gemAvB<ov::bfloat16>(256, 128);
     amx_unit_test_gemAvB<ov::bfloat16>(256, 128);

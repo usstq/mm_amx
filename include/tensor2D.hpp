@@ -4,6 +4,10 @@
 #include <cstring>
 #include <iostream>
 #include <functional>
+
+#include "bf16.hpp"
+#include "misc.hpp"
+
 #ifdef ENABLE_NUMA
 #include "numa.h"
 #endif
