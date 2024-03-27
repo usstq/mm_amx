@@ -91,6 +91,7 @@ class MatMulVec_AMX : public jit_generator {
   MatMulVec_AMX(int head_size, int block_size)
       : m_head_size(head_size), m_block_size(block_size) {
     create_kernel();
+    dump("MatMulVec_AMX");
   }
 
   struct CallArgs {
@@ -104,7 +105,7 @@ class MatMulVec_AMX : public jit_generator {
   Xbyak::Reg64 reg_dst_addr = r10;
   Xbyak::Reg64 reg_i = r11;
   Xbyak::Reg64 reg_BlockSize = r12;
-  
+
   Xbyak::Reg64 reg_params = abi_param1;
 
   Xbyak::Tmm tmmC = tmm0;
@@ -138,9 +139,13 @@ class MatMulVec_AMX : public jit_generator {
     mov(reg_dst_addr, ptr[reg_params + GET_OFF(dst)]);
 
     // load tile config
-    ldtilecfg(ptr[&m_tile_cfg]);
+    
+    mov(reg_i, reinterpret_cast<uintptr_t>(&m_tile_cfg));
+    ldtilecfg(ptr[reg_i]);
 
-    constexpr static int kStep = is_i8_mode ? 64 : 32;
+    xor_(reg_i, reg_i);
+
+    const int kStep = is_i8_mode ? 64 : 32;
     int hs_tail = m_head_size & (kStep - 1);
     assert(hs_tail == 0);
     /*
@@ -149,37 +154,20 @@ class MatMulVec_AMX : public jit_generator {
     A(key) matrix : block_size x head_size  C(dst) block_size x 1
     */
     // load query into B tiles
-    for (int i = 0, offset = 0, tmm_idx = tmmB0.getIdx(); i < m_head_size; i += kStep, offset += 64, tmm_idx++) {
-        tileloadd(Xbyak::Tmm(tmm_idx), ptr[reg_q_addr + offset]);
+    auto num_B_tiles = m_head_size / kStep;
+    for (int i = 0; i < num_B_tiles; i++) {
+      tileloadd(Xbyak::Tmm(tmmB0.getIdx() + i), ptr[reg_q_addr + reg_i + i*64]);
     }
 
     // unroll by m_block_size
-    for (int m = 0; m < m_block_size; m+=16) {
-        for(int i = 0; i < m_head_size/kStep; i++) {
-            tileloadd(tmmA, ptr[reg_k_addr + i*64]);
-            tdpbf16ps(tmmC, tmmA, Xbyak::Tmm(tmmB0.getIdx() + i));
-        }
+    tilezero(tmmC);
+    for (int m = 0; m < m_block_size; m += 16) {
+      for (int i = 0; i < num_B_tiles; i++) {
+        tileloadd(tmmA, ptr[reg_k_addr + reg_i + i * 64]);
+        tdpbf16ps(tmmC, tmmA, Xbyak::Tmm(tmmB0.getIdx() + i));
+      }
+      add(reg_k_addr, num_B_tiles * 64);
     }
-
-    xor_(reg_i, reg_i);
-    L(".lp");
-    add(reg_i, 16);
-
-    cmp(reg_i, reg_BlockSize);
-    jbe(".lp");  // jmp to previous @@
-
-    mov(reg_n, reg_params);  // n
-    xor_(reg_sum, reg_sum);  // sum
-    test(reg_n, reg_n);
-    jz(".exit");
-    xor_(reg_i, reg_i);  // i
-    L(".lp");
-    add(reg_sum, reg_i);
-    inc(reg_i);
-
-    cmp(reg_i, reg_n);
-    jbe(".lp");  // jmp to previous @@
-    L(".exit");  // <B>
 
     tilerelease();
     // outLocalLabel(); // end of local label
@@ -188,5 +176,7 @@ class MatMulVec_AMX : public jit_generator {
 };
 
 int main() {
+  MatMulVec_AMX mxv(128, 64);
+
   return 0;
 }

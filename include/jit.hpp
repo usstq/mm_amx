@@ -1,6 +1,9 @@
 
 #include "/home/tingqian/openvino/src/plugins/intel_cpu/thirdparty/onednn/src/cpu/x64/xbyak/xbyak.h"
 
+#include <fstream>
+#include <cstdlib>
+
 #ifdef XBYAK64
 constexpr Xbyak::Operand::Code abi_save_gpr_regs[] = {
         Xbyak::Operand::RBP,
@@ -85,6 +88,14 @@ public:
         using jit_kernel_func_t = int (*)(const kernel_args_t... args);
         auto *fptr = (jit_kernel_func_t)jit_ker_;
         return (*fptr)(std::forward<kernel_args_t>(args)...);
+    }
+
+    void dump(const char * name) {
+      std::ofstream outfile;
+      outfile.open("temp.bin", std::ios_base::binary);
+      outfile.write(reinterpret_cast<const char *>(getCode()), getSize());
+      outfile.close();
+      system("objdump -D -b binary -mi386:x86-64 -M intel temp.bin");
     }
 };
 
