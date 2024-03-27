@@ -74,10 +74,13 @@ protected:
     virtual void generate() = 0;
 
     const Xbyak::uint8 *jit_ker_ = nullptr;
-    virtual int create_kernel() {
+    virtual int create_kernel(const char * name = "jit_kernel") {
         int err_code = Xbyak::GetError();
         if (err_code != Xbyak::ERR_NONE) return err_code;
         generate();
+        if (std::getenv("JIT_DEBUG")) {
+            dump(name);
+        }
         jit_ker_ = getCode();
         return (jit_ker_) ? 0 : -1;
     }
@@ -87,6 +90,10 @@ public:
     int operator()(kernel_args_t... args) const {
         using jit_kernel_func_t = int (*)(const kernel_args_t... args);
         auto *fptr = (jit_kernel_func_t)jit_ker_;
+        if (std::getenv("JIT_DEBUG")) {
+            std::cout << "jit kernel @ 0x" << std::hex << reinterpret_cast<uintptr_t>(jit_ker_) << " is being called.\n";
+            asm("int3");
+        }
         return (*fptr)(std::forward<kernel_args_t>(args)...);
     }
 
@@ -96,6 +103,37 @@ public:
       outfile.write(reinterpret_cast<const char *>(getCode()), getSize());
       outfile.close();
       system("objdump -D -b binary -mi386:x86-64 -M intel temp.bin");
+    }
+
+    std::vector<uint8_t> log_buffer;
+    uint8_t * m_log_addr;
+    Xbyak::Reg64 reg_scratch = r9;
+    int log_tile_count = 0;
+
+    void log_tile(Xbyak::Tmm tmm, Xbyak::Reg64 reg_stride) {
+      auto offset = log_buffer.size();
+      log_buffer.resize(offset + 1024, 0xFF);
+      m_log_addr = log_buffer.data();
+      log_tile_count++;
+      // reload base
+      mov(reg_scratch, reinterpret_cast<uintptr_t>(&m_log_addr));
+      mov(reg_scratch, ptr[reg_scratch]);
+      tilestored(ptr[reg_scratch + reg_stride + offset], tmm);
+    }
+
+    template<typename T>
+    void show_log() {
+        T * pdata = reinterpret_cast<T*>(m_log_addr);
+        for(int log = 0; log < log_tile_count; log++) {
+          std::cout << "========== log " << log << std::endl;
+          for(int y = 0; y < 16; y++, pdata += 32) {
+              std::cout << "[" << y << "]: ";
+              for(int x = 0; x < 32; x++) {
+                  std::cout << pdata[x] << ",";
+              }
+              std::cout << "\n";
+          }
+        }
     }
 };
 
