@@ -137,3 +137,44 @@ public:
     }
 };
 
+
+struct TileConfig {
+  uint8_t palette_id;
+  uint8_t startRow;
+  uint8_t reserved[14];
+  uint16_t cols[16];
+  uint8_t rows[16];
+  void reset(int palette,
+             int _startRow,
+             const std::vector<std::pair<int, int>>& _rows_columnsBytes) {
+    palette_id = palette;
+    startRow = _startRow;
+    unsigned long i;
+    for (i = 0; i < 14; i++) {
+      reserved[i] = 0;
+    }
+    for (i = 0; i < _rows_columnsBytes.size(); i++) {
+      rows[i] = _rows_columnsBytes[i].first;
+      cols[i] = _rows_columnsBytes[i].second;
+    }
+    for (; i < 16; i++) {
+      cols[i] = 0;
+      rows[i] = 0;
+    }
+  }
+} __attribute__((__packed__));
+
+class TileConfiger : public jit_generator {
+ public:
+  TileConfiger() { create_kernel(); }
+  void generate() override {
+    Xbyak::Label release;
+    test(abi_param1, abi_param1);
+    jz(release);
+    ldtilecfg(ptr[abi_param1]);
+    ret();
+    L(release);
+    tilerelease();
+    ret();
+  }
+};

@@ -6,35 +6,33 @@
 #endif
 
 /*
-w = query * Key
+C = A @ B
 
-query: [1,      head_size]
-Key  : [block_size, head_size]
-w    : [1, block_size]
+               B: 1x2 tiles
+A : 2x1 tiles  C: 2x2 tiles
 
-head_size is known at compile time
+A : [32, K]
+B : [K, 32] repacked
+C : [32, 32]
+
 */
-class MatMulVec_AMX : public jit_generator {
-  void operator=(const MatMulVec_AMX&);
-
+class Linear32x32_AMX : public jit_generator {
  public:
-  int m_head_size;
-  int m_block_size;
+  int m_K;
   TileConfiger m_tile_configer;
   TileConfig m_tile_cfg;
-  MatMulVec_AMX(int head_size, int block_size)
-      : m_head_size(head_size), m_block_size(block_size) {
-    create_kernel("MatMulVec_AMX");
+  Linear32x32_AMX(int K) : m_K(K) {
+    create_kernel("Linear32x32_AMX");
     m_tile_cfg.reset(1, 0,
                      {
-                         {16, 4},   // C:0   M x 1     (4b)
-                         {16, 64},  // A:1   M x 32/64 (64b)
-                         {16, 4},   // B:2   32/64 x 1 (4b)
-                         {16, 4},   // B:3
-                         {16, 4},   // B:4
-                         {16, 4},   // B:5
-                         {16, 4},   // B:6
-                         {16, 4},   // B:7
+                         {16, 64},   // C:0
+                         {16, 64},   // C:1
+                         {16, 64},   // C:2
+                         {16, 64},   // C:3
+                         {16, 64},   // A0:4
+                         {16, 64},   // A1:5
+                         {16, 64},   // B0:6
+                         {16, 64},   // B1:7
                      });
   }
 
@@ -62,12 +60,12 @@ class MatMulVec_AMX : public jit_generator {
     mov(reg_stride_BC, 4);
     const int kStep = 32;
     if ((m_head_size % 32) != 0)
-        throw std::runtime_error("head size is not multiple of 32");
+      throw std::runtime_error("head size is not multiple of 32");
     if ((m_block_size % 16) != 0)
-        throw std::runtime_error("block size is not multiple of 16");
+      throw std::runtime_error("block size is not multiple of 16");
     auto num_B_tiles = m_head_size / kStep;
     if (num_B_tiles > 6)
-        throw std::runtime_error("number of B tiles is bigger than 6");
+      throw std::runtime_error("number of B tiles is bigger than 6");
 
     /*
                                 B(query)    head_size x 1
@@ -147,7 +145,7 @@ int amx_unit_test_gemAvB(int M, int K, int times = -1000) {
 
   timer.tag(__func__, M, K, N, "q*K_AMX")(
       times, [&]() { matxvec(&B[0], &A[0], &C1[0]); });
-    
+
   matxvec.tile_release();
   return 0;
 }
