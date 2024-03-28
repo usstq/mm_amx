@@ -54,7 +54,7 @@ w    : [1, block_size]
 head_size is known at compile time
 */
 
-struct tileconfig_tx {
+struct TileConfig {
   uint8_t palette_id;
   uint8_t startRow;
   uint8_t reserved[14];
@@ -82,48 +82,14 @@ struct tileconfig_tx {
 
 class TileConfiger : public jit_generator {
  public:
-  struct tileconfig {
-    uint8_t palette_id;
-    uint8_t startRow;
-    uint8_t reserved[14];
-    uint16_t cols[16];
-    uint8_t rows[16];
-  } __attribute__((__packed__));
-
-  tileconfig m_config;
-  TileConfiger(int palette,
-               int _startRow,
-               const std::vector<std::pair<int, int>>& _rows_columnsBytes) {
-    m_config.palette_id = palette;
-    m_config.startRow = _startRow;
-    unsigned long i;
-    for (i = 0; i < 14; i++) {
-      m_config.reserved[i] = 0;
-    }
-    for (i = 0; i < _rows_columnsBytes.size(); i++) {
-      m_config.rows[i] = _rows_columnsBytes[i].first;
-      m_config.cols[i] = _rows_columnsBytes[i].second;
-    }
-    for (; i < 16; i++) {
-      m_config.cols[i] = 0;
-      m_config.rows[i] = 0;
-    }    
-    create_kernel();
-    (*this)(1);
-  }
-  ~TileConfiger() {
-    (*this)(0);
-  }
-
-  Xbyak::Reg64 reg_flag = abi_param1;
-
-  void generate() {
-    test(reg_flag, reg_flag);
-    jz(".release");
-    mov(r8, reinterpret_cast<uintptr_t>(&m_config));
-    ldtilecfg(ptr[r8]);
+  TileConfiger() { create_kernel(); }
+  void generate() override {
+    Xbyak::Label release;
+    test(abi_param1, abi_param1);
+    jz(release);
+    ldtilecfg(ptr[abi_param1]);
     ret();
-L(".release");
+    L(release);
     tilerelease();
     ret();
   }
@@ -135,29 +101,28 @@ class MatMulVec_AMX : public jit_generator {
  public:
   int m_head_size;
   int m_block_size;
-  bool is_i8_mode = false;
-
-  // tileconfig_t m_tile_cfg;
-  /*
-
-  */
+  TileConfiger m_tile_configer;
+  TileConfig m_tile_cfg;
   MatMulVec_AMX(int head_size, int block_size)
       : m_head_size(head_size), m_block_size(block_size) {
-    create_kernel();
-    // dump("MatMulVec_AMX");
+    create_kernel("MatMulVec_AMX");
+    m_tile_cfg.reset(1, 0,
+                     {
+                         {16, 4},   // C:0   M x 1     (4b)
+                         {16, 64},  // A:1   M x 32/64 (64b)
+                         {16, 4},   // B:2   32/64 x 1 (4b)
+                         {16, 4},   // B:3
+                         {16, 4},   // B:4
+                         {16, 4},   // B:5
+                         {16, 4},   // B:6
+                         {16, 4},   // B:7
+                     });
   }
 
-  /**
-   * ww can save preamble, avoid using following registers
-   *  Xbyak::Operand::RBP,
-      Xbyak::Operand::RBX,
-      Xbyak::Operand::R12,
-      Xbyak::Operand::R13,
-      Xbyak::Operand::R14,
-      Xbyak::Operand::R15,
-   *
-  */
+  void tile_config() { m_tile_configer(&m_tile_cfg); }
+  void tile_release() { m_tile_configer(nullptr); }
 
+  // to save push/pop: do not use `abi_save_gpr_regs`
   Xbyak::Reg64 reg_q_addr = abi_param1;
   Xbyak::Reg64 reg_k_addr = abi_param2;
   Xbyak::Reg64 reg_dst_addr = abi_param3;
@@ -174,32 +139,28 @@ class MatMulVec_AMX : public jit_generator {
   Xbyak::Tmm tmmB5 = tmm7;
 
   void generate() {
-    // generate tile config
-    // load tile config
-    // mov(reg_i, reinterpret_cast<uintptr_t>(&m_tile_cfg));
-    // ldtilecfg(ptr[reg_i]);
-
     mov(reg_stride_A, m_head_size * 2);
     mov(reg_stride_BC, 4);
-    const int kStep = is_i8_mode ? 64 : 32;
-    int hs_tail = m_head_size & (kStep - 1);
-    assert(hs_tail == 0);
+    const int kStep = 32;
+    if ((m_head_size % 32) != 0)
+        throw std::runtime_error("head size is not multiple of 32");
+    if ((m_block_size % 16) != 0)
+        throw std::runtime_error("block size is not multiple of 16");
+    auto num_B_tiles = m_head_size / kStep;
+    if (num_B_tiles > 6)
+        throw std::runtime_error("number of B tiles is bigger than 6");
+
     /*
                                 B(query)    head_size x 1
-
     A(key) matrix : block_size x head_size  C(dst) block_size x 1
     */
     // load query into B tiles
-    auto num_B_tiles = m_head_size / kStep;
-    assert(num_B_tiles <= 6);
     for (int i = 0; i < num_B_tiles; i++) {
       tileloadd(Xbyak::Tmm(tmmB0.getIdx() + i),
                 ptr[reg_q_addr + reg_stride_BC + i * 64]);
     }
 
-    // unroll by m_block_size
     for (int m = 0; m < m_block_size; m += 16) {
-      // reduce 16x32/16x64 into C
       tilezero(tmmC);
       for (int i = 0; i < num_B_tiles; i++) {
         tileloadd(tmmA, ptr[reg_k_addr + reg_stride_A + i * 64]);
@@ -243,20 +204,9 @@ int amx_unit_test_gemAvB(int M, int K, int times = -1000) {
   tensor2D<T> B(K, 1, true);
   tensor2D<float> C0(M, 1, true);  // reference result
   tensor2D<float> C1(M, 1, true);  // actual result
-
-  TileConfiger tfg(1, 0,
-                   {
-                       {16, 4},   // C:0   M x 1     (4b)
-                       {16, 64},  // A:1   M x 32/64 (64b)
-                       {16, 4},   // B:2   32/64 x 1 (4b)
-                       {16, 4},   // B:3
-                       {16, 4},   // B:4
-                       {16, 4},   // B:5
-                       {16, 4},   // B:6
-                       {16, 4},   // B:7
-                   });
-
   MatMulVec_AMX matxvec(K, M);
+
+  matxvec.tile_config();
   // same B, different layout
   std::cout << __func__ << "(" << M << "," << K << ")\n";
 
@@ -278,6 +228,8 @@ int amx_unit_test_gemAvB(int M, int K, int times = -1000) {
 
   timer.tag(__func__, M, K, N, "q*K_AMX")(
       times, [&]() { matxvec(&B[0], &A[0], &C1[0]); });
+    
+  matxvec.tile_release();
   return 0;
 }
 
