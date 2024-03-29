@@ -277,7 +277,11 @@ struct timeit {
         perf_counters.resize(perf_counters0.size());
         for(int i = 0; i<perf_counters0.size(); i++) {
             perf_counters[i] = (perf_counters1[i] - perf_counters0[i])/times;
-            std::cout << ", " << events[i]->name << " = " << perf_counters[i];
+            std::cout << ", " << events[i]->name << "=" << perf_counters[i];
+
+            if (std::string("HW_CYCLES") == events[i]->name && opsPerCall > 0) {
+                std::cout << " " << opsPerCall / perf_counters[i] << "(Ops/cycle)";
+            }
         }
 
         std::cout << ANSIcolor() << std::endl;

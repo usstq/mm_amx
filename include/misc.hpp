@@ -69,8 +69,13 @@ inline void vshow(__m512 v) {
 
 struct ANSIcolor {
     const char * code;
+    std::string str;
     ANSIcolor(const char * code = "0") : code(code){
+        std::stringstream ss;
+        ss << "\033[" << code << "m";
+        str = ss.str();
     }
+
     friend std::ostream& operator<<(std::ostream& out, const ANSIcolor& obj) {
         out << "\033[" << obj.code << "m";
         return out;
