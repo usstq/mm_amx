@@ -137,7 +137,7 @@ int amx_jit32x32(int K, int times = -1000) {
                                    // cache line, which is vital to performance.
   tensor2D<ov::bfloat16> B(K, N, true);
   auto Bt = B.Tr();
-  std::vector<ov::bfloat16> BPacked(K * N, 0);
+  tensor2D<ov::bfloat16> BPacked(K * N, 1, true);
   tensor2D<float> C0(M, N, true);  // reference result
   tensor2D<float> C1(M, N, true);  // actual result
   Linear32x32_AMX mm32x32(K);
@@ -159,6 +159,7 @@ int amx_jit32x32(int K, int times = -1000) {
   std::string acc;
 
   mm32x32(&A[0], A.stride, &BPacked[0], &C1[0], C1.stride);
+
   if (C0 == C1) {
     acc = "[PASS]";
     //std::cout << ANSIcolor("1;32") << "amx Match!\n" << ANSIcolor();
@@ -236,6 +237,11 @@ int main(int argc, const char* argv[]) {
             << ANSIcolor();
 
   std::cout << "===============================BF16========================\n";
+    amx_mm32x32(128);
+    amx_jit32x32(128);
+    amx_mm32x32(128);
+    amx_jit32x32(128);
+
   for(int i = 0; i<10; i++) {
     amx_mm32x32(4096);
     amx_jit32x32(4096);
