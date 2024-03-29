@@ -14,84 +14,86 @@ A : 2x1 tiles  C: 2x2 tiles
 A : [32, K]
 B : [K, 32] repacked
 C : [32, 32]
-
 */
+
 class Linear32x32_AMX : public jit_generator {
  public:
   int m_K;
-  TileConfiger m_tile_configer;
   TileConfig m_tile_cfg;
   Linear32x32_AMX(int K) : m_K(K) {
     create_kernel("Linear32x32_AMX");
     m_tile_cfg.reset(1, 0,
                      {
-                         {16, 64},   // C:0
-                         {16, 64},   // C:1
-                         {16, 64},   // C:2
-                         {16, 64},   // C:3
-                         {16, 64},   // A0:4
-                         {16, 64},   // A1:5
-                         {16, 64},   // B0:6
-                         {16, 64},   // B1:7
+                         {16, 64},  // C:0
+                         {16, 64},  // C:1
+                         {16, 64},  // C:2
+                         {16, 64},  // C:3
+                         {16, 64},  // A0:4
+                         {16, 64},  // A1:5
+                         {16, 64},  // B0:6
+                         {16, 64},  // B1:7
                      });
   }
 
-  void tile_config() { m_tile_configer(&m_tile_cfg); }
-  void tile_release() { m_tile_configer(nullptr); }
+  const TileConfig& tile_config() { return m_tile_cfg; }
 
   // to save push/pop: do not use `abi_save_gpr_regs`
-  Xbyak::Reg64 reg_q_addr = abi_param1;
-  Xbyak::Reg64 reg_k_addr = abi_param2;
-  Xbyak::Reg64 reg_dst_addr = abi_param3;
-  Xbyak::Reg64 reg_stride_A = r8;
-  Xbyak::Reg64 reg_stride_BC = r9;
+  Xbyak::Reg64 reg_A_addr = abi_param1;
+  Xbyak::Reg64 reg_A_stride = abi_param2;
+  Xbyak::Reg64 reg_B_addr = abi_param3;
+  Xbyak::Reg64 reg_C_addr = abi_param4;
+  Xbyak::Reg64 reg_C_stride = abi_param5;
+  Xbyak::Reg64 reg_B_stride = r10;
+  Xbyak::Reg64 reg_A1_addr = r11;
 
-  Xbyak::Tmm tmmC = tmm0;
-  Xbyak::Tmm tmmA = tmm1;
-  Xbyak::Tmm tmmB0 = tmm2;
-  Xbyak::Tmm tmmB1 = tmm3;
-  Xbyak::Tmm tmmB2 = tmm4;
-  Xbyak::Tmm tmmB3 = tmm5;
-  Xbyak::Tmm tmmB4 = tmm6;
-  Xbyak::Tmm tmmB5 = tmm7;
+  Xbyak::Tmm tmmC00 = tmm0;
+  Xbyak::Tmm tmmC10 = tmm1;
+  Xbyak::Tmm tmmC01 = tmm2;
+  Xbyak::Tmm tmmC11 = tmm3;
+  Xbyak::Tmm tmmA0 = tmm4;
+  Xbyak::Tmm tmmA1 = tmm5;
+  Xbyak::Tmm tmmB0 = tmm6;
+  Xbyak::Tmm tmmB1 = tmm7;
 
   void generate() {
-    mov(reg_stride_A, m_head_size * 2);
-    mov(reg_stride_BC, 4);
-    const int kStep = 32;
-    if ((m_head_size % 32) != 0)
-      throw std::runtime_error("head size is not multiple of 32");
-    if ((m_block_size % 16) != 0)
-      throw std::runtime_error("block size is not multiple of 16");
-    auto num_B_tiles = m_head_size / kStep;
-    if (num_B_tiles > 6)
-      throw std::runtime_error("number of B tiles is bigger than 6");
-
     /*
-                                B(query)    head_size x 1
-    A(key) matrix : block_size x head_size  C(dst) block_size x 1
+                   B: 1x2 tiles
+    A : 2x1 tiles  C: 2x2 tiles
     */
-    // load query into B tiles
-    for (int i = 0; i < num_B_tiles; i++) {
-      tileloadd(Xbyak::Tmm(tmmB0.getIdx() + i),
-                ptr[reg_q_addr + reg_stride_BC + i * 64]);
-    }
+    lea(reg_A1_addr, ptr[reg_A_addr + reg_A_stride * 8]);
+    lea(reg_A1_addr, ptr[reg_A1_addr + reg_A_stride * 8]);
+    auto Ktiles = m_K / 32;
+    assert(m_K % 32 == 0);
+    mov(reg_B_stride, 64);
+    tilezero(tmmC00);
+    tilezero(tmmC01);
+    tilezero(tmmC10);
+    tilezero(tmmC11);
+    for (int k = 0; k < Ktiles; k++) {
+      tileloadd(tmmA0, ptr[reg_A_addr + reg_A_stride + k * 64]);
+      tileloadd(tmmB0, ptr[reg_B_addr + reg_B_stride + k * 2048]);
+      // prefetch_bytes<1024>(pB);
+      tdpbf16ps(tmmC00, tmmA0, tmmB0);
 
-    for (int m = 0; m < m_block_size; m += 16) {
-      tilezero(tmmC);
-      for (int i = 0; i < num_B_tiles; i++) {
-        tileloadd(tmmA, ptr[reg_k_addr + reg_stride_A + i * 64]);
-        tdpbf16ps(tmmC, tmmA, Xbyak::Tmm(tmmB0.getIdx() + i));
-      }
-      tilestored(ptr[reg_dst_addr + reg_stride_BC + m * sizeof(float)], tmmC);
-      // add(reg_dst_addr, 16*sizeof(float));
-      add(reg_k_addr, m_head_size * 2 * 16);
+      tileloadd(tmmA1, ptr[reg_A1_addr + reg_A_stride + k * 64]);
+      tdpbf16ps(tmmC10, tmmA1, tmmB0);
+
+      tileloadd(tmmB1, ptr[reg_B_addr + reg_B_stride + k * 2048 + 1024]);
+      // prefetch_bytes<1024>(pB);
+      tdpbf16ps(tmmC01, tmmA0, tmmB1);
+      tdpbf16ps(tmmC11, tmmA1, tmmB1);
     }
+    tilestored(ptr[reg_C_addr + reg_C_stride], tmmC00);
+    tilestored(ptr[reg_C_addr + reg_C_stride + 64], tmmC01);
+    lea(reg_C_addr, ptr[reg_C_addr + reg_C_stride * 8]);
+    lea(reg_C_addr, ptr[reg_C_addr + reg_C_stride * 8]);
+    tilestored(ptr[reg_C_addr + reg_C_stride], tmmC10);
+    tilestored(ptr[reg_C_addr + reg_C_stride + 64], tmmC11);
     ret();
   }
 };
 
-// #include "kernels_amx.hpp"
+#include "kernels_amx.hpp"
 // #include "kernels_avx512.hpp"
 #include "tensor2D.hpp"
 #include "timeit.hpp"
@@ -113,24 +115,36 @@ timeit timer({
     //{PERF_TYPE_HW_CACHE, 0x2, "LLC_loads"},
     //{PERF_TYPE_RAW, 0x02b1, "UOPS_EXECUTED.CORE"},
 });
-template <typename T>
-int amx_unit_test_gemAvB(int M, int K, int times = -1000) {
-  int N = 1;
-  tensor2D<T> A(M, K, true);  // ensure stride of A matrix is multiple of cache
-                              // line, which is vital to performance.
-  tensor2D<T> B(K, 1, true);
-  tensor2D<float> C0(M, 1, true);  // reference result
-  tensor2D<float> C1(M, 1, true);  // actual result
-  MatMulVec_AMX matxvec(K, M);
 
-  matxvec.tile_config();
-  // same B, different layout
-  std::cout << __func__ << "(" << M << "," << K << ")\n";
+int amx_unit_test_mm32x32(int K, int times = -1000) {
+  const int M = 32;
+  const int N = 32;
+  tensor2D<ov::bfloat16> A(M, K,
+                           true);  // ensure stride of A matrix is multiple of
+                                   // cache line, which is vital to performance.
+  tensor2D<ov::bfloat16> B(K, N, true);
+  auto Bt = B.Tr();
+  std::vector<ov::bfloat16> BPacked(K * N, 0);
+  tensor2D<float> C0(M, N, true);  // reference result
+  tensor2D<float> C1(M, N, true);  // actual result
+  Linear32x32_AMX mm32x32(K);
+  TileConfigScope tcfg(mm32x32.tile_config());
+
+  std::cout << __func__ << "(M=" << M << ",N=" << N << ",K=" << K << ")\n";
+
+  for (int k = 0, i = 0; k < K; k += 32) {
+    amx_kernel::functional::transpose_epi32_16x16(&BPacked[i * 16 * 32],
+                                                  &Bt(0, k), Bt.stride);
+    i++;
+    amx_kernel::functional::transpose_epi32_16x16(&BPacked[i * 16 * 32],
+                                                  &Bt(16, k), Bt.stride);
+    i++;
+  }
 
   C0 = 0;
   matmul(A, B, C0);
 
-  matxvec(&B[0], &A[0], &C1[0]);
+  mm32x32(&A[0], A.stride, &BPacked[0], &C1[0], C1.stride);
   if (C0 == C1) {
     std::cout << ANSIcolor("1;32") << "amx Match!\n" << ANSIcolor();
   } else {
@@ -143,10 +157,10 @@ int amx_unit_test_gemAvB(int M, int K, int times = -1000) {
     std::cout << ANSIcolor("1;31") << "amx Mismatch!\n" << ANSIcolor();
   }
 
-  timer.tag(__func__, M, K, N, "q*K_AMX")(
-      times, [&]() { matxvec(&B[0], &A[0], &C1[0]); });
+  timer.tag(__func__, M, K, N, "mm32x32")(times, [&]() {
+    mm32x32(&A[0], A.stride, &BPacked[0], &C1[0], C1.stride);
+  });
 
-  matxvec.tile_release();
   return 0;
 }
 
@@ -162,6 +176,8 @@ int main(int argc, const char* argv[]) {
             << ANSIcolor();
 
   std::cout << "===============================BF16========================\n";
-  amx_unit_test_gemAvB<ov::bfloat16>(256, 128);
-  amx_unit_test_gemAvB<ov::bfloat16>(256, 128);
+  amx_unit_test_mm32x32(32);
+  amx_unit_test_mm32x32(64);
+  amx_unit_test_mm32x32(1024);
+  amx_unit_test_mm32x32(4096);
 }

@@ -224,7 +224,7 @@ struct tensor2D {
                 float f0 = (*this)(i0,i1);
                 float f1 = rhs(i0,i1);
                 if (isnan2(f1) || isnan2(f0)) {
-                    std::cout << " nan is found: f0=" << f0 << ",  f1=" << f1 << std::endl;
+                    std::cout << " nan is found @(" << i0 << "," << i1 << ") : f0=" << f0 << ",  f1=" << f1 << std::endl;
                     return false;
                 }
             }

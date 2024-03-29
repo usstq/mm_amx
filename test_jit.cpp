@@ -20,7 +20,6 @@ class MatMulVec_AMX : public jit_generator {
  public:
   int m_head_size;
   int m_block_size;
-  TileConfiger m_tile_configer;
   TileConfig m_tile_cfg;
   MatMulVec_AMX(int head_size, int block_size)
       : m_head_size(head_size), m_block_size(block_size) {
@@ -38,8 +37,7 @@ class MatMulVec_AMX : public jit_generator {
                      });
   }
 
-  void tile_config() { m_tile_configer(&m_tile_cfg); }
-  void tile_release() { m_tile_configer(nullptr); }
+  const TileConfig& tile_config() { return m_tile_cfg; }
 
   // to save push/pop: do not use `abi_save_gpr_regs`
   Xbyak::Reg64 reg_q_addr = abi_param1;
@@ -62,12 +60,12 @@ class MatMulVec_AMX : public jit_generator {
     mov(reg_stride_BC, 4);
     const int kStep = 32;
     if ((m_head_size % 32) != 0)
-        throw std::runtime_error("head size is not multiple of 32");
+      throw std::runtime_error("head size is not multiple of 32");
     if ((m_block_size % 16) != 0)
-        throw std::runtime_error("block size is not multiple of 16");
+      throw std::runtime_error("block size is not multiple of 16");
     auto num_B_tiles = m_head_size / kStep;
     if (num_B_tiles > 6)
-        throw std::runtime_error("number of B tiles is bigger than 6");
+      throw std::runtime_error("number of B tiles is bigger than 6");
 
     /*
                                 B(query)    head_size x 1
@@ -124,8 +122,8 @@ int amx_unit_test_gemAvB(int M, int K, int times = -1000) {
   tensor2D<float> C0(M, 1, true);  // reference result
   tensor2D<float> C1(M, 1, true);  // actual result
   MatMulVec_AMX matxvec(K, M);
+  TileConfigScope tilecfg(matxvec.tile_config());
 
-  matxvec.tile_config();
   // same B, different layout
   std::cout << __func__ << "(" << M << "," << K << ")\n";
 
@@ -147,8 +145,7 @@ int amx_unit_test_gemAvB(int M, int K, int times = -1000) {
 
   timer.tag(__func__, M, K, N, "q*K_AMX")(
       times, [&]() { matxvec(&B[0], &A[0], &C1[0]); });
-    
-  matxvec.tile_release();
+
   return 0;
 }
 
