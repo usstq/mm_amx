@@ -1,15 +1,9 @@
+
+CXX=icx
 if ! which icx > /dev/null; then
-if test -f "~/intel/oneapi/setvars.sh"; then
-    echo "initializing oneapi environment for intel compiler"
-    source ~/intel/oneapi/setvars.sh
-    CXX=icx
-else
-    echo "use g++ instead of intel compiler"
+    echo "use g++ instead of intel compiler (AMX intrinsic maybe missing)"
     CXX=g++
 fi
-
-fi
-
 source=$1
 
 if ! test -f "${source}"; then
@@ -26,6 +20,7 @@ target=a.out
 # g++ ./test.cpp -O2 -lpthread -march=native -lstdc++
 
 MARCH_OPTS="-mno-avx256-split-unaligned-load -mno-avx256-split-unaligned-store"
+MARCH_OPTS=""
 COMMON_OPTS="-DENABLE_NUMA -I$SCRIPT_DIR/include -lpthread -march=native -std=c++14 -lstdc++ -lnuma -fopenmp $MARCH_OPTS"
 
 $CXX $source -O2 $COMMON_OPTS -S -masm=intel -fverbose-asm  -o _main.s &&

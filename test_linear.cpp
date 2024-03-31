@@ -74,23 +74,27 @@ class Linear32x32_AMX : public jit_generator {
     mov(reg_ktiles, Ktiles);
     align(64, false);
     L(loop_over_ktiles);
-    //for (int k = 0; k < Ktiles; k++) {
-      tileloadd(tmmA0, ptr[reg_A_addr + reg_A_stride]);
-      tileloadd(tmmB0, ptr[reg_B_addr + reg_B_stride]);
-      for(int i = 0; i < 1024; i+=64) prefetcht0(ptr[reg_B_addr + 4096 + 2048 + i]);
-      tdpbf16ps(tmmC00, tmmA0, tmmB0);
+    // for (int k = 0; k < Ktiles; k++) {
+    tileloadd(tmmA0, ptr[reg_A_addr + reg_A_stride]);
+    tileloadd(tmmB0, ptr[reg_B_addr + reg_B_stride]);
+    for (int i = 0; i < 1024; i += 64)
+      prefetcht0(ptr[reg_B_addr + 4096 + i]);
+    lea(reg_B_addr, ptr[reg_B_addr + 1024]);
 
-      tileloadd(tmmA1, ptr[reg_A1_addr + reg_A_stride]);
-      tdpbf16ps(tmmC10, tmmA1, tmmB0);
+    tdpbf16ps(tmmC00, tmmA0, tmmB0);
 
-      lea(reg_B_addr, ptr[reg_B_addr + 1024]);
-      tileloadd(tmmB1, ptr[reg_B_addr + reg_B_stride]);
-      for(int i = 0; i < 1024; i+=64) prefetcht0(ptr[reg_B_addr + 4096 + 2048 + i]);
-      tdpbf16ps(tmmC01, tmmA0, tmmB1);
-      tdpbf16ps(tmmC11, tmmA1, tmmB1);
+    tileloadd(tmmA1, ptr[reg_A1_addr + reg_A_stride]);
+    tdpbf16ps(tmmC10, tmmA1, tmmB0);
+
+    tileloadd(tmmB1, ptr[reg_B_addr + reg_B_stride]);
+    for (int i = 0; i < 1024; i += 64)
+      prefetcht0(ptr[reg_B_addr + 4096 + i]);
+
+    tdpbf16ps(tmmC01, tmmA0, tmmB1);
+    tdpbf16ps(tmmC11, tmmA1, tmmB1);
     //}
-    add(reg_A_addr, 64);
-    add(reg_A1_addr, 64);
+    lea(reg_A_addr, ptr[reg_A_addr + 64]);
+    lea(reg_A1_addr, ptr[reg_A1_addr + 64]);
     lea(reg_B_addr, ptr[reg_B_addr + 1024]);
     dec(reg_ktiles);
     jnz(loop_over_ktiles, T_NEAR);
@@ -102,6 +106,26 @@ class Linear32x32_AMX : public jit_generator {
     tilestored(ptr[reg_C_addr + reg_C_stride], tmmC10);
     tilestored(ptr[reg_C_addr + reg_C_stride + 64], tmmC11);
     ret();
+  }
+};
+
+#include "bf16.hpp"
+
+class LinearAMX {
+  Linear32x32_AMX m_kernel;
+  int m_K;
+  int m_N;
+  LinearAMX(int K, int N) : m_kernel(K), m_K(K), m_N(N) {}
+  const TileConfig& tile_config() { return m_kernel.m_tile_cfg; }
+  void operator()(int M,
+                  ov::bfloat16* A,
+                  int strideA,
+                  ov::bfloat16* B,
+                  float* C,
+                  int strideC) {
+    // register blocking is done by 32x32 jit kernel
+    // this loop handles cache blockinig
+    
   }
 };
 
@@ -127,7 +151,6 @@ timeit timer({
     //{PERF_TYPE_HW_CACHE, 0x2, "LLC_loads"},
     //{PERF_TYPE_RAW, 0x02b1, "UOPS_EXECUTED.CORE"},
 });
-
 
 int amx_jit32x32(int K, int times = -1000) {
   const int M = 32;
@@ -155,37 +178,37 @@ int amx_jit32x32(int K, int times = -1000) {
 
   C0 = 0;
   matmul(A, B, C0);
-  
+
   std::string acc;
 
   mm32x32(&A[0], A.stride, &BPacked[0], &C1[0], C1.stride);
 
   if (C0 == C1) {
     acc = "[PASS]";
-    //std::cout << ANSIcolor("1;32") << "amx Match!\n" << ANSIcolor();
+    // std::cout << ANSIcolor("1;32") << "amx Match!\n" << ANSIcolor();
   } else {
-    std::cout << "============= A ================ " << std::endl;
-    std::cout << A << std::endl;
-    std::cout << "============= B ================ " << std::endl;
-    std::cout << B << std::endl;
-    logger() << C0 << std::endl;
-    logger() << C1 << std::endl;
+    if (std::getenv("SHOW_ERR")) {
+      std::cout << "============= A ================ " << std::endl;
+      std::cout << A << std::endl;
+      std::cout << "============= B ================ " << std::endl;
+      std::cout << B << std::endl;
+      logger() << C0 << std::endl;
+      logger() << C1 << std::endl;
+    }
     acc = "[FAIL]";
-    //std::cout << ANSIcolor("1;31") << "amx Mismatch!\n" << ANSIcolor();
+    // std::cout << ANSIcolor("1;31") << "amx Mismatch!\n" << ANSIcolor();
   }
 
-  timer.tag(__func__, "(M=", M, ",N=", N, ",K=", K, ")", acc)(times, [&]() {
-    mm32x32(&A[0], A.stride, &BPacked[0], &C1[0], C1.stride);
-  },
-  M*N*K*2 // OPS per call
+  timer.tag(__func__, "(M=", M, ",N=", N, ",K=", K, ")", acc)(
+      times,
+      [&]() { mm32x32(&A[0], A.stride, &BPacked[0], &C1[0], C1.stride); },
+      M * N * K * 2  // OPS per call
   );
 
   return 0;
 }
 
-int amx_mm32x32(int K, int times = -1000) {
-  const int M = 32;
-  const int N = 32;
+int amx_mm(const int M, const int N, int K, int times = -1000) {
   tensor2D<ov::bfloat16> A(M, K,
                            true);  // ensure stride of A matrix is multiple of
                                    // cache line, which is vital to performance.
@@ -204,7 +227,7 @@ int amx_mm32x32(int K, int times = -1000) {
   mm32x32(A, Bt, 0, N, pp);
   if (C0 == C1) {
     acc = "[PASS]";
-    //ss_name << ANSIcolor("1;32").str << "[PASS]" << ANSIcolor();
+    // ss_name << ANSIcolor("1;32").str << "[PASS]" << ANSIcolor();
   } else {
     std::cout << "============= A ================ " << std::endl;
     std::cout << A << std::endl;
@@ -212,14 +235,13 @@ int amx_mm32x32(int K, int times = -1000) {
     std::cout << B << std::endl;
     logger() << C0 << std::endl;
     logger() << C1 << std::endl;
-    //ss_name << ANSIcolor("1;31") << "[FAIL]" << ANSIcolor();
+    // ss_name << ANSIcolor("1;31") << "[FAIL]" << ANSIcolor();
     acc = "[FAIL]";
   }
 
-  timer.tag(__func__, "(M=", M, ",N=", N, ",K=", K, ")", acc)(times, [&]() {
-    mm32x32(A, Bt, 0, N, pp);
-  },
-  M*N*K*2 // OPS per call
+  timer.tag(__func__, "        ", "(M=", M, ",N=", N, ",K=", K, ")", acc)(
+      times, [&]() { mm32x32(A, Bt, 0, N, pp); },
+      2.0* M * N * K  // OPS per call
   );
 
   return 0;
@@ -237,13 +259,21 @@ int main(int argc, const char* argv[]) {
             << ANSIcolor();
 
   std::cout << "===============================BF16========================\n";
-    amx_mm32x32(128);
-    amx_jit32x32(128);
-    amx_mm32x32(128);
-    amx_jit32x32(128);
+  amx_mm(32, 32, 128);
+  amx_jit32x32(128);
+  amx_mm(32, 32, 128);
+  amx_jit32x32(128);
 
-  for(int i = 0; i<10; i++) {
-    amx_mm32x32(4096);
+  std::cout << "===============================32x32========================\n";
+  for (int i = 0; i < 3; i++) {
+    amx_mm(32, 32, 4096);
     amx_jit32x32(4096);
+  }
+
+  std::cout << "===============================256x352========================\n";
+  for (int i = 0; i < 3; i++) {
+    amx_mm(256,  11*32, 4096);
+    amx_mm(256,  1024, 4096);
+    //amx_jit32x32(4096);
   }
 }

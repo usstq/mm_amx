@@ -46,7 +46,7 @@ Thus the basic flow is, for each sub-matrix $C_{ij}$, we do what specified in GE
 Step 2 is a reduce-procedure which is usually the computational heavy part or hot-spot, and it's heavily memory bounded, given that the throughput of TDP* instruction (*the AMX matmul & accumulation instruction*) is 16 cycles, during which:
 
  - L1D can load (64x2)x16 = 2KB which is 2 tiles
- - L2 can load (48)x16 = 768 Bytes which is 75% tile [^2]
+ - L2 can load (48)x16 = 768 Bytes which is 75% tile (only 70% reached in practice) [^2]
  - LLC can load (21)x16 = 336 Bytes which is 32.8% tile [^2]
  - 8-channel 4800MT/s DDR can load (4.8e9 x 8 x 8/2e9)/56 x 16 = 43.8 Bytes/core @2GHz CPU frequency on chip with 56-cores, which is 4.2% tile
 
