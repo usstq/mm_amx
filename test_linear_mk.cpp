@@ -85,28 +85,34 @@ class Linear32x32_AMX : public jit_generator {
         const_A_steps = 1024;
     }
 
+    bool do_sw_prefetch = std::getenv("SWPF") != nullptr;
+
     align(64, false);
     L(loop_over_ktiles);
     //for (int k = 0; k < Ktiles; k++) {
       tileloadd(tmmA0, ptr[reg_A_addr + reg_A_stride]);
-      if (is_matrix_A_blocked) {
+      if (is_matrix_A_blocked && do_sw_prefetch) {
         for(int i = 0; i < 1024; i+=64) prefetcht0(ptr[reg_A_addr + 4096 + i]);
       }
       tileloadd(tmmB0, ptr[reg_B_addr + reg_B_stride]);
-      for(int i = 0; i < 1024; i+=64) prefetcht0(ptr[reg_B_addr + 4096 + i]);
+      if (do_sw_prefetch) {
+        for(int i = 0; i < 1024; i+=64) prefetcht0(ptr[reg_B_addr + 4096 + i]);
+      }
       lea(reg_B_addr, ptr[reg_B_addr + 1024]);
 
       tdpbf16ps(tmmC00, tmmA0, tmmB0);
 
       tileloadd(tmmA1, ptr[reg_A1_addr + reg_A_stride]);
-      if (is_matrix_A_blocked) {
+      if (is_matrix_A_blocked && do_sw_prefetch) {
         for(int i = 0; i < 1024; i+=64) prefetcht0(ptr[reg_A1_addr + 4096 + i]);
       }
 
       tdpbf16ps(tmmC10, tmmA1, tmmB0);
 
       tileloadd(tmmB1, ptr[reg_B_addr + reg_B_stride]);
-      for(int i = 0; i < 1024; i+=64) prefetcht0(ptr[reg_B_addr + 4096 + i]);
+      if (do_sw_prefetch) {
+        for(int i = 0; i < 1024; i+=64) prefetcht0(ptr[reg_B_addr + 4096 + i]);
+      }
 
       tdpbf16ps(tmmC01, tmmA0, tmmB1);
       tdpbf16ps(tmmC11, tmmA1, tmmB1);
