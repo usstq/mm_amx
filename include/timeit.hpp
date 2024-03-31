@@ -198,6 +198,12 @@ struct timeit {
         return *this;
     }
 
+    std::string _color;
+    timeit& color(std::string code) {
+        _color = code;
+        return *this;
+    }
+
     int preset_expect_times_milliseconds;
     void set_time_ms(int time_ms) {
         preset_expect_times_milliseconds = time_ms;
@@ -213,7 +219,7 @@ struct timeit {
         preset_peakOpsPerSecond = peak_per_second;
     }
 
-    std::vector<uint64_t> perf_counters;
+    std::map<std::string, uint64_t> perf_counters;
 
     template<typename Callable>
     double operator()(const Callable & c,
@@ -267,20 +273,25 @@ struct timeit {
         std::cout << "done\r                                \r" << std::flush;
         std::chrono::duration<double> total_latency = finish-start;
         auto avg_latency = total_latency.count()/times;
-        std::cout << ANSIcolor("0;33") << _tag << "\t: " << avg_latency*1e6 << " us x " << times;
+
+        std::string ansi_color = _color;
+        if (ansi_color.size() == 0) ansi_color = "0;33";
+        std::cout << ANSIcolor(ansi_color.c_str()) << _tag << "\t: " << avg_latency*1e6 << " us x " << times;
         if (opsPerCall > 0 && peakOpsPerSecond > 0) {
             std::cout << ", " << static_cast<int>(100*(opsPerCall/avg_latency)/(peakOpsPerSecond)) << "% ("
                     << opsPerCall/avg_latency/(1e9) << " G" << unit << " /"
                     << peakOpsPerSecond/1e9 << " G" << unit << ")";
         }
 
-        perf_counters.resize(perf_counters0.size());
+        perf_counters.clear();
         for(int i = 0; i<perf_counters0.size(); i++) {
-            perf_counters[i] = (perf_counters1[i] - perf_counters0[i])/times;
-            std::cout << ", " << events[i]->name << "=" << perf_counters[i];
+            auto avg_counter = (perf_counters1[i] - perf_counters0[i])/times;
+            perf_counters[events[i]->name] = avg_counter;
+            std::cout << ", " << events[i]->name << "=" << avg_counter;
 
             if (std::string("HW_CYCLES") == events[i]->name && opsPerCall > 0) {
-                std::cout << " " << opsPerCall / perf_counters[i] << "(Ops/cycle)";
+                // return average HW cycles instead
+                std::cout << " " << opsPerCall / avg_counter << "(Ops/cycle)";
             }
         }
 
