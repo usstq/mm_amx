@@ -57,6 +57,10 @@ Step 2 is a reduce-procedure which is usually the computational heavy part or ho
    - 65.8% tile load can be archieved if only B is loaded in compact
    - when A & B matrix are small enough to hold inside L2 cache, SW prefetching into L1 cache hurts performance.
  - LLC can load (21)x16 = 336 Bytes which is 32.8% tile [^2]
+   
+   according to what we saw in extreamly simplified sample `Linear32x32_AMX`:
+   - only 11%~15% tile loads per 16 cycles from LLC (thus AMX usage is only 11%~15%)
+
  - 8-channel 4800MT/s DDR can load (4.8e9 x 8 x 8/2e9)/56 x 16 = 43.8 Bytes/core @2GHz CPU frequency on chip with 56-cores, which is 4.2% tile
 
 so we should load less tiles in order to perform a single TDP* instruction, which can be done by register blocking.
