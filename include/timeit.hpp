@@ -276,7 +276,7 @@ struct timeit {
 
         std::string ansi_color = _color;
         if (ansi_color.size() == 0) ansi_color = "0;33";
-        std::cout << ANSIcolor(ansi_color.c_str()) << _tag << "\t: " << avg_latency*1e6 << " us x " << times;
+        std::cout << std::fixed << std::setprecision(2) << ANSIcolor(ansi_color.c_str()) << _tag << "\t: " << avg_latency*1e6 << " us x " << times;
         if (opsPerCall > 0 && peakOpsPerSecond > 0) {
             std::cout << ", " << static_cast<int>(100*(opsPerCall/avg_latency)/(peakOpsPerSecond)) << "% ("
                     << opsPerCall/avg_latency/(1e9) << " G" << unit << " /"

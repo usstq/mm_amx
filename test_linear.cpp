@@ -278,7 +278,7 @@ int amx_jit(const int M, const int N, const int K, int times = -1000) {
         acc_color = "1;31";
     }
 
-    timer.tag(__func__, "(M=", M, ",N=", N, ",K=", K, ")", acc)
+    timer.tag(__func__, " (M=", M, ",N=", N, ",K=", K, ")", acc)
         .color(acc_color)(
             times, [&]() { mm_jit(&A[0], A.stride, &BPacked[0], &C1[0], C1.stride); },
             M * N * K * 2 // OPS per call
@@ -310,7 +310,7 @@ int amx_mm(const int M, const int N, int K, int times = -1000) {
         acc = "[FAIL]";
     }
 
-    timer.tag(__func__, " (M=", M, ",N=", N, ",K=", K, ")", acc)
+    timer.tag(__func__, "  (M=", M, ",N=", N, ",K=", K, ")", acc)
         .color(acc_color)(
             times, [&]() { mm32x32(A, Bt, 0, N, pp); },
             M * N * K * 2 // OPS per call
@@ -362,7 +362,6 @@ int main(int argc, const char* argv[]) {
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
     std::cout << ANSIcolor("31") << "omp_get_num_threads() = " << omp_get_num_threads() << std::endl << ANSIcolor();
 
-#if 0
     std::cout << "===============================BF16========================\n";
     amx_mm(32, 32, 128);
     amx_jit<Linear32x32_AMX>(32, 32, 128);
@@ -377,9 +376,10 @@ int main(int argc, const char* argv[]) {
     std::cout << "===============================64x64 (L2)========================\n";
     for (int i = 0; i < 2; i++) {
         amx_mm(64, 64, 4096);
+        amx_dnnl(64, 64, 4096);
         amx_jit<LinearNxN>(64, 64, 4096);
     }
-#endif
+
     std::cout << "===============================128x128 (==L2)========================\n";
     for (int i = 0; i < 2; i++) {
         amx_mm(128, 128, 4096);
