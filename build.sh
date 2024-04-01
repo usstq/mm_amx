@@ -1,5 +1,5 @@
 
-CXX=icx
+CXX=icpx
 if ! which icx > /dev/null; then
     echo "use g++ instead of intel compiler (AMX intrinsic maybe missing)"
     CXX=g++
@@ -32,4 +32,4 @@ echo main.s is generated &&
 echo debug.out is generated &&
 echo ======== test begin========== &&
 echo numactl --localalloc -C 0-5 ./$target &&
-numactl --localalloc -C 0-5 ./$target
+numactl -N1 --localalloc -C 0-5 ./$target

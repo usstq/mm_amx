@@ -1,5 +1,5 @@
 
-#include "/home/tingqian/openvino/src/plugins/intel_cpu/thirdparty/onednn/src/cpu/x64/xbyak/xbyak.h"
+#include "../thirdparty/xbyak/xbyak/xbyak.h"
 
 #include <cstdlib>
 #include <fstream>
@@ -71,7 +71,9 @@ class jit_generator : public Xbyak::CodeGenerator {
     ret();
   }
 
-  virtual void generate() = 0;
+  virtual void generate() {
+    ret();
+  }
 
   const Xbyak::uint8* jit_ker_ = nullptr;
   virtual int create_kernel(const char* name = "jit_kernel") {
