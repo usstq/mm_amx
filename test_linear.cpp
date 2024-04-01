@@ -1,6 +1,8 @@
 #include "jit.hpp"
 #include <vector>
 
+#include "dnnl_kernels.hpp"
+
 #if !defined(XBYAK64_GCC)
 #error NOT SUPPORTED
 #endif
@@ -286,9 +288,7 @@ int amx_jit(const int M, const int N, const int K, int times = -1000) {
 }
 
 int amx_mm(const int M, const int N, int K, int times = -1000) {
-    tensor2D<ov::bfloat16> A(M, K,
-                             true); // ensure stride of A matrix is multiple of
-                                    // cache line, which is vital to performance.
+    tensor2D<ov::bfloat16> A(M, K, true); // ensure stride of A matrix is multiple of cache line, which is vital to performance.
     tensor2D<ov::bfloat16> B(K, N, true);
     auto Bt = B.Tr();
     std::vector<ov::bfloat16> BPacked(K * N, 0);
@@ -319,6 +319,40 @@ int amx_mm(const int M, const int N, int K, int times = -1000) {
     return 0;
 }
 
+int amx_dnnl(const int M, const int N, int K, int times = -1000) {
+    tensor2D<ov::bfloat16> A(M, K, true); // ensure stride of A matrix is multiple of cache line, which is vital to performance.
+    tensor2D<ov::bfloat16> B(K, N, true); // [IC, OC]
+    tensor2D<float> C0(M, N, true); // reference result
+    tensor2D<float> C1(M, N, true); // actual result
+    DNNLInnerProduct mmdnnl(M, N, K, &B[0], true);
+
+    mmdnnl.set_A(&A[0]);
+    mmdnnl.set_C(&C1[0]);
+
+    std::string acc;
+    std::string acc_color;
+    C0 = 0;
+    matmul(A, B, C0);
+
+    mmdnnl.run();
+    if (C0 == C1) {
+        acc = "[PASS]";
+    } else {
+        acc_color = "1;31";
+        acc = "[FAIL]";
+    }
+
+    timer.tag(__func__, "(M=", M, ",N=", N, ",K=", K, ")", acc)
+        .color(acc_color)(
+            times, [&]() { mmdnnl.run(); },
+            M * N * K * 2 // OPS per call
+        );
+
+    return 0;
+}
+
+
+
 int main(int argc, const char* argv[]) {
     srand(0);
     bool initAMX = initXTILE();
@@ -328,6 +362,7 @@ int main(int argc, const char* argv[]) {
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
     std::cout << ANSIcolor("31") << "omp_get_num_threads() = " << omp_get_num_threads() << std::endl << ANSIcolor();
 
+#if 0
     std::cout << "===============================BF16========================\n";
     amx_mm(32, 32, 128);
     amx_jit<Linear32x32_AMX>(32, 32, 128);
@@ -344,19 +379,23 @@ int main(int argc, const char* argv[]) {
         amx_mm(64, 64, 4096);
         amx_jit<LinearNxN>(64, 64, 4096);
     }
+#endif
     std::cout << "===============================128x128 (==L2)========================\n";
     for (int i = 0; i < 2; i++) {
         amx_mm(128, 128, 4096);
+        amx_dnnl(128, 128, 4096);
         amx_jit<LinearNxN>(128, 128, 4096);
     }
     std::cout << "===============================256x256 (>L2)========================\n";
     for (int i = 0; i < 2; i++) {
         amx_mm(256, 256, 4096);
+        amx_dnnl(256, 256, 4096);
         amx_jit<LinearNxN>(256, 256, 4096);
     }
     std::cout << "===============================256x320 (>L2)========================\n";
     for (int i = 0; i < 2; i++) {
         amx_mm(256, 320, 4096);
+        amx_dnnl(256, 320, 4096);
         amx_jit<LinearNxN>(256, 320, 4096);
     }
 #if 0

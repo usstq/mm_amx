@@ -1,5 +1,5 @@
 
-#include "../thirdparty/xbyak/xbyak/xbyak.h"
+#include "xbyak.h"
 
 #include <cstdlib>
 #include <fstream>

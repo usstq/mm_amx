@@ -1,3 +1,6 @@
 [submodule "thirdparty/xbyak"]
 	path = thirdparty/xbyak
 	url = https://github.com/herumi/xbyak.git
+[submodule "thirdparty/oneDNN"]
+	path = thirdparty/oneDNN
+	url = https://github.com/oneapi-src/oneDNN.git
