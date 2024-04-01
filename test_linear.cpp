@@ -181,12 +181,31 @@ public:
 
     void call_general(int x0, int x1, int y0, int y1, ov::bfloat16* A0, int strideA, ov::bfloat16* B0, float* C0, int strideC) {
         // 128x128 : 560
-        for (int y = y0; y < y1; y+=64) {
-            for (int x = x0; x < x1; x += 32) {
-                call_kernel(x, y, A0, strideA, B0, C0, strideC);
+        if (y1-y0 > x1-x0) {
+            bool rightward = true;
+            for (int y = y0; y < y1; y+=32) {
+                if (rightward) {
+                    for (int x = x0; x < x1; x += 32) {
+                        call_kernel(x, y, A0, strideA, B0, C0, strideC);
+                    }
+                } else {
+                    for (int x = x1 - 32; x >= x0; x -= 32) {
+                        call_kernel(x, y, A0, strideA, B0, C0, strideC);
+                    }
+                }
             }
-            for (int x = x1 - 32; x >= x0; x -= 32) {
-                call_kernel(x, y+32, A0, strideA, B0, C0, strideC);
+        } else {
+            bool downward = true;
+            for (int x = x0; x < x1; x += 32, downward=!downward) {
+                if (downward) {
+                    for (int y = y0; y < y1; y+=32) {
+                        call_kernel(x, y, A0, strideA, B0, C0, strideC);
+                    }
+                } else {
+                    for (int y = y1-32; y >= y0; y-=32) {
+                        call_kernel(x, y, A0, strideA, B0, C0, strideC);
+                    }
+                }
             }
         }
     }
@@ -397,6 +416,13 @@ int main(int argc, const char* argv[]) {
         amx_mm(256, 320, 4096);
         amx_dnnl(256, 320, 4096);
         amx_jit<LinearNxN>(256, 320, 4096);
+    }
+
+    std::cout << "===============================256x4096 (>L2)========================\n";
+    for (int i = 0; i < 2; i++) {
+        amx_mm(256, 4096, 4096);
+        amx_dnnl(256, 4096, 4096);
+        amx_jit<LinearNxN>(256, 4096, 4096);
     }
 #if 0
     std::cout << "===============================32x32 (LLC)========================\n";
