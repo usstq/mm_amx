@@ -18,10 +18,14 @@
 
 
 uint64_t rdtsc_calibrate(int seconds = 1) {
+
     uint64_t start_ticks;
+    std::cout << "rdtsc is calibrating ... " << std::flush;
     start_ticks = __rdtsc();
     std::this_thread::sleep_for(std::chrono::seconds(seconds));
-    return (__rdtsc() - start_ticks) / seconds;
+    auto tsc_diff = (__rdtsc() - start_ticks);
+    std::cout << "done." << std::endl;
+    return tsc_diff / seconds;
 }
 
 struct RDTSC {
@@ -154,6 +158,7 @@ struct timeit {
 
     timeit(const std::vector<std::tuple<uint32_t, uint32_t, const char *>> & type_config_names = {}) {
         override_expect_times_milliseconds = 0;
+
         if (std::getenv("TIMES")) {
             override_expect_times_milliseconds = atoi(std::getenv("TIMES"));
         }
@@ -204,6 +209,8 @@ struct timeit {
         return *this;
     }
 
+    EnvVar _clflush{"CLFLUSH"};
+
     int preset_expect_times_milliseconds;
     void set_time_ms(int time_ms) {
         preset_expect_times_milliseconds = time_ms;
@@ -233,6 +240,26 @@ struct timeit {
         return operator()(preset_expect_times_milliseconds, c, opsPerCall, peakOpsPerSecond, preset_unit);
     }
 
+    std::function<void(void)> hook_clear_cache;
+
+    std::vector<uint8_t> _cache_data;
+    std::vector<uint8_t> _cache_data2;
+    void clear_cache() {
+        static int value = 0;
+        if (hook_clear_cache) {
+            hook_clear_cache();
+            return;
+        }
+        if (_cache_data.size() < 256*1024*1024) {
+            _cache_data.resize(256*1024*1024);
+            _cache_data2.resize(256*1024*1024);
+        }
+        memset(&_cache_data[0], value++, _cache_data.size());
+        memcpy(&_cache_data2[0], &_cache_data[0], _cache_data.size());
+        memset(&_cache_data[0], value++, _cache_data.size());
+        memcpy(&_cache_data2[0], &_cache_data[0], _cache_data.size());
+    }
+
     template<typename Callable>
     double operator()(
                       int expect_times_milliseconds,
@@ -244,10 +271,13 @@ struct timeit {
             expect_times_milliseconds = override_expect_times_milliseconds;
         int times;
         // cache warm-up
-        std::cout << "warm-up..." << std::flush;
-        c();
-        c();
-        std::cout << "done\r" << std::flush;
+        if (expect_times_milliseconds != 1) {
+            // one-time trigger must avoid warm-up
+            std::cout << "warm-up..." << std::flush;
+            c();
+            c();
+            std::cout << "done\r" << std::flush;
+        }
         // determine times
         if (expect_times_milliseconds > 0) {
             times = expect_times_milliseconds;
@@ -262,17 +292,43 @@ struct timeit {
         assert(times > 0);
         std::cout << "start..." << std::flush;
         // profiling
-        auto perf_counters0 = get_perf_counters();
-        auto start = std::chrono::high_resolution_clock::now();
-        for(int i = 0; i < times; i++) {
-            c();
+        std::vector<uint64_t> perf_counter(events.size(), 0);
+        double total_latency = 0;
+        if (_clflush.v_int) {
+            std::vector<uint64_t> perf_counter0(perf_counter.size(), 0);
+            int i;
+            auto start0 = __rdtsc();
+            for(i = 0; i < times; i++) {
+                clear_cache();
+                for(int i = 0; i<perf_counter.size(); i++) perf_counter0[i] = events[i]->rdpmc_read();
+                auto start = __rdtsc();
+                c();
+                for(int i = 0; i<perf_counter.size(); i++) perf_counter[i] += events[i]->rdpmc_read() - perf_counter0[i];
+                auto finish = __rdtsc();
+                total_latency += tsc2second(finish-start);
+                if (expect_times_milliseconds < 0 && tsc2second(finish - start0)*1e3 > (-expect_times_milliseconds))
+                    break;
+            }
+            times = i;
+        } else {
+            auto perf_counters0 = get_perf_counters();
+            auto start = __rdtsc();
+            for(int i = 0; i < times; i++) {
+                c();
+            }
+            //auto finish = std::chrono::high_resolution_clock::now();
+            auto finish = __rdtsc();
+            perf_counter = get_perf_counters();
+            for(int i = 0; i<perf_counter.size(); i++) {
+                perf_counter[i] -= perf_counters0[i];
+            }
+            //std::chrono::duration<double> diff = finish-start;
+            //total_latency = diff.count();
+            total_latency = tsc2second(finish-start);
         }
-        auto finish = std::chrono::high_resolution_clock::now();
-        auto perf_counters1 = get_perf_counters();
 
         std::cout << "done\r                                \r" << std::flush;
-        std::chrono::duration<double> total_latency = finish-start;
-        auto avg_latency = total_latency.count()/times;
+        auto avg_latency = total_latency/times;
 
         std::string ansi_color = _color;
         if (ansi_color.size() == 0) ansi_color = "0;33";
@@ -284,8 +340,8 @@ struct timeit {
         }
 
         perf_counters.clear();
-        for(int i = 0; i<perf_counters0.size(); i++) {
-            auto avg_counter = (perf_counters1[i] - perf_counters0[i])/times;
+        for(int i = 0; i<perf_counter.size(); i++) {
+            auto avg_counter = perf_counter[i]/times;
             perf_counters[events[i]->name] = avg_counter;
             std::cout << ", " << events[i]->name << "=" << avg_counter;
 

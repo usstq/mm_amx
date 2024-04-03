@@ -5,6 +5,8 @@
 #include <fstream>
 #include <vector>
 
+#include "misc.hpp"
+
 #ifdef XBYAK64
 constexpr Xbyak::Operand::Code abi_save_gpr_regs[] = {
     Xbyak::Operand::RBP, Xbyak::Operand::RBX, Xbyak::Operand::R12,
@@ -46,7 +48,14 @@ constexpr Xbyak::Operand::Code abi_not_param_reg =
 
 class jit_generator : public Xbyak::CodeGenerator {
  public:
-  jit_generator() : Xbyak::CodeGenerator(Xbyak::DEFAULT_MAX_CODE_SIZE*4, (void*)0) {}
+  
+  static std::string& jit_debug() {
+    static EnvVar v("JIT_DEBUG");
+    return v.v_str;
+  }
+
+  jit_generator() : Xbyak::CodeGenerator(Xbyak::DEFAULT_MAX_CODE_SIZE*4, (void*)0) {
+  }
 
  protected:
   const size_t num_abi_save_gpr_regs =
@@ -76,14 +85,21 @@ class jit_generator : public Xbyak::CodeGenerator {
   }
 
   const Xbyak::uint8* jit_ker_ = nullptr;
-  virtual int create_kernel(const char* name = "jit_kernel") {
+  const char * ker_name = "?";
+  virtual int create_kernel(const char* name = "?") {
     int err_code = Xbyak::GetError();
     if (err_code != Xbyak::ERR_NONE)
       return err_code;
     generate();
-    if (std::getenv("JIT_DEBUG")) {
-      dump(name);
+    ker_name = name;
+#ifdef JIT_DEBUG    
+    if (!jit_debug().empty()) {
+        std::cout << "jit_generator generate() is done: " << name << std::endl;
+        if (jit_debug() == name || jit_debug() == "*") {
+            dump();
+        }
     }
+#endif
     jit_ker_ = getCode();
     return (jit_ker_) ? 0 : -1;
   }
@@ -93,16 +109,20 @@ class jit_generator : public Xbyak::CodeGenerator {
   int operator()(kernel_args_t... args) const {
     using jit_kernel_func_t = int (*)(const kernel_args_t... args);
     auto* fptr = (jit_kernel_func_t)jit_ker_;
-    if (std::getenv("JIT_DEBUG")) {
-      std::cout << "jit kernel @ 0x" << std::hex
+#ifdef JIT_DEBUG
+    if (!jit_debug().empty()) {
+      if (jit_debug() == ker_name || jit_debug() == "*") {
+        std::cout << "jit kernel " << ker_name << " @ 0x" << std::hex
                 << reinterpret_cast<uintptr_t>(jit_ker_)
                 << " is being called.\n";
-      asm("int3");
+        asm("int3");
+      }
     }
+#endif
     return (*fptr)(std::forward<kernel_args_t>(args)...);
   }
 
-  void dump(const char* name) {
+  void dump() {
     std::ofstream outfile;
     outfile.open("temp.bin", std::ios_base::binary);
     outfile.write(reinterpret_cast<const char*>(getCode()), getSize());

@@ -12,8 +12,6 @@
 #include "numa.h"
 #endif
 
-#define rndup(x, n) (((x + n - 1)/n)*n)
-
 // https://stackoverflow.com/questions/570669/checking-if-a-double-or-float-is-nan-in-c/57770634#57770634
 static inline uint32_t load_ieee754_rep(float a) {
     uint32_t r;
