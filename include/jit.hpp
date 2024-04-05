@@ -1,4 +1,6 @@
 
+#pragma once
+
 #include "xbyak.h"
 
 #include <cstdlib>
@@ -46,6 +48,12 @@ constexpr Xbyak::Operand::Code abi_not_param_reg =
 #define abi_not_param1 Xbyak::Reg64(abi_not_param_reg)
 #endif
 
+// https://en.wikipedia.org/wiki/X86_calling_conventions#Microsoft_x64_calling_convention
+//      The registers RAX, RCX, RDX, R8, R9, R10, R11 are considered volatile (caller-saved).[25]
+//      The registers RBX, RBP, RDI, RSI, RSP, R12-R15 are considered nonvolatile (callee-saved).[25]
+// https://en.wikipedia.org/wiki/X86_calling_conventions#System_V_AMD64_ABI
+//      If the callee wishes to use registers RBX, RSP, RBP, and R12–R15, it must restore their original values before returning control to the caller. 
+// 
 class jit_generator : public Xbyak::CodeGenerator {
  public:
   

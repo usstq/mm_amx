@@ -231,8 +231,6 @@ public:
         call_256x256(x0 + 0, y0 + 256, A0, strideA, B0, C0, strideC, ktiles);
     }
 
-    EnvVar PFAB{"PFAB", 8};
-
     void call_general(int x0, int x1, int y0, int y1, ov::bfloat16* A0, int strideA, ov::bfloat16* B0, float* C0, int strideC) {
         // 128x128 : 560
         if (y1 - y0 >= x1 - x0) {
@@ -271,7 +269,7 @@ public:
             call_64x64(0, 0, A0, strideA, B0, C0, strideC, m_Ktiles);
         else if (m_M == 128 && m_N == 128 && false)
             call_128x128(0, 0, A0, strideA, B0, C0, strideC, m_Ktiles);
-        else if (m_M == 256 && m_N == 256)
+        else if (m_M == 256 && m_N == 256 && false)
             call_256x256(0, 0, A0, strideA, B0, C0, strideC, m_Ktiles);
         else if (m_M == 512 && m_N == 512 && false)
             call_512x512(0, 0, A0, strideA, B0, C0, strideC, m_Ktiles);
@@ -369,7 +367,6 @@ int amx_jit(const int M, const int N, const int K, int times = -1000) {
     return 0;
 }
 
-
 int amx_jit_special(const int M, const int N, const int K) {
     tensor2D<ov::bfloat16> A(M, K, true);
     tensor2D<ov::bfloat16> B(K, N, true);
@@ -406,56 +403,99 @@ int amx_jit_special(const int M, const int N, const int K) {
 
     timer.tag(__func__, " (M=", M, ",N=", N, ",K=", K, ")", acc).color(acc_color);
 
-    auto clflush = [](void * pv, int bytes) {
+    auto clflush = [](void* pv, int bytes) {
         auto* p = reinterpret_cast<uint8_t*>(pv);
-        for(int i = 0; i < bytes; i+=64) {
-            _mm_clflush(p + i);
+        for (int i = 0; i < bytes; i += 64) {
+            _mm_clflushopt(p + i);
         }
+        _mm_mfence();
     };
 
-    auto sw_prefetch_L2 = [](void * pv, int bytes) {
+    auto sw_prefetch_L2 = [](void* pv, int bytes) {
         auto* p = reinterpret_cast<uint8_t*>(pv);
-        for(int i = 0; i < bytes; i+=64) {
-            _mm_prefetch(p + i, _MM_HINT_T1);
+        int i;
+        for (i = 0; i + 256 <= bytes; i += 64 * 4) {
+            _mm_prefetch(p + i, _MM_HINT_T2);
+            _mm_prefetch(p + i + 64, _MM_HINT_T2);
+            _mm_prefetch(p + i + 64 * 2, _MM_HINT_T2);
+            _mm_prefetch(p + i + 64 * 3, _MM_HINT_T2);
         }
+        for (; i < bytes; i += 64) {
+            _mm_prefetch(p + i, _MM_HINT_T2);
+        }
+        _mm_mfence();
     };
+
+    {
+        tensor2D<uint8_t> D(512 * 1024 * 1024, 1, true);
+        std::cout << "------- clear-cache " << D.capacity << " bytes then SW prefetch them back -------\n";
+        for (int i = 0; i < 4; i++) {
+            // D is too large to fit any level of cache, thus no need to flush it out of the cache
+            auto latency = timer(1, [&]() { sw_prefetch_L2(&D[0], D.capacity); });
+            std::cout << "    DDR=>L2 bandwidth: " << D.capacity * 1e-9 / latency << " GB/s" << std::endl;
+        }
+    }
 
     timer._clflush = 0;
-    for (int i = 0; i < 15; i++) {
-        if (i == 2) {
-            std::cout << "------- clear-cache -------\n";
-            timer.clear_cache();
-        }
-        if (i == 5) {
-            std::cout << "------- clear-cache & tileload : whole L2 is cleared, including code & stack? -------\n";
-            timer.clear_cache();
-            timer(1, [&](){
-                sw_prefetch_L2(&A[0], A.capacity);
-                sw_prefetch_L2(&mm_jit.m_B0[0], mm_jit.m_B0.capacity);
-                sw_prefetch_L2(&C1[0], C1.capacity);
-            });
-        }
-        if (i == 8) {
-            std::cout << "------- clear-cache & prefetch : only A/B/C is cleared, SW prefetch to L2 can recover them -------\n";
-            //timer.clear_cache();
-            clflush(&A[0], A.capacity);  // 512K data flushed + 30us
-            clflush(&mm_jit.m_B0[0], mm_jit.m_B0.capacity); // 512K data flushed +28us 
-            clflush(&C1[0], C1.capacity); //  101->91 = 10
 
-            timer(1, [&](){
-                sw_prefetch_L2(&A[0], A.capacity);
-                sw_prefetch_L2(&mm_jit.m_B0[0], mm_jit.m_B0.capacity);
-                sw_prefetch_L2(&C1[0], C1.capacity);
-            });
+    auto do_benchmarks = [&]() {
+        for (int i = 0; i < 3; i++) {
+            timer(
+                1,
+                [&]() {
+                    TileConfigScope tcfg(mm_jit.tile_config());
+                    mm_jit(&A[0], A.stride, &C1[0], C1.stride);
+                },
+                M * N * K * 2);
         }
-        timer(
-            1,
-            [&]() {
-                TileConfigScope tcfg(mm_jit.tile_config());
-                mm_jit(&A[0], A.stride, &C1[0], C1.stride);
-            },
-            M * N * K * 2);
-    }
+    };
+
+    ECOUT("------- memcpy w/o any prefetching-------");
+    timer.clear_cache();
+    do_benchmarks();
+
+    ECOUT("------- clflush A/B/C w/o any prefetching-------");
+    clflush(&A[0], A.capacity);
+    clflush(&mm_jit.m_B0[0], mm_jit.m_B0.capacity);
+    clflush(&C1[0], C1.capacity);
+    do_benchmarks();
+
+    ECOUT("------- memcpy + clflush w/o any prefetching-------");
+    timer.clear_cache();
+    clflush(&A[0], A.capacity);
+    clflush(&mm_jit.m_B0[0], mm_jit.m_B0.capacity);
+    clflush(&C1[0], C1.capacity);
+    do_benchmarks();
+
+    ECOUT("------- clear-cache & tileload : whole L2 is cleared, including code & stack? -------");
+    timer.clear_cache();
+    auto swpf_latency = timer(1, [&]() {
+        sw_prefetch_L2(&A[0], A.capacity);
+        sw_prefetch_L2(&mm_jit.m_B0[0], mm_jit.m_B0.capacity);
+        sw_prefetch_L2(&C1[0], C1.capacity);
+    });
+    ECOUT("    prefetch ", A.capacity + mm_jit.m_B0.capacity + C1.capacity, " bytes, DDR=>L2 bandwidth = ", (A.capacity + mm_jit.m_B0.capacity + C1.capacity) * 1e-9 / swpf_latency, " GB/s");
+    do_benchmarks();
+
+    ECOUT("------- clear-cache & prefetch : only A/B/C is cleared, SW prefetch to L2 can recover them -------");
+    clflush(&A[0], A.capacity);                     // 512K data flushed + 30us
+    clflush(&mm_jit.m_B0[0], mm_jit.m_B0.capacity); // 512K data flushed +28us
+    //clflush(&C1[0], C1.capacity);                   //  101->91 = 10
+    swpf_latency = timer(1, [&]() {
+        sw_prefetch_L2(&A[0], A.capacity);                     // 37us to fetch / 26us overhead
+        sw_prefetch_L2(&mm_jit.m_B0[0], mm_jit.m_B0.capacity); // 34us to fetch / 30us overhead
+        //sw_prefetch_L2(&C1[0], C1.capacity);                   // 5us to fetch / 10us overhead
+    });
+    ECOUT("    prefetch ", A.capacity + mm_jit.m_B0.capacity + C1.capacity, " bytes, DDR=>L2 bandwidth = ", (A.capacity + mm_jit.m_B0.capacity + C1.capacity) * 1e-9 / swpf_latency, " GB/s");
+    do_benchmarks();
+
+    ECOUT("------- SW prefetch to L2 when data is already there -------");
+    swpf_latency = timer(1, [&]() {
+        sw_prefetch_L2(&A[0], A.capacity);
+        sw_prefetch_L2(&mm_jit.m_B0[0], mm_jit.m_B0.capacity);
+        sw_prefetch_L2(&C1[0], C1.capacity);
+    });
+    do_benchmarks();
 
     return 0;
 }
@@ -524,6 +564,8 @@ int amx_dnnl(const int M, const int N, int K, int times = -1000) {
     return 0;
 }
 
+#include "test_bw.hpp"
+
 int main(int argc, const char* argv[]) {
     srand(0);
     bool initAMX = initXTILE();
@@ -549,14 +591,24 @@ int main(int argc, const char* argv[]) {
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
     std::cout << ANSIcolor("31") << "omp_get_num_threads() = " << omp_get_num_threads() << std::endl << ANSIcolor();
 
+    test_all_bw(3);
+
     std::cout << "===============================128x128 (==L2)========================\n";
     if (0) {
         amx_mm(128, 128, 2048);
         amx_dnnl(128, 128, 2048);
         amx_jit(128, 128, 2048);
     }
-    std::cout << "===============================128x128 (==L2)========================\n";
+
     amx_jit_special(128, 128, 2048);
+    std::cout << "===============================256x256 (==L2)========================\n";
+    amx_jit_special(256, 256, 1024);
+    amx_jit_special(256, 256, 512);
+    timer._clflush = 1;
+    amx_jit(256, 256, 512);
+    amx_jit(256, 256, 1024);
+    amx_jit(256, 256, 2048);
+    amx_jit(256, 256, 4096);
     return 0;
     std::cout << "===============================BF16========================\n";
     amx_mm(32, 32, 128);

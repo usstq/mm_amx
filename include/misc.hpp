@@ -326,6 +326,26 @@ inline void splitter(const T& n, const Q& team, const Q& tid, T& n_start, T& n_e
     n_end += n_start;
 }
 
+template<typename ... Ts>
+void easy_cout(const char* file, const char* func, int line, Ts... args) {
+    std::string file_path(file);
+    std::string file_name(file);
+    auto last_sep = file_path.find_last_of('/');
+    if (last_sep == std::string::npos)
+        last_sep = file_path.find_last_of('\\');
+    if (last_sep != std::string::npos)
+        file_name = file_path.substr(last_sep + 1);
+
+    std::string file_name_with_line = file_name + ":" + std::to_string(line);
+    auto tag = file_name_with_line + " " + func + "()";
+
+    std::stringstream ss;
+    int dummy[sizeof...(Ts)] = { (ss << args, 0)... };
+    std::cout << tag << " " << ss.str() << std::endl;
+}
+
+#define ECOUT(...) easy_cout(__FILE__, __func__, __LINE__, __VA_ARGS__)
+
 inline int omp_thread_count() {
     int n = 0;
 #pragma omp parallel reduction(+ : n)
