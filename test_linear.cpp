@@ -22,6 +22,7 @@ class Linear32x32_AMX : public jit_generator {
 public:
     TileConfig m_tile_cfg;
     bool m_do_accumulation;
+
     Linear32x32_AMX(bool do_accumulation) : m_do_accumulation(do_accumulation) {
         create_kernel("Linear32x32_AMX");
         m_tile_cfg.reset(1, 0,
@@ -39,13 +40,16 @@ public:
 
     const TileConfig& tile_config() { return m_tile_cfg; }
 
+    int64_t m_ktiles;
+    void* prefetch_ptrA;
     // to save push/pop: do not use `abi_save_gpr_regs`
     Xbyak::Reg64 reg_A_addr = abi_param1;
     Xbyak::Reg64 reg_A_stride = abi_param2;
     Xbyak::Reg64 reg_B_addr = abi_param3;
     Xbyak::Reg64 reg_C_addr = abi_param4;
     Xbyak::Reg64 reg_C_stride = abi_param5;
-    Xbyak::Reg64 reg_ktiles = abi_param6;
+    Xbyak::Reg64 reg_prefetchA = abi_param6;
+    Xbyak::Reg64 reg_ktiles = rax;
     Xbyak::Reg64 reg_B_stride = r10;
     Xbyak::Reg64 reg_A1_addr = r11;
 
@@ -79,51 +83,38 @@ public:
             tilezero(tmmC10);
             tilezero(tmmC11);
         }
+        mov(reg_B_stride, reinterpret_cast<uintptr_t>(&m_ktiles));
+        mov(reg_ktiles, ptr[reg_B_stride + 0]);
+
+        mov(reg_B_stride, reinterpret_cast<uintptr_t>(&prefetch_ptrA));
+        mov(reg_prefetchA, ptr[reg_B_stride + 0]);
+        
         lea(reg_A1_addr, ptr[reg_A_addr + reg_A_stride * 8]);
         lea(reg_A1_addr, ptr[reg_A1_addr + reg_A_stride * 8]);
         mov(reg_B_stride, 64);
 
         auto const_A_steps = 64;
 
-        bool is_matrix_A_blocked = std::getenv("ABLK") != nullptr;
-        if (is_matrix_A_blocked) {
-            // if matrix is blocked in 16x32, ops/cycle 630=>700
-            mov(reg_A_stride, 64);
-            const_A_steps = 1024;
-        }
-
-        bool do_sw_prefetch = std::getenv("SWPF") != nullptr;
-
         align(64, false);
         L(loop_over_ktiles);
         // for (int k = 0; k < Ktiles; k++) {
         tileloadd(tmmA0, ptr[reg_A_addr + reg_A_stride]);
-        if (is_matrix_A_blocked && do_sw_prefetch) {
-            for (int i = 0; i < 1024; i += 64)
-                prefetcht0(ptr[reg_A_addr + 4096 + i]);
-        }
         tileloadd(tmmB0, ptr[reg_B_addr + reg_B_stride]);
-        if (do_sw_prefetch) {
-            for (int i = 0; i < 1024; i += 64)
-                prefetcht0(ptr[reg_B_addr + 4096 + i]);
-        }
         lea(reg_B_addr, ptr[reg_B_addr + 1024]);
+
+        // prefetch next 32xK A-sub matrix
+        prefetcht1(ptr[reg_prefetchA + 0]);
+        prefetcht1(ptr[reg_prefetchA + 64]);
+        prefetcht1(ptr[reg_prefetchA + 64*2]);
+        prefetcht1(ptr[reg_prefetchA + 64*3]);
+        lea(reg_prefetchA, ptr[reg_prefetchA + 64*4]);
 
         tdpbf16ps(tmmC00, tmmA0, tmmB0);
 
         tileloadd(tmmA1, ptr[reg_A1_addr + reg_A_stride]);
-        if (is_matrix_A_blocked && do_sw_prefetch) {
-            for (int i = 0; i < 1024; i += 64)
-                prefetcht0(ptr[reg_A1_addr + 4096 + i]);
-        }
-
         tdpbf16ps(tmmC10, tmmA1, tmmB0);
 
         tileloadd(tmmB1, ptr[reg_B_addr + reg_B_stride]);
-        if (do_sw_prefetch) {
-            for (int i = 0; i < 1024; i += 64)
-                prefetcht0(ptr[reg_B_addr + 4096 + i]);
-        }
 
         tdpbf16ps(tmmC01, tmmA0, tmmB1);
         tdpbf16ps(tmmC11, tmmA1, tmmB1);
@@ -175,9 +166,15 @@ public:
     int m_M;
     int m_N;
     int m_flag;
+
+    uint8_t fake_buff[256];
     LinearNxN(int K, int M, int N, ov::bfloat16* weight, int w_stride) : m_K(K), m_M(M), m_N(N), m_kernel_0(false), m_kernel_1(true) {
         m_flag = std::getenv("LIFLAGS") ? atoi(std::getenv("LIFLAGS")) : 0;
         m_Ktiles = m_K / 32;
+        m_kernel_0.m_ktiles = m_Ktiles;
+        m_kernel_1.m_ktiles = m_Ktiles;
+        m_kernel_0.prefetch_ptrA = fake_buff;
+        m_kernel_1.prefetch_ptrA = fake_buff;
         assert((m_K % 32) == 0);
         set_weight(weight, w_stride);
     }
@@ -231,17 +228,31 @@ public:
         call_256x256(x0 + 0, y0 + 256, A0, strideA, B0, C0, strideC, ktiles);
     }
 
+    //float Cx[32*32];
+
     void call_general(int x0, int x1, int y0, int y1, ov::bfloat16* A0, int strideA, ov::bfloat16* B0, float* C0, int strideC) {
         // 128x128 : 560
         if (y1 - y0 >= x1 - x0) {
             auto* ptrA0 = reinterpret_cast<uint8_t*>(A0);
             auto* ptrC0 = reinterpret_cast<uint8_t*>(C0);
+
+            auto prefetch_blk_bytes = 32 * m_K * sizeof(ov::bfloat16) / ((x1-x0)/32);
             for (int y = y0; y < y1; y += 32, ptrA0 += 32 * strideA, ptrC0 += 32 * strideC) {
                 auto* ptrB0 = reinterpret_cast<uint8_t*>(B0);
-                for (int x = x0; x < x1; x += 32, ptrB0 += m_Ktiles * 2048) {
-                    m_kernel_0(ptrA0, strideA, ptrB0, ptrC0 + x * sizeof(float), strideC, m_Ktiles);
 
-                    // call_kernel(x, y, A0, strideA, B0, C0, strideC, m_Ktiles);
+                // for prefetching next 32xK subA
+                auto* ptrA1 = ptrA0 + (32) * strideA;
+                for (int x = x0; x < x1; x += 32, ptrB0 += m_Ktiles * 2048) {
+
+                    // too many SW prefetch would also block CPU HW pipeline, so it must be mixed into kernel
+                    //for(int i = 0; i < prefetch_blk_bytes; i += 64) _mm_prefetch(ptrA1 + i, _MM_HINT_T2);
+
+                    m_kernel_0.prefetch_ptrA = ptrA1;
+                    m_kernel_0(ptrA0, strideA, ptrB0, ptrC0 + x * sizeof(float), strideC, m_Ktiles);
+                    //m_kernel_0(ptrA0, strideA, ptrB0, Cx, 32*sizeof(float), m_Ktiles);
+
+                    // prefetch next 32xK subA
+                    ptrA1 += prefetch_blk_bytes;
                 }
             }
         } else {
@@ -263,6 +274,9 @@ public:
     // B0: repacked
     void operator()(ov::bfloat16* A0, int strideA, float* C0, int strideC) {
         ov::bfloat16* B0 = &m_B0[0];
+        call_general(0, m_N, 0, m_M, A0, strideA, B0, C0, strideC);
+        return;
+
         if (m_M == 32 && m_N == 32)
             call_kernel(0, 0, A0, strideA, B0, C0, strideC, m_Ktiles);
         else if (m_M == 64 && m_N == 64)
@@ -426,6 +440,31 @@ int amx_jit_special(const int M, const int N, const int K) {
         _mm_mfence();
     };
 
+    auto load_prefetch_L2 = [](void* pv, int bytes) {
+        auto* p = reinterpret_cast<uint8_t*>(pv);
+        int i;
+        auto sum0 = _mm512_setzero_epi32();
+        auto sum1 = _mm512_setzero_epi32();
+        auto sum2 = _mm512_setzero_epi32();
+        auto sum3 = _mm512_setzero_epi32();
+        for (i = 0; i + 256 <= bytes; i += 64 * 4) {
+            auto a0 = _mm512_loadu_epi32(p + i);
+            auto a1 = _mm512_loadu_epi32(p + i + 64);
+            auto a2 = _mm512_loadu_epi32(p + i + 64*2);
+            auto a3 = _mm512_loadu_epi32(p + i + 64*3);
+            sum0 = _mm512_add_epi32(sum0, a0);
+            sum1 = _mm512_add_epi32(sum1, a1);
+            sum2 = _mm512_add_epi32(sum2, a2);
+            sum3 = _mm512_add_epi32(sum3, a3);
+        }
+        sum0 = _mm512_add_epi32(sum0, sum1);
+        sum2 = _mm512_add_epi32(sum2, sum3);
+        sum0 = _mm512_add_epi32(sum0, sum2);
+        if (_mm512_cvtsi512_si32(sum0) > 0) {
+            std::cout << 1;
+        }
+    };
+
     {
         tensor2D<uint8_t> D(512 * 1024 * 1024, 1, true);
         std::cout << "------- clear-cache " << D.capacity << " bytes then SW prefetch them back -------\n";
@@ -454,7 +493,29 @@ int amx_jit_special(const int M, const int N, const int K) {
     timer.clear_cache();
     do_benchmarks();
 
-    ECOUT("------- clflush A/B/C w/o any prefetching-------");
+    ECOUT("------- clflush B w/o any prefetching------- +", mm_jit.m_B0.capacity);
+    //clflush(&A[0], A.capacity);
+    clflush(&mm_jit.m_B0[0], mm_jit.m_B0.capacity);
+    //clflush(&C1[0], C1.capacity);
+    do_benchmarks();
+
+    ECOUT("------- clflush A w/o any prefetching------- +", A.capacity);
+    clflush(&A[0], A.capacity);
+    //clflush(&mm_jit.m_B0[0], mm_jit.m_B0.capacity);
+    //clflush(&C1[0], C1.capacity);
+    do_benchmarks();
+
+    ECOUT("------- clflush C w/o any prefetching------- +", C1.capacity);
+    clflush(&C1[0], C1.capacity);
+    do_benchmarks();
+
+    ECOUT("------- clflush A/B w/o any prefetching------- +", A.capacity);
+    clflush(&A[0], A.capacity);
+    clflush(&mm_jit.m_B0[0], mm_jit.m_B0.capacity);
+    //clflush(&C1[0], C1.capacity);
+    do_benchmarks();
+
+    ECOUT("------- clflush A/B/C w/o any prefetching------- +", C1.capacity);
     clflush(&A[0], A.capacity);
     clflush(&mm_jit.m_B0[0], mm_jit.m_B0.capacity);
     clflush(&C1[0], C1.capacity);
@@ -494,6 +555,26 @@ int amx_jit_special(const int M, const int N, const int K) {
         sw_prefetch_L2(&A[0], A.capacity);
         sw_prefetch_L2(&mm_jit.m_B0[0], mm_jit.m_B0.capacity);
         sw_prefetch_L2(&C1[0], C1.capacity);
+    });
+    do_benchmarks();
+
+    ECOUT("------- only A is flushed, prefetch A before kernel -------");
+    clflush(&A[0], A.capacity);
+    swpf_latency = timer(1, [&]() {
+        sw_prefetch_L2(&A[0], A.capacity);
+    });
+    do_benchmarks();
+
+    ECOUT("------- only A is flushed, prefetch A row by row -------");
+    clflush(&A[0], A.capacity);
+    do_benchmarks();
+
+    ECOUT("------- only A is flushed, prefetch A row by row + 32 rows prelog-------");
+    clflush(&A[0], A.capacity);
+    swpf_latency = timer(1, [&]() {
+        //sw_prefetch_L2(&A[0], A.stride * (32));
+        //sw_prefetch_L2(&mm_jit.m_B0[0], mm_jit.m_B0.capacity);
+        load_prefetch_L2(&A[0], A.stride * (32));
     });
     do_benchmarks();
 
@@ -570,13 +651,14 @@ int main(int argc, const char* argv[]) {
     srand(0);
     bool initAMX = initXTILE();
 
+    /*
     // using big AMX matmul as cache cleaner to avoid AMX being open/close Port5
     Linear32x32_AMX clr_cache_amx(false);
     const int ABsize = 64 * 1024 * 1024;
     std::vector<ov::bfloat16> clr_cache_A(ABsize, 1.0f);
     std::vector<ov::bfloat16> clr_cache_B(ABsize, 2.0f);
     float clr_cache_C[32 * 32];
-    /*
+
     timer.hook_clear_cache = [&]() {
         // std::cout << "clr_cache_amx\n";
         TileConfigScope tcfg(clr_cache_amx.tile_config());
@@ -591,7 +673,7 @@ int main(int argc, const char* argv[]) {
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
     std::cout << ANSIcolor("31") << "omp_get_num_threads() = " << omp_get_num_threads() << std::endl << ANSIcolor();
 
-    test_all_bw(3);
+    //test_all_bw(3);
 
     std::cout << "===============================128x128 (==L2)========================\n";
     if (0) {
@@ -603,13 +685,20 @@ int main(int argc, const char* argv[]) {
     amx_jit_special(128, 128, 2048);
     std::cout << "===============================256x256 (==L2)========================\n";
     amx_jit_special(256, 256, 1024);
-    amx_jit_special(256, 256, 512);
+    //amx_jit_special(256, 256, 512);
+
+    return 0;
+
     timer._clflush = 1;
     amx_jit(256, 256, 512);
     amx_jit(256, 256, 1024);
     amx_jit(256, 256, 2048);
+    amx_jit(512, 512, 1024);
     amx_jit(256, 256, 4096);
+    
     return 0;
+
+
     std::cout << "===============================BF16========================\n";
     amx_mm(32, 32, 128);
     amx_jit(32, 32, 128);

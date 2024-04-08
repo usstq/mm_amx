@@ -7,16 +7,18 @@ setup(name='lltm_cpp',
       cmdclass={'build_ext': cpp_extension.BuildExtension})
 '''
 
-setup(name='mha_opt',
+setup(name='mlp_opt',
       ext_modules=[
         cpp_extension.CppExtension(
-                    'mha_opt', ['mha_opt.cpp'],
+                    'mlp_opt', ['mlp_opt.cpp'],
                     extra_compile_args=[ '-fopenmp',
                                         '-mno-avx256-split-unaligned-load',
                                         '-mno-avx256-split-unaligned-store',
                                         '-march=native',
+                                        "-DOV_CPU_WITH_PROFILER"
                                         #'-g'
                                         ],
+                    include_dirs=["../thirdparty/xbyak/xbyak"],
                     extra_link_args=['-lgomp'])
       ],
       include_dirs=['../include'],

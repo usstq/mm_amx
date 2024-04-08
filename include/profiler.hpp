@@ -1,219 +1,222 @@
+// Copyright (C) 2018-2022 Intel Corporation
+// SPDX-License-Identifier: Apache-2.0
+//
 
-#include <map>
-#include <deque>
-#include <thread>
-#include <memory>
-#include <vector>
-#include <iostream>
-#include <sstream>
-#include <fstream>
+#pragma once
+#ifdef OV_CPU_WITH_PROFILER
 
+#    include <atomic>
+#    include <chrono>
+#    include <cstddef>
+#    include <deque>
+#    include <fstream>
+#    include <functional>
+#    include <iostream>
+#    include <map>
+#    include <memory>
+#    include <mutex>
+#    include <set>
+#    include <sstream>
+#    include <thread>
+#    include <vector>
+extern "C" {
+#    ifdef _WIN32
+#        include <intrin.h>
+#    else
+#        include <x86intrin.h>
+#    endif
+}
+
+namespace ov {
+namespace intel_cpu {
+
+namespace detail {
 struct ProfileData {
     uint64_t start;
     uint64_t end;
-    std::string name;  // Title
-    std::string cat;   // Category
-    std::map<const char *, std::string> args;
+    std::string cat;
+    std::string name;
 
-    ProfileData(const std::string& name) : name(name) {
+    ProfileData(const std::string& cat, const std::string& name) : cat(cat), name(name) {
         start = __rdtsc();
     }
+    static void record_end(ProfileData* p) {
+        p->end = __rdtsc();
+    }
 };
-
 
 struct chromeTrace {
     std::ostream& os;
     int fake_tid;
     uint64_t ts;
     chromeTrace(std::ostream& os, int fake_tid) : os(os), fake_tid(fake_tid) {}
-    void setTs(uint64_t _ts) {
-        ts = _ts;
-    }
-    void addCounter(std::string name, std::vector<std::pair<std::string, double>> values) {
-        // name += std::to_string(fake_tid);
-        os << "{\n"
-           << "\"ph\": \"C\",\n"
-           << "\"name\": \"" << name << "\",\n"
-           << "\"pid\": " << fake_tid << ",\n"
-           << "\"tid\": " << 0 << ",\n"
-           << "\"ts\": " << ts << ",\n"
-           << "\"args\": {\n";
-        const char* sep = "";
-        for (auto& pair : values) {
-            os << sep << "\"" << pair.first << "\" : " << pair.second;
-            sep = ",";
-        }
-        os << " }},\n";
-    }
-    void addCompleteEvent(std::string name,
-                          std::string cat,
-                          uint64_t start,
-                          uint64_t dur,
-                          const std::map<const char*, std::string>& args) {
-        os << "{\n";
-        os << "\"ph\": \"X\",\n"
-           << "\"cat\": \"" << cat << "\",\n"
-           << "\"name\": \"" << name << "\",\n"
-           << "\"pid\": " << fake_tid << ",\n"
-           << "\"tid\": " << 0 << ",\n"
-           << "\"ts\": " << start << ",\n"
-           << "\"dur\": " << dur << ",\n"
-           << "\"args\": {\n";
-        const char* sep = "";
-        for (auto& a : args) {
-            std::string key = a.first;
-            os << sep << "      \"" << a.first << "\" : \"" << a.second << "\"";
-            sep = ",\n";
-        }
-        os << "\n          }\n";
-        os << "},\n";
+    void addCompleteEvent(std::string name, std::string cat, double start, double dur) {
+        // chrome tracing will show & group-by to name, so we use cat as name
+        os << "{\"ph\": \"X\", \"name\": \"" << cat << "\", \"cat\":\"" << name << "\","
+           << "\"pid\": " << fake_tid << ", \"tid\": 0,"
+           << "\"ts\": " << start << ", \"dur\": " << dur << "},\n";
     }
 };
 
+struct TscCounter {
+    uint64_t tsc_ticks_per_second;
+    uint64_t tsc_ticks_base;
+    double tsc_to_usec(uint64_t tsc_ticks) const {
+        return (tsc_ticks - tsc_ticks_base) * 1000000.0 / tsc_ticks_per_second;
+    }
+    double tsc_to_usec(uint64_t tsc_ticks0, uint64_t tsc_ticks1) const {
+        return (tsc_ticks1 - tsc_ticks0) * 1000000.0 / tsc_ticks_per_second;
+    }
+    void init() {
+        static std::once_flag flag;
+        std::call_once(flag, [&]() {
+            uint64_t start_ticks = __rdtsc();
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            tsc_ticks_per_second = (__rdtsc() - start_ticks);
+            std::cout << "[OV_CPU_PROFILE] tsc_ticks_per_second = " << tsc_ticks_per_second << std::endl;
+            tsc_ticks_base = __rdtsc();
+        });
+    }
+};
 
-class ProfilerManager {
-    bool enabled;
-    // cannot use vector<> since each new Profile() API call will
-    // emplace_back() an item and wrap it into a shared_ptr, this
-    // process is nested and during which vector resize may invalid
-    // the ProfileData elements still referenced by an alive shared_ptr
-    // and later when it finally gets un-referenced, a wild pointer would
-    // be updated and memory would be corrupted. deque can fix it.
-    std::deque<ProfileData> all_data;
-    std::thread::id tid;
-    uint64_t  tsc_ticks_per_second;
-    uint64_t  tsc_ticks_base;
-
+class ProfilerBase {
 public:
-    static uint64_t rdtsc_calibrate(int seconds = 1) {
-        uint64_t start_ticks;
-        start_ticks = __rdtsc();
-        std::this_thread::sleep_for(std::chrono::seconds(seconds));
-        return (__rdtsc() - start_ticks) / seconds;
-    }
+    virtual void save(std::ofstream& fw, TscCounter& tsc) = 0;
+};
 
-    ProfilerManager() {
-        const char* str_enable = std::getenv("OV_CPU_PROFILE");
-        if (!str_enable)
-            str_enable = "0";
-        int num_hint = atoi(str_enable);
-        set_enable(num_hint > 0);
-        if (enabled) {
-            if (tsc_ticks_per_second == 0) {
-                uint64_t expected = 0;
-                auto tps = rdtsc_calibrate();
-                tsc_ticks_per_second = tps;
-                std::cout << "=== ProfilerManager: tsc_ticks_per_second = " << tsc_ticks_per_second << std::endl;
-                tsc_ticks_base = __rdtsc();
-            }
-        }
-        tid = std::this_thread::get_id();
-    }
+struct ProfilerFinalizer {
+    std::mutex g_mutex;
+    std::set<ProfilerBase*> all_managers;
+    const char* dump_file_name = "ov_profile.json";
+    bool dump_file_over = false;
+    bool not_finalized = true;
+    std::ofstream fw;
+    std::atomic_int totalProfilerManagers{0};
+    TscCounter tsc;
 
-    ~ProfilerManager(){
-        finalize();
+    ~ProfilerFinalizer() {
+        if (not_finalized)
+            finalize();
     }
 
     void finalize() {
-        // collect all entries
-        std::ostringstream dump_text;
-        int64_t total_traces;
-        if (all_data.size()) {
-            chromeTrace ct(dump_text, 0);
-            for (auto& d : all_data) {
-                ct.addCompleteEvent(d.name, d.cat, tsc_to_usec(d.start), tsc_to_usec(d.end) - tsc_to_usec(d.start), d.args);
-                total_traces++;
-            }
-            std::cout << "==== Profile: total number of profile entries " << all_data.size() << std::endl;
-        }
-
-        if (total_traces == 0)
+        if (!not_finalized)
+            return;
+        std::lock_guard<std::mutex> guard(g_mutex);
+        if (dump_file_over || all_managers.empty())
             return;
 
-        // the last ProfilerManagers is responsible for dump to file
-        const char* dump_file_name = "ov_profile.json";
-        std::ofstream fw(dump_file_name, std::ios::out);
+        // start dump
+        fw.open(dump_file_name, std::ios::out);
+        fw << "{\n";
+        fw << "\"schemaVersion\": 1,\n";
+        fw << "\"traceEvents\": [\n";
+        fw.flush();
 
-        if (fw.is_open()) {
-            fw << "{\n";
-            fw << "\"schemaVersion\": 1,\n";
-            fw << "\"traceEvents\": [\n";
+        for (auto& pthis : all_managers) {
+            pthis->save(fw, tsc);
+        }
+        all_managers.clear();
 
-            fw << dump_text.str();
-
-            if (tsc_ticks_per_second)
-                fw << R"({
-                    "name": "Profiler End",
-                    "ph": "i",
-                    "s": "g",
-                    "pid": "Traces",
-                    "tid": "Trace OV Profiler",
-                    "ts":)"
-                        << tsc_to_usec(__rdtsc()) << "}";
+        fw << R"({
+            "name": "Profiler End",
+            "ph": "i",
+            "s": "g",
+            "pid": "Traces",
+            "tid": "Trace OV Profiler",
+            "ts":)"
+           << tsc.tsc_to_usec(__rdtsc()) << "}",
             fw << "]\n";
-            fw << "}\n";
-            fw.close();
-            std::cout << "==== Profile data is dumpped into " << dump_file_name << "\n";
-        }
+        fw << "}\n";
+        auto total_size = fw.tellp();
+        fw.close();
+        dump_file_over = true;
+        not_finalized = false;
+        std::cout << "[OV_CPU_PROFILE] Dumpped " << total_size / (1024 * 1024) << " (MB) to " << dump_file_name
+                  << std::endl;
     }
 
-    ProfileData* startProfile(const std::string& name) {
-        all_data.emplace_back(name);
-        return &all_data.back();
-    }
-    uint64_t tsc_to_usec(uint64_t tsc_ticks) {
-        return (tsc_ticks - tsc_ticks_base) * 1000000 / tsc_ticks_per_second;
-    }
-
-    void set_enable(bool on) {
-        enabled = on;
-    }
-    bool is_enabled() {
-        return enabled;
-    }
-
-    struct ProfileDataWrapper {
-        ProfileData * p;
-        ProfileDataWrapper(ProfileData * p = nullptr) : p(p) {
-        }
-        ~ProfileDataWrapper() {
-            if (p)
-                p->end = __rdtsc();
-        }
-        ProfileDataWrapper(const ProfileDataWrapper &) = delete;
-        ProfileDataWrapper(ProfileDataWrapper && r) {
-            p = r.p;
-            r.p = nullptr;
-        }
-        ProfileDataWrapper& operator=(ProfileDataWrapper&& r) {
-            p = r.p;
-            r.p = nullptr;
-        }
-    };
-
-    inline ProfileDataWrapper Profile(const char* name) {
-        if (!is_enabled())
-            return ProfileDataWrapper();
-        ProfileData* p = startProfile(name);
-        return ProfileDataWrapper(p);
-    }
-
-    inline ProfileDataWrapper Profile(const std::string& name) {
-        if (!is_enabled())
-            return nullptr;
-        ProfileData* p = startProfile(name);
-        return ProfileDataWrapper(p);
-    }
-
-    template<typename ... Ts>
-    inline ProfileDataWrapper Profile(Ts... args) {
-        if (!is_enabled())
-            return ProfileDataWrapper();
-
+    int register_manager(ProfilerBase* pthis) {
+        std::lock_guard<std::mutex> guard(g_mutex);
         std::stringstream ss;
-        int dummy[sizeof...(Ts)] = { (ss << args << " ", 0)... };
+        tsc.init();
+        auto serial_id = totalProfilerManagers.fetch_add(1);
+        ss << "[OV_CPU_PROFILE] #" << serial_id << "(" << pthis << ") : is registed." << std::endl;
+        std::cout << ss.str();
+        all_managers.emplace(pthis);
+        return serial_id;
+    }
 
-        ProfileData* p = startProfile(ss.str());
-        return ProfileDataWrapper(p);
+    static ProfilerFinalizer& get() {
+        static ProfilerFinalizer inst;
+        return inst;
     }
 };
+
+}  // namespace detail
+
+class Profiler : public detail::ProfilerBase {
+    bool enabled;
+    std::deque<detail::ProfileData> all_data;
+    int serial;
+
+public:
+    Profiler() {
+        const char* str_enable = std::getenv("OV_CPU_PROFILE");
+        if (!str_enable)
+            str_enable = "0";
+        enabled = atoi(str_enable) > 0;
+        if (enabled)
+            serial = detail::ProfilerFinalizer::get().register_manager(this);
+    }
+    ~Profiler() {
+        detail::ProfilerFinalizer::get().finalize();
+    }
+
+    void save(std::ofstream& fw, detail::TscCounter& tsc) override {
+        if (!enabled)
+            return;
+        auto data_size = all_data.size();
+        if (!data_size)
+            return;
+
+        detail::chromeTrace ct(fw, serial);
+        for (auto& d : all_data) {
+            ct.addCompleteEvent(d.name,
+                                d.cat,
+                                tsc.tsc_to_usec(d.start),
+                                tsc.tsc_to_usec(d.start, d.end));
+        }
+        all_data.clear();
+        std::cout << "[OV_CPU_PROFILE] #" << serial << "(" << this << ") finalize: dumpped " << data_size << std::endl;
+    }
+
+    using ProfileDataHandle = std::unique_ptr<detail::ProfileData, void (*)(detail::ProfileData*)>;
+
+    static ProfileDataHandle startProfile(const std::string& cat, const std::string& name = {}) {
+        thread_local Profiler inst;
+        if (!inst.enabled) {
+            return ProfileDataHandle(nullptr, [](detail::ProfileData*) {});
+        }
+        inst.all_data.emplace_back(cat, name);
+        return ProfileDataHandle(&inst.all_data.back(), detail::ProfileData::record_end);
+    }
+
+    friend class ProfilerFinalizer;
+};
+
+}  // namespace intel_cpu
+}  // namespace ov
+
+#    define PROFILE(var_name, ...)                                          \
+        auto var_name = ov::intel_cpu::Profiler::startProfile(__VA_ARGS__); \
+        (void)var_name;
+
+#    define PROFILE2(var_name, ...) var_name = ov::intel_cpu::Profiler::startProfile(__VA_ARGS__);
+
+#else
+
+#    define PROFILE(var_name, ...)
+#    define PROFILE2(var_name, ...)
+
+#endif

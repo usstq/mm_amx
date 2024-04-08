@@ -1,6 +1,11 @@
 
 export CXX=icpx
 
+# to enable higher version of gcc (to compile torch extension)
+# https://stackoverflow.com/questions/61590926/how-to-install-gcc-g-9-on-centos-8-docker-centoslatest
+source /opt/rh/gcc-toolset-13/enable
+source /home/tingqian/tingqian/venv/bin/activate
+
 if ! which icpx > /dev/null; then
 # source oneapi & try again
 source /opt/intel/oneapi/setvars.sh

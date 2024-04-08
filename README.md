@@ -91,6 +91,53 @@ If we only considering L2 cache, we have following cache blocking scheme which d
 
 ![cache_blk.png](./cache_blk.png)
 
+
+Throughput of Memory hierarchy:
+
+```bash
+@BufferSize    15 K : 380.22 GB/s  x 1
+@BufferSize    30 K : 457.55 GB/s  x 1
+@BufferSize     1 M : 181.53 GB/s  x 1
+@BufferSize  1.25 M : 158.51 GB/s  x 1
+@BufferSize   1.5 M : 127.43 GB/s  x 1
+@BufferSize  1.75 M : 91.819 GB/s  x 1
+@BufferSize     2 M : 62.778 GB/s  x 1
+@BufferSize  2.25 M : 50.531 GB/s  x 1
+@BufferSize   2.5 M : 41.677 GB/s  x 1
+@BufferSize  2.75 M : 37.173 GB/s  x 1
+@BufferSize    13 M : 31.123 GB/s  x 1
+@BufferSize    56 M : 31.116 GB/s  x 1
+@BufferSize   128 M : 23.965 GB/s  x 1
+@BufferSize   512 M : 14.299 GB/s  x 1
+@BufferSize     1 G : 13.363 GB/s  x 1
+@BufferSize     2 G :    13 GB/s  x 1
+```
+
+
+```bash
+amx_jit_ (M=_256_,N=_256_,K=_512_)_[PASS]       : 117.97 us x 11, HW_CYCLES=396832 169.11(Ops/cycle)
+amx_jit_ (M=_256_,N=_256_,K=_1024_)_[PASS]      : 189.19 us x 11, HW_CYCLES=599602 223.84(Ops/cycle)
+amx_jit_ (M=_256_,N=_256_,K=_2048_)_[PASS]      : 273.17 us x 11, HW_CYCLES=835525 321.28(Ops/cycle) <======= 
+amx_jit_ (M=_512_,N=_512_,K=_1024_)_[PASS]      : 501.86 us x 11, HW_CYCLES=1549072 346.58(Ops/cycle) <======= 
+amx_jit_ (M=_256_,N=_256_,K=_4096_)_[PASS]      : 685.72 us x 11, HW_CYCLES=2115576 253.77(Ops/cycle)
+```
+
+ - when A/B fits L2 cache, prefer bigger M/N than K, to get higher Ops/byte.
+ - when B matrix cannot fit into L2, Ops/cycle would reduce.
+
+thus we prefer to split along K dimension to fit L2 (to preserve M/N dimension size for higher Ops/byte).
+
+using 32x32 kernel (2x2 tiles):
+
+ - we need to access a new (32xK) A sub-rows for each (32xKxN) Multiply-Adds, so memory access vs MAdds is 1:N.
+ - we need to access whole (N*K) B matrix for (MxKxN) MAdds, so memory access vs MAdds is 1:M.
+
+A can be prefetched row by row. but B must be prefetched in whole (because it's being reused/accessed as a whole).
+
+SW prefetch instructions can also block CPU pipeline if there are too many of them, so we have to evenly distribute them into kernel.
+but how many prefetches is required in each (32x32) AMX kernel is determined by: `32*K*sizeof(bf16)/(K/32)/P = (2048/P)`, here P is the number of (32x32) kernel invocations which maybe a variable rather than a compile time constant.
+
+
 ## Multicore parallelism
 
 

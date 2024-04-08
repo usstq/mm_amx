@@ -65,7 +65,7 @@ struct tensor2D {
         }
         return ret;
     }
-    tensor2D<T> clone() {
+    tensor2D<T> clone() const {
         tensor2D<T> ret;
         ret.resize(dims[0], dims[1], force_compact);
         if (ret.stride == stride) {
