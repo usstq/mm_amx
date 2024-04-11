@@ -391,7 +391,6 @@ public:
     void _set_weight(ov::bfloat16* weight, int w_stride) {
         tensor2D<ov::bfloat16> Bt(m_N, m_K, weight, w_stride);
         m_B0 = repack_weights(Bt);
-        ov::bfloat16* B0 = &m_B0[0];
     }
 
     void set_weight(torch::Tensor weight) {
@@ -439,6 +438,15 @@ public:
 };
 
 
+void clflush(torch::Tensor x) {
+    ASSERT(x.is_contiguous());
+    auto* p = reinterpret_cast<uint8_t*>(x.data_ptr());
+    auto nbytes = x.nbytes();
+    for (size_t i = 0; i < nbytes; i += 64) {
+        _mm_clflushopt(p + i);
+    }
+    _mm_mfence();
+}
 
 //===============================================================
 static bool _init_xtile = initXTILE();
@@ -453,4 +461,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("__deepcopy__", [](const LinearNxN &self, py::dict) {
             return LinearNxN(self);
         });
+    m.def("clflush", &clflush, "Clear cache");
 }

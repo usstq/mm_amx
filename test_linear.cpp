@@ -41,7 +41,7 @@ public:
     const TileConfig& tile_config() { return m_tile_cfg; }
 
     int64_t m_ktiles;
-    void* prefetch_ptrA;
+    void* prefetch_ptr;
     // to save push/pop: do not use `abi_save_gpr_regs`
     Xbyak::Reg64 reg_A_addr = abi_param1;
     Xbyak::Reg64 reg_A_stride = abi_param2;
@@ -86,7 +86,7 @@ public:
         mov(reg_B_stride, reinterpret_cast<uintptr_t>(&m_ktiles));
         mov(reg_ktiles, ptr[reg_B_stride + 0]);
 
-        mov(reg_B_stride, reinterpret_cast<uintptr_t>(&prefetch_ptrA));
+        mov(reg_B_stride, reinterpret_cast<uintptr_t>(&prefetch_ptr));
         mov(reg_prefetchA, ptr[reg_B_stride + 0]);
         
         lea(reg_A1_addr, ptr[reg_A_addr + reg_A_stride * 8]);
@@ -155,6 +155,7 @@ static tensor2D<ov::bfloat16> repack_weights(tensor2D<ov::bfloat16>& Bt) {
     return BPacked;
 }
 
+
 class LinearNxN {
 public:
     Linear32x32_AMX m_kernel_0;
@@ -173,8 +174,8 @@ public:
         m_Ktiles = m_K / 32;
         m_kernel_0.m_ktiles = m_Ktiles;
         m_kernel_1.m_ktiles = m_Ktiles;
-        m_kernel_0.prefetch_ptrA = fake_buff;
-        m_kernel_1.prefetch_ptrA = fake_buff;
+        m_kernel_0.prefetch_ptr = fake_buff;
+        m_kernel_1.prefetch_ptr = fake_buff;
         assert((m_K % 32) == 0);
         set_weight(weight, w_stride);
     }
@@ -247,7 +248,7 @@ public:
                     // too many SW prefetch would also block CPU HW pipeline, so it must be mixed into kernel
                     //for(int i = 0; i < prefetch_blk_bytes; i += 64) _mm_prefetch(ptrA1 + i, _MM_HINT_T2);
 
-                    m_kernel_0.prefetch_ptrA = ptrA1;
+                    m_kernel_0.prefetch_ptr = ptrA1;
                     m_kernel_0(ptrA0, strideA, ptrB0, ptrC0 + x * sizeof(float), strideC, m_Ktiles);
                     //m_kernel_0(ptrA0, strideA, ptrB0, Cx, 32*sizeof(float), m_Ktiles);
 
@@ -312,6 +313,143 @@ public:
     }
 };
 
+
+class LinearReduceK {
+public:
+    Linear32x32_AMX m_kernel_0;
+    Linear32x32_AMX m_kernel_1;
+    tensor2D<ov::bfloat16> m_B;
+    int m_Ktiles;
+    int m_subKtiles = 8;
+    int m_K;
+    int m_M;
+    int m_N;
+    int m_flag;
+
+    uint8_t fake_buff[256];
+    LinearReduceK(int K, int M, int N, ov::bfloat16* weight, int w_stride) : m_K(K), m_M(M), m_N(N), m_kernel_0(false), m_kernel_1(true) {
+        m_flag = std::getenv("LIFLAGS") ? atoi(std::getenv("LIFLAGS")) : 0;
+        m_Ktiles = m_K / 32;
+        m_kernel_0.m_ktiles = m_Ktiles;
+        m_kernel_1.m_ktiles = m_Ktiles;
+        m_kernel_0.prefetch_ptr = fake_buff;
+        m_kernel_1.prefetch_ptr = fake_buff;
+        assert((m_K % 32) == 0);
+        set_weight(weight, w_stride);
+    }
+    const TileConfig& tile_config() { return m_kernel_0.m_tile_cfg; }
+
+    // Bt: [N, K]
+    template <int kernel_idx = 0>
+    void call_kernel(int x, int y, ov::bfloat16* A0, int strideA, ov::bfloat16* B0, float* C0, int strideC, int ktiles) {
+        // clang-format off
+        if (kernel_idx == 0)
+            m_kernel_0(reinterpret_cast<uint8_t*>(A0) + y * strideA, strideA,
+                    reinterpret_cast<uint8_t*>(B0) + ((x / 32) * (ktiles)) * 2048,
+                    reinterpret_cast<uint8_t*>(C0 + x) + y * strideC, strideC,
+                    ktiles);
+        else
+            m_kernel_1(reinterpret_cast<uint8_t*>(A0) + y * strideA, strideA,
+                    reinterpret_cast<uint8_t*>(B0) + ((x / 32) * (ktiles)) * 2048,
+                    reinterpret_cast<uint8_t*>(C0 + x) + y * strideC, strideC,
+                    ktiles);
+        // clang-format on
+    }
+
+    void call_general(int x0, int x1, int y0, int y1, ov::bfloat16* A0, int strideA, ov::bfloat16* B0, float* C0, int strideC) {
+        for (int kt = 0; kt < m_Ktiles; kt += m_subKtiles) {
+            // 256=8x32, reduce on 8Ktile
+            //
+            auto curKtiles = (m_Ktiles - kt);
+            if (curKtiles > m_subKtiles)
+                curKtiles = m_subKtiles;
+            
+            auto curK = curKtiles * 32;
+            auto* ptrA0 = reinterpret_cast<uint8_t*>(A0) + kt*32*sizeof(ov::bfloat16);
+            auto* ptrC0 = reinterpret_cast<uint8_t*>(C0);
+
+            // call 32x32 kernels (assume both M & N are integer multiple of 32)
+            // 
+            // prefetch for next subKtiles:
+            //    M*K element of A
+            //    N*K element of B
+            // current subKtile will call 32x32 kernels (M/32)*(N/32) = M*N/1024 times
+            // thus each 32x32 kernel needs to prefetch:
+            //     1024*K/N element of A
+            //     1024*K/M element of B
+            // evenly prefetch A & B for next subKtiles
+
+            // 32x32 kernel will loop (m_subKtiles) times, so in each iteration
+            // we need to load:
+            //    sub-block A:  [sizeof(bf16)*1024*(m_subKtiles*32)/N]/m_subKtiles = 2048*32/N bytes (64x4 bytes for N=256)
+            //    sub-block B:  [sizeof(bf16)*1024*(m_subKtiles*32)/M]/m_subKtiles = 2048*32/M bytes (64x4 bytes for M=256)
+            //
+            // since 32x32 kernel has only one register-pointer for prefetch, we can prefetch A & B interleaved
+            // 32x32 kernel will prefetch A or B for 64x8=512 bytes on each iteration.
+            //
+            // next sub-block A matrix is not contigours, it inner dimension of (m_subKtiles*32) = 256 (512bytes for bf16)
+            // thus prefetch pointer has to jump over A's stride on each 512bytes.
+            // that's not an issue
+            //
+
+            auto* prefetch_B = reinterpret_cast<uint8_t*>(B0) + (kt + m_subKtiles) * (m_N/32) * 2048;
+            auto prefetch_blkB_bytes = sizeof(ov::bfloat16) * 1024*(m_subKtiles*32) / m_M;
+
+            auto* prefetch_A = reinterpret_cast<uint8_t*>(A0) + (kt + m_subKtiles) * 32 * sizeof(ov::bfloat16);
+            
+            for (int y = y0; y < y1; y += 32, ptrA0 += 32 * strideA, ptrC0 += 32 * strideC) {
+                auto* ptrB0 = reinterpret_cast<uint8_t*>(B0) + kt * (m_N/32) * 2048;
+                // for prefetching next 32xK subA
+                for (int x = x0; x < x1; x += 32, ptrB0 += curKtiles * 2048) {
+
+                    // too many SW prefetch would also block CPU HW pipeline, so it must be mixed into kernel
+                    //for(int i = 0; i < prefetch_blk_bytes; i += 64) _mm_prefetch(ptrA1 + i, _MM_HINT_T2);
+
+                    if (kt == 0) {
+                        m_kernel_0.prefetch_ptr = prefetch_B;
+                        m_kernel_0.m_ktiles = curKtiles;
+                        m_kernel_0(ptrA0, strideA, ptrB0, ptrC0 + x * sizeof(float), strideC, curKtiles);
+                    } else {
+                        m_kernel_1.prefetch_ptr = prefetch_B;
+                        m_kernel_1.m_ktiles = curKtiles;
+                        m_kernel_1(ptrA0, strideA, ptrB0, ptrC0 + x * sizeof(float), strideC, curKtiles);
+                    }
+
+                    // prefetch next 32xK subA
+                    prefetch_B += prefetch_blkB_bytes;
+                }
+            }
+        }
+    }
+
+    // B0: repacked
+    void operator()(ov::bfloat16* A0, int strideA, float* C0, int strideC) {
+        ov::bfloat16* B0 = &m_B[0];
+        call_general(0, m_N, 0, m_M, A0, strideA, B0, C0, strideC);
+        return;
+    }
+
+    void set_weight(ov::bfloat16* weight, int w_stride) {
+        m_B = tensor2D<ov::bfloat16>(m_N * m_K, 1, true);
+
+        int i = 0;
+        for (int kt = 0; kt < m_Ktiles; kt += m_subKtiles) {
+            auto curKtiles = (m_Ktiles - kt);
+            if (curKtiles > m_subKtiles)
+                curKtiles = m_subKtiles;
+            tensor2D<ov::bfloat16> Bt(m_N, curKtiles * 32, weight + kt*32, w_stride);
+            for (int n = 0; n < Bt.dims[0]; n += 32) {
+                for (int k = 0; k < Bt.dims[1]; k += 32) {
+                    amx_kernel::functional::transpose_epi32_16x16(&m_B[i * 16 * 32], &Bt(n, k), Bt.stride);
+                    i++;
+                    amx_kernel::functional::transpose_epi32_16x16(&m_B[i * 16 * 32], &Bt(n + 16, k), Bt.stride);
+                    i++;
+                }
+            }
+        }
+    }
+};
+
 #include "timeit.hpp"
 
 #ifdef _WIN32
@@ -332,6 +470,7 @@ timeit timer({
     //{PERF_TYPE_RAW, 0x02b1, "UOPS_EXECUTED.CORE"},
 });
 
+template<typename LinearKernel = LinearNxN>
 int amx_jit(const int M, const int N, const int K, int times = -1000) {
     tensor2D<ov::bfloat16> A(M, K,
                              true); // ensure stride of A matrix is multiple of
@@ -341,7 +480,7 @@ int amx_jit(const int M, const int N, const int K, int times = -1000) {
 
     tensor2D<float> C0(M, N, true); // reference result
     tensor2D<float> C1(M, N, true); // actual result
-    LinearNxN mm_jit(K, M, N, &Bt[0], Bt.stride);
+    LinearKernel mm_jit(K, M, N, &Bt[0], Bt.stride);
 
     C0 = 0;
     matmul(A, B, C0);
@@ -375,8 +514,133 @@ int amx_jit(const int M, const int N, const int K, int times = -1000) {
                 TileConfigScope tcfg(mm_jit.tile_config());
                 mm_jit(&A[0], A.stride, &C1[0], C1.stride);
             },
-            M * N * K * 2 // OPS per call
+            2.0 * M * N * K // OPS per call
         );
+
+    return 0;
+}
+
+
+void clflush(void* pv, int bytes) {
+    auto* p = reinterpret_cast<uint8_t*>(pv);
+    for (int i = 0; i < bytes; i += 64) {
+        _mm_clflushopt(p + i);
+    }
+    _mm_mfence();
+};
+
+void clflush(tensor2D<ov::bfloat16>& t) {
+    clflush(&t[0], t.capacity);
+};
+
+void sw_prefetch_L2(void* pv, int bytes) {
+    auto* p = reinterpret_cast<uint8_t*>(pv);
+    int i;
+    for (i = 0; i + 256 <= bytes; i += 64 * 4) {
+        _mm_prefetch(p + i, _MM_HINT_T2);
+        _mm_prefetch(p + i + 64, _MM_HINT_T2);
+        _mm_prefetch(p + i + 64 * 2, _MM_HINT_T2);
+        _mm_prefetch(p + i + 64 * 3, _MM_HINT_T2);
+    }
+    for (; i < bytes; i += 64) {
+        _mm_prefetch(p + i, _MM_HINT_T2);
+    }
+    _mm_mfence();
+};
+
+void load_prefetch_L2(void* pv, int bytes) {
+    auto* p = reinterpret_cast<uint8_t*>(pv);
+    int i;
+    auto sum0 = _mm512_setzero_epi32();
+    auto sum1 = _mm512_setzero_epi32();
+    auto sum2 = _mm512_setzero_epi32();
+    auto sum3 = _mm512_setzero_epi32();
+    for (i = 0; i + 256 <= bytes; i += 64 * 4) {
+        auto a0 = _mm512_loadu_epi32(p + i);
+        auto a1 = _mm512_loadu_epi32(p + i + 64);
+        auto a2 = _mm512_loadu_epi32(p + i + 64*2);
+        auto a3 = _mm512_loadu_epi32(p + i + 64*3);
+        sum0 = _mm512_add_epi32(sum0, a0);
+        sum1 = _mm512_add_epi32(sum1, a1);
+        sum2 = _mm512_add_epi32(sum2, a2);
+        sum3 = _mm512_add_epi32(sum3, a3);
+    }
+    sum0 = _mm512_add_epi32(sum0, sum1);
+    sum2 = _mm512_add_epi32(sum2, sum3);
+    sum0 = _mm512_add_epi32(sum0, sum2);
+    if (_mm512_cvtsi512_si32(sum0) > 0) {
+        std::cout << 1;
+    }
+};
+
+int amx_jit_special_reduceK(const int M, const int N, const int K) {
+    tensor2D<ov::bfloat16> A(M, K, true);
+    tensor2D<ov::bfloat16> B(K, N, true);
+    auto Bt = B.Tr();
+
+    tensor2D<float> C0(M, N, true); // reference result
+    tensor2D<float> C1(M, N, true); // actual result
+    LinearNxN       mm_jit(K, M, N, &Bt[0], Bt.stride);
+    LinearReduceK   mm_rk(K, M, N, &Bt[0], Bt.stride);
+    timer._clflush = 0;
+
+    auto do_benchmarks_jit = [&]() {
+        for (int i = 0; i < 3; i++) {
+            timer.tag("NosplitK (M=", M, ",N=", N, ",K=", K, ")")(
+                1,
+                [&]() {
+                    TileConfigScope tcfg(mm_jit.tile_config());
+                    mm_jit(&A[0], A.stride, &C1[0], C1.stride);
+                },
+                2.0 * M * N * K);
+        }
+    };
+    auto do_benchmarks_rk = [&]() {
+        for (int i = 0; i < 3; i++) {
+            timer.tag("ReduceK  (M=", M, ",N=", N, ",K=", K, ")")(
+                1,
+                [&]() {
+                    TileConfigScope tcfg(mm_rk.tile_config());
+                    mm_rk(&A[0], A.stride, &C1[0], C1.stride);
+                },
+                2.0 * M * N * K);
+        }
+    };
+
+    ECOUT("-------------");
+    do_benchmarks_jit();
+    do_benchmarks_rk();
+
+    ECOUT("-------------");
+    do_benchmarks_jit();
+    do_benchmarks_rk();
+
+    ECOUT("----- clflush B matrix for jit --------");
+    clflush(mm_jit.m_B0);
+    do_benchmarks_jit();
+
+    ECOUT("----- clflush B matrix for rk --------");
+    clflush(mm_rk.m_B);
+    do_benchmarks_rk();
+
+    ECOUT("----- clflush A matrix for jit --------");
+    clflush(A);
+    do_benchmarks_jit();
+
+    ECOUT("----- clflush A matrix for rk --------");
+    clflush(A);
+    do_benchmarks_rk();
+
+
+    ECOUT("----- clflush A&B matrix for jit --------");
+    clflush(A);
+    clflush(mm_jit.m_B0);
+    do_benchmarks_jit();
+
+    ECOUT("----- clflush A&B matrix for rk --------");
+    clflush(A);
+    clflush(mm_rk.m_B);
+    do_benchmarks_rk();
 
     return 0;
 }
@@ -417,53 +681,6 @@ int amx_jit_special(const int M, const int N, const int K) {
 
     timer.tag(__func__, " (M=", M, ",N=", N, ",K=", K, ")", acc).color(acc_color);
 
-    auto clflush = [](void* pv, int bytes) {
-        auto* p = reinterpret_cast<uint8_t*>(pv);
-        for (int i = 0; i < bytes; i += 64) {
-            _mm_clflushopt(p + i);
-        }
-        _mm_mfence();
-    };
-
-    auto sw_prefetch_L2 = [](void* pv, int bytes) {
-        auto* p = reinterpret_cast<uint8_t*>(pv);
-        int i;
-        for (i = 0; i + 256 <= bytes; i += 64 * 4) {
-            _mm_prefetch(p + i, _MM_HINT_T2);
-            _mm_prefetch(p + i + 64, _MM_HINT_T2);
-            _mm_prefetch(p + i + 64 * 2, _MM_HINT_T2);
-            _mm_prefetch(p + i + 64 * 3, _MM_HINT_T2);
-        }
-        for (; i < bytes; i += 64) {
-            _mm_prefetch(p + i, _MM_HINT_T2);
-        }
-        _mm_mfence();
-    };
-
-    auto load_prefetch_L2 = [](void* pv, int bytes) {
-        auto* p = reinterpret_cast<uint8_t*>(pv);
-        int i;
-        auto sum0 = _mm512_setzero_epi32();
-        auto sum1 = _mm512_setzero_epi32();
-        auto sum2 = _mm512_setzero_epi32();
-        auto sum3 = _mm512_setzero_epi32();
-        for (i = 0; i + 256 <= bytes; i += 64 * 4) {
-            auto a0 = _mm512_loadu_epi32(p + i);
-            auto a1 = _mm512_loadu_epi32(p + i + 64);
-            auto a2 = _mm512_loadu_epi32(p + i + 64*2);
-            auto a3 = _mm512_loadu_epi32(p + i + 64*3);
-            sum0 = _mm512_add_epi32(sum0, a0);
-            sum1 = _mm512_add_epi32(sum1, a1);
-            sum2 = _mm512_add_epi32(sum2, a2);
-            sum3 = _mm512_add_epi32(sum3, a3);
-        }
-        sum0 = _mm512_add_epi32(sum0, sum1);
-        sum2 = _mm512_add_epi32(sum2, sum3);
-        sum0 = _mm512_add_epi32(sum0, sum2);
-        if (_mm512_cvtsi512_si32(sum0) > 0) {
-            std::cout << 1;
-        }
-    };
 
     {
         tensor2D<uint8_t> D(512 * 1024 * 1024, 1, true);
@@ -581,6 +798,7 @@ int amx_jit_special(const int M, const int N, const int K) {
     return 0;
 }
 
+
 int amx_mm(const int M, const int N, int K, int times = -1000) {
     tensor2D<ov::bfloat16> A(M, K, true); // ensure stride of A matrix is multiple of cache line, which is vital to performance.
     tensor2D<ov::bfloat16> B(K, N, true);
@@ -607,7 +825,7 @@ int amx_mm(const int M, const int N, int K, int times = -1000) {
     timer.tag(__func__, "  (M=", M, ",N=", N, ",K=", K, ")", acc)
         .color(acc_color)(
             times, [&]() { mm32x32(A, Bt, 0, N, pp); },
-            M * N * K * 2 // OPS per call
+            2.0 * M * N * K // OPS per call
         );
 
     return 0;
@@ -639,7 +857,7 @@ int amx_dnnl(const int M, const int N, int K, int times = -1000) {
     timer.tag(__func__, "(M=", M, ",N=", N, ",K=", K, ")", acc)
         .color(acc_color)(
             times, [&]() { mmdnnl.run(); },
-            M * N * K * 2 // OPS per call
+            2.0 * M * N * K // OPS per call
         );
 
     return 0;
@@ -680,6 +898,55 @@ int main(int argc, const char* argv[]) {
         amx_mm(128, 128, 2048);
         amx_dnnl(128, 128, 2048);
         amx_jit(128, 128, 2048);
+    }
+
+    if (0) {
+        std::cout << "===============================256x256x4096 (>>L2)========================\n";
+        for (int i = 0; i < 2; i++) {
+            amx_mm(256, 256, 4096);
+            amx_dnnl(256, 256, 4096);
+            amx_jit(256, 256, 4096);
+            amx_jit<LinearReduceK>(256, 256, 4096);
+        }
+        std::cout << "===============================256x256x11008 (>>L2)========================\n";
+        for (int i = 0; i < 2; i++) {
+            amx_mm(256, 256, 11008);
+            amx_dnnl(256, 256, 11008);
+            amx_jit(256, 256, 11008);
+            amx_jit<LinearReduceK>(256, 256, 11008);
+        }
+        std::cout << "===============================256x256x25600 (>>L2)========================\n";
+        for (int i = 0; i < 2; i++) {
+            amx_mm(256, 256, 25600);
+            amx_dnnl(256, 256, 25600);
+            amx_jit(256, 256, 25600);
+            amx_jit<LinearReduceK>(256, 256, 25600);
+        }
+        return 0;
+    }
+
+    //amx_jit_special_reduceK(256, 256, 4096); return 0;
+    //amx_jit_special_reduceK(256, 256, 2560);
+    amx_jit_special_reduceK(256, 256, 25600); return 0;
+
+    if (0) {
+        for(int i =0; i < 4; i++){
+        //timer._clflush = 0;
+        std::cout << "=============================== no split on K ========================\n";
+        amx_jit(256, 256, 256);
+        amx_jit(256, 256, 512);
+        amx_jit(256, 256, 1024);
+        amx_jit(256, 256, 2048);
+        //amx_jit(512, 512, 128);
+        //amx_jit(512, 512, 256);
+        //amx_jit(512, 512, 512);
+        std::cout << "=============================== split on K ========================\n";
+        amx_jit<LinearReduceK>(256, 256, 256);
+        amx_jit<LinearReduceK>(256, 256, 512);
+        amx_jit<LinearReduceK>(256, 256, 1024);
+        amx_jit<LinearReduceK>(256, 256, 2048);
+        }
+        return 0;
     }
 
     amx_jit_special(128, 128, 2048);

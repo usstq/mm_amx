@@ -1,6 +1,7 @@
 import torch
 from tqdm import tqdm
 import copy
+import time
 
 # need import torch before this ext, otherwise:
 # ImportError: libc10.so: cannot open shared object file: No such file or directory
@@ -34,6 +35,13 @@ def check_acc(M=32, N=32, K=32):
 check_acc(32, 32, 32)
 check_acc(32, 32, 4096)
 check_acc(512, 128, 4096)
+
+class Config(object):
+    opt = False
+    clflush = False
+    hidden_size = 4096
+    intermediate_size = 11008
+    pass
 
 class LlamaMLP(torch.nn.Module):
     def __init__(self, config, layer_id=0):
@@ -69,12 +77,30 @@ class LlamaMLP(torch.nn.Module):
         self.opt_down_proj.name = f"down_proj_{layer_id}"
         self.opt = False
 
+    def flops(self, M):
+        x = 0
+        x += M * self.hidden_size * self.intermediate_size * 2 # gate_proj
+        x += M * self.hidden_size * self.intermediate_size * 2 # up_proj
+        x += M * self.hidden_size * self.intermediate_size * 2 # down_proj
+        return x
+
+    def numel(self, M):
+        x = 0
+        x += M * self.hidden_size + self.gate_proj.weight.numel() + self.up_proj.weight.numel()
+        x += M * self.intermediate_size + self.down_proj.weight.numel()
+        x += M * self.hidden_size
+        return x
+
     def set_id(self, layer_id):
         self.opt_gate_proj.name = f"gate_proj_{layer_id}"
         self.opt_up_proj.name = f"up_proj_{layer_id}"
         self.opt_down_proj.name = f"down_proj_{layer_id}"
 
     def forward(self, x):
+
+        if self.config.clflush:
+            mlp_opt.clflush(x)
+
         if not self.config.opt:
             down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
             return down_proj
@@ -86,18 +112,12 @@ class LlamaMLP(torch.nn.Module):
         y0 = torch.empty((batch_size, self.intermediate_size), dtype=torch.float)
         y1 = torch.empty((batch_size, self.intermediate_size), dtype=torch.float)
         self.opt_gate_proj.forward(xbf16, y0)
-        
         self.opt_up_proj.forward(xbf16, y1)
 
         down_proj = torch.empty((batch_size, self.hidden_size), dtype=torch.float)
         self.opt_down_proj.forward((self.act_fn(y0) * y1).to(torch.bfloat16), down_proj)
         return down_proj
 
-class Config(object):
-    opt = False
-    hidden_size = 4096
-    intermediate_size = 11008
-    pass
 
 def check_acc_llama7b_MLP(M=256):
     llama7b_config = Config()
@@ -153,7 +173,7 @@ class LlamaRMSNorm(torch.nn.Module):
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return hidden_states.to(input_dtype)
 
-def perf_llama7b_MLP(M=256, num_layers=32, rounds=10):
+def perf_llama7b_MLP(M=256, num_layers=32, rounds=10, clflush = False):
     llama7b_config = Config()
     mlp = LlamaMLP(llama7b_config)
 
@@ -167,19 +187,33 @@ def perf_llama7b_MLP(M=256, num_layers=32, rounds=10):
 
     x = torch.randint(-1, 2, (M, llama7b_config.hidden_size), dtype=torch.float32)
 
+    llama7b_config.clflush = clflush
+
     llama7b_config.opt = False
+    t0 = time.time()
     with torch.cpu.amp.autocast():
         with torch.no_grad():
             for i in tqdm(range(rounds)):
                 y0 = seqNet(x)
+    dt = (time.time() - t0)/rounds/num_layers
+    print(f"    per-layer dt: {dt}")
+    print(f"    GFlops: {mlp.flops(M) * 1e-9/ dt}")
+    print(f"    GB/s  : {mlp.numel(M) * 2 * 1e-9/ dt}")
+    
     y0 = y0.to(torch.float)
 
     llama7b_config.opt = True
+    t0 = time.time()
     for i in tqdm(range(rounds)):
         y1 = seqNet(x)
+    dt = (time.time() - t0)/rounds/num_layers
+    print(f"    per-layer dt: {dt}")
+    print(f"    GFlops: {mlp.flops(M) * 1e-9/ dt}")
+    print(f"    GB/s  : {mlp.numel(M) * 2 * 1e-9/ dt}")
+
 
     print(torch.allclose(y1, y0))
     print("y0=", y0)
     print("y1=", y1)
 
-perf_llama7b_MLP(M=32, num_layers=4)
+perf_llama7b_MLP(M=256, num_layers=32, clflush = False)
