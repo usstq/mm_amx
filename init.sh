@@ -43,10 +43,10 @@ function build() {
     echo main.s is generated &&
     echo debug.out is generated &&
     echo ======== test begin========== &&
-    echo numactl --localalloc -C 0-5 ./$target &&
+    echo numactl  -N1 --localalloc -C56 ./$target &&
     CLFLUSH=1 numactl -N1 --localalloc -C56 ./$target
 }
 
 function run1() {
-    CLFLUSH=1 numactl --localalloc -C56 $1
+    CLFLUSH=0 numactl --localalloc -C56 $1
 }
