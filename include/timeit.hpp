@@ -242,22 +242,24 @@ struct timeit {
 
     std::function<void(void)> hook_clear_cache;
 
-    std::vector<uint8_t> _cache_data;
-    std::vector<uint8_t> _cache_data2;
     void clear_cache() {
         static int value = 0;
         if (hook_clear_cache) {
             hook_clear_cache();
             return;
         }
-        if (_cache_data.size() < 256*1024*1024) {
-            _cache_data.resize(256*1024*1024);
-            _cache_data2.resize(256*1024*1024);
+        #pragma omp parallel
+        {
+            std::vector<uint8_t> _cache_data;
+            std::vector<uint8_t> _cache_data2;
+            _cache_data.resize(32*1024*1024);
+            _cache_data2.resize(32*1024*1024);
+
+            memset(&_cache_data[0], value++, _cache_data.size());
+            memcpy(&_cache_data2[0], &_cache_data[0], _cache_data.size());
+            memset(&_cache_data[0], value++, _cache_data.size());
+            memcpy(&_cache_data2[0], &_cache_data[0], _cache_data.size());
         }
-        memset(&_cache_data[0], value++, _cache_data.size());
-        memcpy(&_cache_data2[0], &_cache_data[0], _cache_data.size());
-        memset(&_cache_data[0], value++, _cache_data.size());
-        memcpy(&_cache_data2[0], &_cache_data[0], _cache_data.size());
     }
 
     template<typename Callable>
@@ -345,9 +347,12 @@ struct timeit {
             perf_counters[events[i]->name] = avg_counter;
             std::cout << ", " << events[i]->name << "=" << avg_counter;
 
-            if (std::string("HW_CYCLES") == events[i]->name && opsPerCall > 0) {
-                // return average HW cycles instead
-                std::cout << " " << opsPerCall / avg_counter << "(Ops/cycle)";
+            if (std::string("HW_CYCLES") == events[i]->name) {
+                std::cout << " CPU~" << (avg_counter * 1e-9/avg_latency) << "GHz";
+                if (opsPerCall > 0) {
+                    // return average HW cycles instead
+                    std::cout << " " << opsPerCall / avg_counter << "(Ops/cycle)";
+                }
             }
         }
 

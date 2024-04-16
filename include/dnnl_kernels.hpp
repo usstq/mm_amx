@@ -107,4 +107,13 @@ struct DNNLInnerProduct {
         }
         stream.wait();
     }
+
+    void* get_weight(size_t * p_size) {
+        auto& wmem = m_args[DNNL_ARG_WEIGHTS];
+        if (p_size) {
+            dnnl::memory::desc wdesc = wmem.get_desc();
+            *p_size = wdesc.get_size();
+        }
+        return wmem.get_data_handle();
+    }
 };

@@ -129,8 +129,23 @@ thus we prefer to split along K dimension to fit L2 (to preserve M/N dimension s
 
 using 32x32 kernel (2x2 tiles):
 
- - we need to access a new (32xK) A sub-rows for each (32xKxN) Multiply-Adds, so memory access vs MAdds is 1:N.
- - we need to access whole (N*K) B matrix for (MxKxN) MAdds, so memory access vs MAdds is 1:M.
+ - we need to access a new (MxK) A matrix for (2*MxKxN) Flops, so memory access vs Flops is 1:2N = 1/(2N):1
+ - we need to access whole (N*K) B matrix for (2*MxKxN) Flops, so memory access vs Flops is 1:2M = 1/(2M):1
+ - in total 1 Flops needs [1/(2N) + 1/(2M)] elements, or (1/N + 1/M) bytes in BF16 format.
+ - AMX peak MAdds per cycle is 1024 Flops/cycle, with CPU frequency 1.8 GHz (when all cores are busy), 1843.2 GFlops
+ - due to limitation of L2 bandwidth, 60~70% of peak GFlops can be archieved, which is 1843.2 * 75% ~= 1382.4
+ - as a comparison, AVX512 FP32 peak Gflops is 64 Flops/cycle with CPU frequency 2.6 GHz, 166 GFlops,
+   so in practice we should expect AMX's thoughput to be 1382.4/166 ~ **8X** of AVX512.
+ - per core DDR bandwidth is BW/cores, which generate `BW/cores/(1/N + 1/M)` GFlops computations for each core.
+ - so AMX ALU usage is `BW/cores/(1/N + 1/M)/1843.2`
+
+| M, N              | total BW (GB/s) |  GFlops | AMX Usage |
+| :---------------- | :------: | ----: | ----: |
+| 256, 256          |   260   | 594 | 32% |
+| 512, 512          |   260   | 1188 | 64% |
+| 256, 256          |   520   | 1188 | 64% |
+
+
 
 A can be prefetched row by row. but B must be prefetched in whole (because it's being reused/accessed as a whole).
 

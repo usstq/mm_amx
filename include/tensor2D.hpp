@@ -144,12 +144,14 @@ struct tensor2D {
 
     void fill_rnd() {
         auto * p = data.get();
-        int i = 0;
+
         int total = dims[0]*padded_dim1;
         // +1 -1 for integer types
         // 0.5 -0.5 for float point 
+        
         float scale = std::is_integral<T>::value ? 2:1;
-        for(i = 0; i + 8 <= total; i+=8) {
+        #pragma omp parallel for
+        for(int i = 0; i <= total - 8; i+=8) {
             // lower mantissa can help to avoid small errors in accuracy comparison
             auto num = rand() & 0xFF;
             p[i]   = scale*((num & 1) - 0.5f); num>>=1;
@@ -161,6 +163,8 @@ struct tensor2D {
             p[i+6] = scale*((num & 1) - 0.5f); num>>=1;
             p[i+7] = scale*((num & 1) - 0.5f); num>>=1;
         }
+        int i;
+        for(i = 0; i + 8 <= total; i+=8) {}
         for(; i<total; i++) {
             auto num = rand();
             p[i] = scale*((num & 1) - 0.5f);
@@ -303,6 +307,7 @@ void matmul(tensor2D<ov::bfloat16> & A,
     int K = A.dims[1];
     assert(B.dims[0] == K);
     assert(B.dims[1] == N);
+    #pragma omp parallel for collapse(2)
     for(int m = 0; m < M; m++) {
         for(int n = 0; n < N; n++) {
             float sum = C(m,n);
