@@ -15,7 +15,7 @@
 #include "timeit.hpp"
 
 timeit timer({
-    //{PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES, "HW_CYCLES"},
+    {PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES, "HW_CYCLES"},
     //{PERF_TYPE_RAW, 0x3c, "CPU_CLK_UNHALTED.THREAD"},
     //{PERF_TYPE_RAW, 0x81d0, "MEM_LOAD_RETIRED.ALL_LOADS"},
     //{PERF_TYPE_HW_CACHE, 0x10002, "LLC_load_misses"},
@@ -27,8 +27,9 @@ timeit timer({
     //{PERF_TYPE_RAW, 0x01d1, "L1_HIT"}, {PERF_TYPE_RAW, 0x08d1, "L1_MISS"},
 
     //{PERF_TYPE_RAW, 0x01d1, "L1_HIT"}, {PERF_TYPE_RAW, 0x02d1, "L2_HIT"}, {PERF_TYPE_RAW, 0x40d1, "FB_HIT"},
-    {PERF_TYPE_RAW, 0x01d1, "L1_HIT"},
+    //{PERF_TYPE_RAW, 0x01d1, "L1_HIT"},
     {PERF_TYPE_RAW, 0x02d1, "L2_HIT"},
+    //{PERF_TYPE_RAW, 0x10d1, "L2_MISS"},
     {PERF_TYPE_RAW, 0x04d1, "L3_HIT"},
     {PERF_TYPE_RAW, 0x20d1, "L3_MISS"},
 
@@ -42,78 +43,176 @@ timeit timer({
     //{PERF_TYPE_RAW, 0x02b1, "UOPS_EXECUTED.CORE"},
 });
 
-void clflush(void* pv, int bytes) {
-    auto* p = reinterpret_cast<uint8_t*>(pv);
-    for (int i = 0; i < bytes; i += 64) {
-        _mm_clflushopt(p + i);
-    }
-    _mm_mfence();
-};
-
-template <typename V>
-void clflush(tensor2D<V>& t) {
-    clflush(&t[0], t.capacity);
-};
-
-void sw_prefetch_L2(void* pv, int bytes) {
-    auto* p = reinterpret_cast<uint8_t*>(pv);
-    int i;
-    for (i = 0; i + 256 <= bytes; i += 64 * 4) {
-        _mm_prefetch(p + i, _MM_HINT_T1);
-        _mm_prefetch(p + i + 64, _MM_HINT_T1);
-        _mm_prefetch(p + i + 64 * 2, _MM_HINT_T1);
-        _mm_prefetch(p + i + 64 * 3, _MM_HINT_T1);
-    }
-    for (; i < bytes; i += 64) {
-        _mm_prefetch(p + i, _MM_HINT_T1);
-    }
-    _mm_mfence();
-};
-
-template <typename V>
-void sw_prefetch_L2(tensor2D<V>& t) {
-    sw_prefetch_L2(&t[0], t.capacity);
-};
-
-void load_prefetch_L2(void* pv, int bytes) {
-    auto* p = reinterpret_cast<uint8_t*>(pv);
-    int i;
-    auto sum0 = _mm512_setzero_epi32();
-    auto sum1 = _mm512_setzero_epi32();
-    auto sum2 = _mm512_setzero_epi32();
-    auto sum3 = _mm512_setzero_epi32();
-    for (i = 0; i + 256 <= bytes; i += 64 * 4) {
-        auto a0 = _mm512_loadu_epi32(p + i);
-        auto a1 = _mm512_loadu_epi32(p + i + 64);
-        auto a2 = _mm512_loadu_epi32(p + i + 64 * 2);
-        auto a3 = _mm512_loadu_epi32(p + i + 64 * 3);
-        sum0 = _mm512_add_epi32(sum0, a0);
-        sum1 = _mm512_add_epi32(sum1, a1);
-        sum2 = _mm512_add_epi32(sum2, a2);
-        sum3 = _mm512_add_epi32(sum3, a3);
-    }
-    sum0 = _mm512_add_epi32(sum0, sum1);
-    sum2 = _mm512_add_epi32(sum2, sum3);
-    sum0 = _mm512_add_epi32(sum0, sum2);
-    if (_mm512_cvtsi512_si32(sum0) < 0) {
-        std::cout << 1;
-    }
-};
-template <typename V>
-void load_prefetch_L2(tensor2D<V>& t) {
-    load_prefetch_L2(&t[0], t.capacity);
-};
-
 constexpr double nbytes = 512 * 4096 * sizeof(ov::bfloat16);
 
-int main() {
-    EnvVar USE_SAME("USE_SAME", 0);
+inline void copy_out_32x32(tensor2D<float>& C, int x0, int x1) {
+    auto strideC = C.stride;
+#define M512_STORE _mm512_storeu_ps
 
-    // MSRConfig _msr0(0x1A0, MASK_1A0_PF);
-    // MSRConfig _msr1(0x1A4, MASK_1A4_PF);
+    // #define M512_STORE _mm512_stream_ps
 
-    timer.tag(nbytes, "Bytes", nbytes / 64, "CacheLines");
+    for (int y = 0; y < C.dims[0]; y += 32) {
+        uint8_t* dst0 = reinterpret_cast<uint8_t*>(&C(y, x0));
+        for (int x = x0; x < x1; x += 32, dst0 += 32 * sizeof(float)) {
+            auto ra0 = _mm512_set1_ps(0.1f);
+            auto ra1 = _mm512_set1_ps(0.2f);
+            auto rb0 = _mm512_set1_ps(0.3f);
+            auto rb1 = _mm512_set1_ps(0.4f);
+            auto* dst = dst0;
+            for (int i = 0; i < 16; i += 2) {
+                M512_STORE(dst, ra0);
+                M512_STORE(dst + 64, rb0);
+                dst += strideC;
+                M512_STORE(dst, ra1);
+                M512_STORE(dst + 64, rb1);
+                dst += strideC;
+            }
+            for (int i = 0; i < 16; i += 2) {
+                M512_STORE(dst, ra0);
+                M512_STORE(dst + 64, rb0);
+                dst += strideC;
+                M512_STORE(dst, ra1);
+                M512_STORE(dst + 64, rb1);
+                dst += strideC;
+            }
+        }
+    }
+}
 
+inline void copy_out(tensor2D<float>& C, int x0, int x1) {
+    auto strideC = C.stride;
+    auto ra0 = _mm512_set1_ps(0.1f);
+
+#define M512_STORE _mm512_storeu_ps
+    uint8_t* dst0 = reinterpret_cast<uint8_t*>(&C(0, 0));
+
+    for (int y = 0; y < C.dims[0]; y += 16, dst0 += 16 * strideC) {
+        for (int x = x0; x < x1; x += 16) {
+            auto* dst = dst0 + x * sizeof(float);
+            for (int i = 0; i < 16; i++) {
+                M512_STORE(dst, ra0);
+                dst += strideC;
+            }
+        }
+    }
+}
+
+/*
+inline void copy_out(tensor2D<float>& C, int x0, int x1) {
+    auto strideC = C.stride;
+    auto ra0 = _mm256_set1_ps (0.1f);
+
+#define M512_STORE _mm256_storeu_ps
+    uint8_t* dst0 = reinterpret_cast<uint8_t*>(&C(0, x0));
+    for (int y = 0; y < C.dims[0]; y ++, dst0 += strideC) {
+        auto* dst = dst0;
+        for (int x = x0; x < x1; x += 8, dst += 8*sizeof(float)) {
+            M512_STORE( reinterpret_cast<float*>(dst), ra0);
+        }
+    }
+}
+*/
+
+int test_copy_out(int subN = 8) {
+    auto nthr = get_nthr();
+
+    tensor2D<float> fullC(256, nthr * subN);
+    std::vector<tensor2D<float>> partC(nthr);
+
+#pragma omp parallel
+    {
+        int ithr = omp_get_thread_num();
+        partC[ithr] = tensor2D<float>(256, subN);
+    }
+
+    for (int r = 0; r < 4; r++) {
+        auto latency = timer.tag("part", partC[0].capacity / 1000, "KBytes")(1, [&]() {
+#pragma omp parallel
+            {
+                int ithr = omp_get_thread_num();
+                copy_out(partC[ithr], 0, subN);
+            }
+        });
+        std::cout << "\t   copy_out part BW : " << partC[0].capacity * 1e-9 / latency << " x " << nthr << "=" << fullC.capacity * 1e-9 / latency << " GB/s" << std::endl;
+
+        latency = timer.tag("full", partC[0].capacity / 1000, "KBytes")(1, [&]() {
+#pragma omp parallel
+            {
+                int ithr = omp_get_thread_num();
+                copy_out(fullC, ithr * subN, ithr * subN + subN);
+            }
+        });
+        std::cout << "\t   copy_out full BW : " << partC[0].capacity * 1e-9 / latency << " x " << nthr << "=" << fullC.capacity * 1e-9 / latency << " GB/s" << std::endl;
+    }
+    return 0;
+}
+
+void my_memset(void* dst_mem, int stride, int H, int W, float f = 0.1f) {
+    auto* dst0 = reinterpret_cast<uint8_t*>(dst_mem);
+    auto vf = _mm256_set1_ps(f);
+    for (int h = 0; h < H; h++, dst0 += stride) {
+        // 256bits/32bytes/8floats
+        for (int w = 0; w < W; w += 32) {
+            _mm256_storeu_ps(reinterpret_cast<float*>(dst0 + w), vf);
+        }
+    }
+}
+
+
+int write_to_Cache(int per_thread_size, bool is_full) {
+    auto nthr = get_nthr();
+    const int M = 256;
+    std::vector<std::shared_ptr<uint8_t>> buff(nthr, nullptr);
+    std::vector<uint8_t*> ptrs(nthr, nullptr);
+
+    int stride;
+    if (!is_full) {
+#pragma omp parallel
+        {
+            int ithr = omp_get_thread_num();
+            buff[ithr] = std::shared_ptr<uint8_t>(reinterpret_cast<uint8_t*>(aligned_alloc(64, M * per_thread_size)), [](void* p) { ::free(p); });
+            ptrs[ithr] = buff[ithr].get();
+        }
+        stride = (per_thread_size);
+    } else {
+        // use single big buffer
+        buff[0] = std::shared_ptr<uint8_t>(reinterpret_cast<uint8_t*>(aligned_alloc(64, M * nthr * per_thread_size)), [](void* p) { ::free(p); });
+        for (int ithr = 0; ithr < nthr; ithr++) {
+            ptrs[ithr] = buff[0].get() + ithr * per_thread_size;
+        }
+        stride = (nthr * per_thread_size);
+    }
+
+    timer.tag(is_full ? "full" : "part", M, "x", per_thread_size, "Bytes", nthr, "Threads")(
+        100,
+        [&]() {
+#pragma omp parallel
+            {
+                int ithr = omp_get_thread_num();
+                my_memset(ptrs[ithr], stride, M, per_thread_size);
+#if 0
+                auto v = _mm256_set1_ps(ithr);
+                auto* dst0 = reinterpret_cast<float*>(ptrs[ithr]);
+                for (int i = 0; i < 256; i++, dst0 += stride) {
+                    auto* dst = dst0;
+                    for (int r = 0; r < per_thread_size; r += 32, dst += 8) {
+                        _mm256_storeu_ps(dst, v);
+                    }
+                }
+                for (int r = 0; r < per_thread_size; r += 32) {
+                    auto* dst = reinterpret_cast<float*>(&perThreadArgs[ithr * per_thread_size + r]);
+                    for (int i = 0; i < 256; i++, dst += stride) {
+                        _mm256_storeu_ps(dst, v);
+                    }
+                }
+#endif
+            }
+        },
+        1.0 * per_thread_size * M * nthr);
+    return 1;
+}
+
+int read_from_Cache(size_t nbytes, bool USE_SAME) {
     int nthr;
     uint8_t* thr_data[128];
 
@@ -123,10 +222,10 @@ int main() {
 
         if (0 == ithr) {
             nthr = omp_get_num_threads();
-            thr_data[ithr] = reinterpret_cast<uint8_t*>(aligned_alloc(64, nbytes));
+            thr_data[ithr] = reinterpret_cast<uint8_t*>(aligned_alloc(4096, nbytes));
             memset(thr_data[ithr], 1, nbytes);
         } else if (!USE_SAME) {
-            thr_data[ithr] = reinterpret_cast<uint8_t*>(aligned_alloc(64, nbytes));
+            thr_data[ithr] = reinterpret_cast<uint8_t*>(aligned_alloc(4096, nbytes));
             memset(thr_data[ithr], 1, nbytes);
         }
     }
@@ -136,37 +235,131 @@ int main() {
             thr_data[ithr] = thr_data[0];
         }
     }
+    timer.tag(USE_SAME ? "SAME" : "MULTI", static_cast<uint32_t>(nbytes / 1e3), "KBytes", nbytes / 64, "CacheLines", nthr, "threads");
 
-    std::cout << " >>>>>>>>>>>>>>>  nthr = " << nthr << std::endl;
-
-    for (int xx = 0; xx < 3; xx++) {
-        std::cout << "========== clflush ===========" << std::endl;
+    for (int xx = 0; xx < 2; xx++) {
+        std::cout << "========== clflush " << xx << " ===========" << std::endl;
 #pragma omp parallel
         {
             int ithr = omp_get_thread_num();
             clflush(thr_data[ithr], nbytes);
         }
 
-        for (int t = 0; t < 3; t++) {
-            auto latency = timer(1, [&]() {
+        for (int t = 0; t < 5; t++) {
+            timer(
+                1,
+                [&]() {
 #pragma omp parallel
-                {
-                    int ithr = omp_get_thread_num();
-                    sw_prefetch_L2(thr_data[ithr], nbytes);
-                }
-            });
-            std::cout << "\t   sw_prefetch_L2 BW: " << nbytes * 1e-9 / latency << " GB/s x " << nthr << " = " << nbytes * nthr * 1e-9 / latency << " GB/s" << std::endl;
+                    {
+                        int ithr = omp_get_thread_num();
+                        load_prefetch_L2(thr_data[ithr], nbytes);
+                    }
+                },
+                nbytes);
+        }
+    }
+    return 0;
+}
 
-            auto latency2 = timer(1, [&]() {
+void cross_core_L2_read(size_t nbytes = 256 * 256 * 4) {
+    int nthr = get_nthr();
+    uint8_t* thr_data[128];
+#pragma omp parallel
+    {
+        int ithr = omp_get_thread_num();
+        thr_data[ithr] = reinterpret_cast<uint8_t*>(aligned_alloc(64, nbytes));
+        memset(thr_data[ithr], 1, nbytes);
+    }
+
+    timer.tag(nthr, "threads");
+
+    std::cout << ":::::::::::::::::::::::::::::::\n";
+    for (int r = 0; r < 5; r++) {
+        for (int k = 0; k < 5; k++) {
+            timer(1, [&]() {
 #pragma omp parallel
                 {
                     int ithr = omp_get_thread_num();
                     load_prefetch_L2(thr_data[ithr], nbytes);
                 }
             });
-            std::cout << "\t   load_prefetch_L2 BW: " << nbytes * 1e-9 / latency2 << " GB/s x " << nthr << " = " << nbytes * nthr * 1e-9 / latency2 << " GB/s" << std::endl;
         }
+
+        std::cout << "======= cross-core-cache-read r=" << r << std::endl;
+        timer(1, [&]() {
+#pragma omp parallel
+            {
+                int ithr = omp_get_thread_num() + 1;
+                if (ithr >= nthr)
+                    ithr -= nthr;
+                load_prefetch_L2(thr_data[ithr], nbytes);
+            }
+        });
     }
+}
+
+
+void cross_core_L2_write(size_t nbytes = 256 * 256 * 4) {
+    int nthr = get_nthr();
+    uint8_t* thr_data[128];
+#pragma omp parallel
+    {
+        int ithr = omp_get_thread_num();
+        thr_data[ithr] = reinterpret_cast<uint8_t*>(aligned_alloc(64, nbytes));
+        memset(thr_data[ithr], 1, nbytes);
+    }
+
+    timer.tag(nthr, "threads");
+    std::cout << ":::::::::::::::::::::::::::::::\n";
+    for (int r = 0; r < 5; r++) {
+        for (int k = 0; k < 5; k++) {
+            timer(1, [&]() {
+#pragma omp parallel
+                {
+                    int ithr = omp_get_thread_num();
+                    my_memset(thr_data[ithr], nbytes, 1, nbytes);
+                }
+            });
+        }
+
+        std::cout << "======= cross-core-cache-write r=" << r << std::endl;
+        timer(1, [&]() {
+#pragma omp parallel
+            {
+                int ithr = omp_get_thread_num() + 1;
+                if (ithr >= nthr)
+                    ithr -= nthr;
+                my_memset(thr_data[ithr], nbytes, 1, nbytes);
+            }
+        });
+    }
+}
+
+int main() {
+    // cross_core_L2_write(); cross_core_L2_read();    return 0;
+    for(int r = 0; r < 10; r++) {
+        write_to_Cache(1024, true);
+        write_to_Cache(1024, false);
+        write_to_Cache(2048, true);
+        write_to_Cache(2048, false);
+        write_to_Cache(4096, true);
+        write_to_Cache(4096, false);
+    }
+    return 0;
+
+    read_from_Cache(1024 * 1024 * 1, false);
+    read_from_Cache(1024 * 1024 * 1.5, false);
+    read_from_Cache(1024 * 1024 * 2, false);
+    read_from_Cache(1024 * 1024 * 2, true);
+
+    read_from_Cache(1024 * 1024 * 3.8, false);
+    read_from_Cache(1024 * 1024 * 3.8, true);
+
+
+    // MSRConfig _msr0(0x1A0, MASK_1A0_PF);
+    // MSRConfig _msr1(0x1A4, MASK_1A4_PF);
+
+    return test_copy_out(256);
 
 #if 0
     std::cout << "========== clflush ===========" << std::endl;

@@ -356,10 +356,29 @@ struct timeit {
             }
         }
 
+        if (opsPerCall > 0)
+            std::cout << " " << autoUnit(opsPerCall/ avg_latency, "Ops/s");
+
         std::cout << ANSIcolor() << std::endl;
         return avg_latency;
     }
 
+    std::string autoUnit(double v, const std::string& unit) {
+        auto to_fixed_str = [](double value) {
+            char buf[256];
+            std::sprintf(buf, "%.3f", value);
+            return std::string(buf);
+        };
+        if (v >= 1e12)
+            return to_fixed_str(v/1e12) + "(T" + unit + ")";
+        if (v >= 1e9)
+            return to_fixed_str(v/1e9) + "(G" + unit + ")";
+        if (v >= 1e6)
+            return to_fixed_str(v/1e6) + "(M" + unit + ")";
+        if (v >= 1e3)
+            return to_fixed_str(v/1e3) + "(K" + unit + ")";
+        return to_fixed_str(v) + "(" + unit + ")";
+    }
 };
 
 

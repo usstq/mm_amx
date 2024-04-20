@@ -42,69 +42,6 @@ timeit timer({
 });
 
 
-
-void clflush(void* pv, int bytes) {
-    auto* p = reinterpret_cast<uint8_t*>(pv);
-    for (int i = 0; i < bytes; i += 64) {
-        _mm_clflushopt(p + i);
-    }
-    _mm_mfence();
-};
-
-template<typename V>
-void clflush(tensor2D<V>& t) {
-    clflush(&t[0], t.capacity);
-};
-
-void sw_prefetch_L2(void* pv, int bytes) {
-    auto* p = reinterpret_cast<uint8_t*>(pv);
-    int i;
-    for (i = 0; i + 256 <= bytes; i += 64 * 4) {
-        _mm_prefetch(p + i, _MM_HINT_T2);
-        _mm_prefetch(p + i + 64, _MM_HINT_T2);
-        _mm_prefetch(p + i + 64 * 2, _MM_HINT_T2);
-        _mm_prefetch(p + i + 64 * 3, _MM_HINT_T2);
-    }
-    for (; i < bytes; i += 64) {
-        _mm_prefetch(p + i, _MM_HINT_T2);
-    }
-    _mm_mfence();
-};
-
-template<typename V>
-void sw_prefetch_L2(tensor2D<V>& t) {
-    sw_prefetch_L2(&t[0], t.capacity);
-};
-
-void load_prefetch_L2(void* pv, int bytes) {
-    auto* p = reinterpret_cast<uint8_t*>(pv);
-    int i;
-    auto sum0 = _mm512_setzero_epi32();
-    auto sum1 = _mm512_setzero_epi32();
-    auto sum2 = _mm512_setzero_epi32();
-    auto sum3 = _mm512_setzero_epi32();
-    for (i = 0; i + 256 <= bytes; i += 64 * 4) {
-        auto a0 = _mm512_loadu_epi32(p + i);
-        auto a1 = _mm512_loadu_epi32(p + i + 64);
-        auto a2 = _mm512_loadu_epi32(p + i + 64*2);
-        auto a3 = _mm512_loadu_epi32(p + i + 64*3);
-        sum0 = _mm512_add_epi32(sum0, a0);
-        sum1 = _mm512_add_epi32(sum1, a1);
-        sum2 = _mm512_add_epi32(sum2, a2);
-        sum3 = _mm512_add_epi32(sum3, a3);
-    }
-    sum0 = _mm512_add_epi32(sum0, sum1);
-    sum2 = _mm512_add_epi32(sum2, sum3);
-    sum0 = _mm512_add_epi32(sum0, sum2);
-    if (_mm512_cvtsi512_si32(sum0) > 0) {
-        std::cout << 1;
-    }
-};
-template<typename V>
-void load_prefetch_L2(tensor2D<V>& t) {
-    load_prefetch_L2(&t[0], t.capacity);
-};
-
 float allsum(const float* src, int count) {
     auto sum0 = _mm512_setzero_ps();
     auto sum1 = _mm512_setzero_ps();
@@ -128,11 +65,7 @@ float allsum(const float* src, int count) {
 }
 
 
-
-
 /*
-
-
 although :
  - memory foot-print < L2 size
  - kernel `allsum` load avx512 register in one cache line unit
@@ -147,7 +80,6 @@ after clflush the tensor, next kernel execution causes big L3_MISS but also cons
 some prefetcher 
 
 524288_Bytes_8192_CacheLines    : 46.76 us x 1, L1_HIT=49, L2_HIT=2786, L3_HIT=0, L3_MISS=5423
-
 */
 
 constexpr int N = 1024*1024/8;
@@ -161,7 +93,6 @@ int main() {
 
     float expected_sum = N;
 
-    MSRConfig _msr0(0x1A0, MASK_1A0_PF);
     MSRConfig _msr1(0x1A4, MASK_1A4_PF);
 
     printf("base=%p\n", base);

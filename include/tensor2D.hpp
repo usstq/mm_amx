@@ -256,6 +256,18 @@ struct tensor2D {
         return true;
     }
 
+    void clflush() {
+        ::clflush(data.get(), capacity);
+    };
+
+    void sw_prefetch() {
+        ::sw_prefetch_L2(data.get(), capacity);
+    };
+
+    void load_prefetch() {
+        ::load_prefetch_L2(data.get(), capacity);
+    };
+
     bool compare(const tensor2D<T> & rhs, float tolerance) {
         float max_abs_diff = 0;
         float max_rel_diff = 0;

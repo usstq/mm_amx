@@ -116,7 +116,7 @@ inline int readenv(const char* name) {
 struct EnvVar {
     std::string v_str;
     int v_int;
-    const char * name;
+    const char* name;
     void init(const char* _name, bool with_int_default, int int_default = 0) {
         name = _name;
         auto* p = std::getenv(name);
@@ -158,79 +158,84 @@ sdm-vol-4.pdf
 
     bit 9 (1<<9  0x200)
         Hardware Prefetcher Disable (R/W)
-        When set, disables the hardware prefetcher operation on streams of data. 
+        When set, disables the hardware prefetcher operation on streams of data.
         When clear (default), enables the prefetch queue.
         Disabling of the hardware prefetcher may impact processor performance.
 
     bit 19 (1<<19 0x80000)
-        Adjacent Cache Line Prefetch Disable (R/W) 
-        When set to 1, the processor fetches the cache line that contains data currently required by the processor. 
+        Adjacent Cache Line Prefetch Disable (R/W)
+        When set to 1, the processor fetches the cache line that contains data currently required by the processor.
         When set to 0, the processor fetches cache lines that comprise a cache line pair (128 bytes).
-        Single processor platforms should not set this bit. Server platforms should set 
-        or clear this bit based on platform performance observed in validation and 
-        testing. 
-        BIOS may contain a setup option that controls the setting of this bit.        
+        Single processor platforms should not set this bit. Server platforms should set
+        or clear this bit based on platform performance observed in validation and
+        testing.
+        BIOS may contain a setup option that controls the setting of this bit.
 
     bit 37:
         DCU Prefetcher Disable (R/W)
-        When set to 1, the DCU L1 data cache prefetcher is disabled. The default 
-        value after reset is 0. BIOS may write ‘1’ to disable this feature. 
-        The DCU prefetcher is an L1 data cache prefetcher. When the DCU prefetcher 
-        detects multiple loads from the same line done within a time limit, the DCU 
-        prefetcher assumes the next line will be required. The next line is prefetched 
+        When set to 1, the DCU L1 data cache prefetcher is disabled. The default
+        value after reset is 0. BIOS may write ‘1’ to disable this feature.
+        The DCU prefetcher is an L1 data cache prefetcher. When the DCU prefetcher
+        detects multiple loads from the same line done within a time limit, the DCU
+        prefetcher assumes the next line will be required. The next line is prefetched
         in to the L1 data cache from memory or L2.
 
 0x1A4: MSR_PREFETCH_CONTROL
 
-bit-0 L2 Hardware Prefetcher Disable (R/W) 
-        If 1, disables the L2 hardware prefetcher, which fetches additional lines of 
+bit-0 L2 Hardware Prefetcher Disable (R/W)
+        If 1, disables the L2 hardware prefetcher, which fetches additional lines of
         code or data into the L2 cache.
 
-bit-1 L2 Adjacent Cache Line Prefetcher Disable (R/W) 
-        If 1, disables the adjacent cache line prefetcher, which fetches the cache 
+bit-1 L2 Adjacent Cache Line Prefetcher Disable (R/W)
+        If 1, disables the adjacent cache line prefetcher, which fetches the cache
         line that comprises a cache line pair (128 bytes).
 
-bit-2 DCU Hardware Prefetcher Disable (R/W) 
-        If 1, disables the L1 data cache prefetcher, which fetches the next cache 
+bit-2 DCU Hardware Prefetcher Disable (R/W)
+        If 1, disables the L1 data cache prefetcher, which fetches the next cache
         line into L1 data cache.
 */
-#define MSR_BIT(x) (uint64_t(1)<<x)
+#define MSR_BIT(x) (uint64_t(1) << x)
 
 #define MASK_1A0_PF (MSR_BIT(9) | MSR_BIT(19) | MSR_BIT(37))
 #define MASK_1A4_PF (MSR_BIT(0) | MSR_BIT(1) | MSR_BIT(2))
 
-
 #include <fcntl.h>
-#include <unistd.h>
 #include <sched.h>
+#include <unistd.h>
 
 struct MSRConfig {
     uint64_t v_old;
     uint64_t v_new;
     int offset;
-    EnvVar SETMSR{"SETMSR", -1};
+    EnvVar SETMSR{"SETMSR", 0};
 
     int cpu;
     MSRConfig(int offset, uint64_t mask) : offset(offset) {
-       cpu = sched_getcpu();
-       if (cpu < 0) {
-            perror("sched_getcpu failed");
-            abort();
-       }
-       v_old = rdmsr<uint64_t>(cpu, offset);
-       printf("v_old=%lX\n", v_old);
-       v_new = v_old | mask;
-       printf("v_new=%lX\n", v_new);
-       wrmsr(cpu, offset, v_new);
-       printf("[cpu %d] MSR[%x] setup  %lx -> %lx  ...\n", cpu, offset, v_old, v_new);
+        if (SETMSR) {
+            cpu = sched_getcpu();
+            if (cpu < 0) {
+                perror("sched_getcpu failed");
+                abort();
+            }
+            v_old = rdmsr<uint64_t>(cpu, offset);
+            printf("v_old=%lX\n", v_old);
+            v_new = v_old | mask;
+            printf("v_new=%lX\n", v_new);
+            wrmsr(cpu, offset, v_new);
+            auto v_now = rdmsr<uint64_t>(cpu, offset);
+            printf("[cpu %d] MSR[%x] setup  %lx -> %lx  ...\n", cpu, offset, v_old, v_now);
+        }
     }
 
     ~MSRConfig() {
-        wrmsr(cpu, offset, v_old);
-        printf("[cpu %d] MSR[%x] recover  %lx -> %lx  ...\n", cpu, offset, v_new, v_old);
+        if (SETMSR) {
+            wrmsr(cpu, offset, v_old);
+            auto v_now = rdmsr<uint64_t>(cpu, offset);
+            printf("[cpu %d] MSR[%x] recover to %lx  ...\n", cpu, offset, v_now);
+        }
     }
 
-    template<typename T>
+    template <typename T>
     T rdmsr(int cpu, int offset) {
         std::string fname = "/dev/cpu/";
         fname += std::to_string(cpu);
@@ -246,7 +251,7 @@ struct MSRConfig {
         return rv;
     }
 
-    template<typename T>
+    template <typename T>
     T wrmsr(int cpu, int offset, T rv) {
         std::string fname = "/dev/cpu/";
         fname += std::to_string(cpu);
@@ -263,10 +268,13 @@ struct MSRConfig {
     }
 };
 
-
 #define stringify(a) xstr(a)
 #define xstr(a) #a
-#define ASSERT(cond) if (!(cond)) { std::cout << "ASSERT("<< stringify(cond) << ") failed at " << __LINE__ << "\n" << std::endl; abort();}
+#define ASSERT(cond)                                                                                                                                                                                                                                                                   \
+    if (!(cond)) {                                                                                                                                                                                                                                                                     \
+        std::cout << "ASSERT(" << stringify(cond) << ") failed at " << __LINE__ << "\n" << std::endl;                                                                                                                                                                                  \
+        abort();                                                                                                                                                                                                                                                                       \
+    }
 
 void clflush(void* pv, int bytes) {
     auto* p = reinterpret_cast<uint8_t*>(pv);
@@ -291,30 +299,47 @@ void sw_prefetch_L2(void* pv, int bytes) {
     _mm_mfence();
 };
 
-void load_prefetch_L2(void* pv, int bytes) {
+void load_prefetch_L2(void* pv, int bytes, int rounds = 1) {
     auto* p = reinterpret_cast<uint8_t*>(pv);
     int i;
     auto sum0 = _mm512_setzero_epi32();
     auto sum1 = _mm512_setzero_epi32();
     auto sum2 = _mm512_setzero_epi32();
     auto sum3 = _mm512_setzero_epi32();
-    for (i = 0; i + 256 <= bytes; i += 64 * 4) {
-        auto a0 = _mm512_loadu_epi32(p + i);
-        auto a1 = _mm512_loadu_epi32(p + i + 64);
-        auto a2 = _mm512_loadu_epi32(p + i + 64 * 2);
-        auto a3 = _mm512_loadu_epi32(p + i + 64 * 3);
-        sum0 = _mm512_add_epi32(sum0, a0);
-        sum1 = _mm512_add_epi32(sum1, a1);
-        sum2 = _mm512_add_epi32(sum2, a2);
-        sum3 = _mm512_add_epi32(sum3, a3);
+    for (int r = 0; r < rounds; r++) {
+        for (i = 0; i + 256 <= bytes; i += 64 * 4) {
+            auto a0 = _mm512_loadu_epi32(p + i);
+            auto a1 = _mm512_loadu_epi32(p + i + 64);
+            auto a2 = _mm512_loadu_epi32(p + i + 64 * 2);
+            auto a3 = _mm512_loadu_epi32(p + i + 64 * 3);
+            sum0 = _mm512_add_epi32(sum0, a0);
+            sum1 = _mm512_add_epi32(sum1, a1);
+            sum2 = _mm512_add_epi32(sum2, a2);
+            sum3 = _mm512_add_epi32(sum3, a3);
+        }
     }
     sum0 = _mm512_add_epi32(sum0, sum1);
     sum2 = _mm512_add_epi32(sum2, sum3);
     sum0 = _mm512_add_epi32(sum0, sum2);
-    if (_mm512_cvtsi512_si32(sum0) > 0) {
+    if (_mm512_cvtsi512_si32(sum0) == 0x1234) {
         std::cout << 1;
     }
 };
+
+#include <omp.h>
+
+inline int get_nthr() {
+    static int _nthr = []() {
+        int nthr;
+#pragma omp parallel
+        {
+            if (0 == omp_get_thread_num())
+                nthr = omp_get_num_threads();
+        }
+        return nthr;
+    }();
+    return _nthr;
+}
 
 //===============================================================
 #ifndef _GNU_SOURCE
@@ -492,7 +517,7 @@ inline void splitter(const T& n, const Q& team, const Q& tid, T& n_start, T& n_e
     n_end += n_start;
 }
 
-template<typename ... Ts>
+template <typename... Ts>
 void easy_cout(const char* file, const char* func, int line, Ts... args) {
     std::string file_path(file);
     std::string file_name(file);
@@ -506,7 +531,7 @@ void easy_cout(const char* file, const char* func, int line, Ts... args) {
     auto tag = file_name_with_line + " " + func + "()";
 
     std::stringstream ss;
-    int dummy[sizeof...(Ts)] = { (ss << args, 0)... };
+    int dummy[sizeof...(Ts)] = {(ss << args, 0)...};
     std::cout << tag << " " << ss.str() << std::endl;
 }
 
