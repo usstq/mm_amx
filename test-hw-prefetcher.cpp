@@ -70,7 +70,7 @@ class MeasureAccess : public jit_generator {
     mfence();
 
     // dummy access
-    mov(reg_dummy, dword[reg_addr]);
+    vmovups(zmm0, ptr[reg_addr]);
 
     mfence();
 
@@ -94,15 +94,18 @@ void test_read_prefetch() {
     for(int i = 0; i < nbytes; i++) data[i] = 1;
 
     auto data_access = [&]() {
-        volatile uint8_t* vdata = data;
-        int sum = 0;
-        for(int i = 6; i < 16; i++) sum += vdata[i*64];
-        if(sum == 1) {
+        auto sum = _mm512_setzero_ps();
+        for(int i = 6; i < 16; i++) sum += _mm512_loadu_ps(data + i*64);
+        if(_mm512_reduce_add_ps(sum) == 1) {
             abort();
         }
     };
 
     auto wait_tsc = second2tsc(1e-3);
+    auto wait = [&](){
+        auto t0 = __rdtsc();
+        while(__rdtsc() - t0 < wait_tsc);
+    };
 
     // 8192 = 128 x 64 = 128 cacheline
     std::vector<int64_t> access_times(nbytes/64, 0);
@@ -118,13 +121,13 @@ void test_read_prefetch() {
                 _mm_mfence();
             }
 
+            wait();
+
             // access pattern triggers HW prefetch
             data_access();
             _mm_mfence();
 
-            // wait 1ms
-            auto t0 = __rdtsc();
-            while(__rdtsc() - t0 < wait_tsc);
+            wait();
 
             // check which elements have been prefetched
             access_times[cache_line] += measure_access(data + cache_line*64);
