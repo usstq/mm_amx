@@ -8,6 +8,7 @@
 #include <map>
 #include <vector>
 #include <stdio.h>
+#include <atomic>
 
 // _rdpmc
 #ifdef _WIN32
@@ -116,9 +117,9 @@ struct linux_perf_event {
             abort();
             return;
         }
-        std::ios::fmtflags f(std::cout.flags());
-        std::cout << std::hex << "Linux perf event " << name << " (type=" << type << ",config=" << config << ")" << " is opened!" << std::endl;
-        std::cout.flags(f);
+        //std::ios::fmtflags f(std::cout.flags());
+        //std::cout << std::hex << "Linux perf event " << name << " (type=" << type << ",config=" << config << ")" << " is opened!" << std::endl;
+        //std::cout.flags(f);
     }
     ~linux_perf_event() {
         if (fd > 0) {
@@ -148,6 +149,69 @@ struct linux_perf_event {
     }
 };
 
+
+struct perf_log {
+    std::vector<std::shared_ptr<linux_perf_event>> events;
+
+    std::vector<uint64_t> m_counters;
+    std::atomic<int> m_count;
+    const int m_events;
+
+    void reserve(int count) {
+        m_counters.resize(count * (2 + events.size()), 0);
+        m_count = 0;
+    }
+
+    perf_log(const std::vector<std::tuple<uint32_t, uint32_t, const char *>> & type_config_names = {}) : m_events(type_config_names.size()) {
+        int nthr = 0;
+#pragma omp parallel
+        {
+            int ithr = omp_get_thread_num();
+            if(ithr == 0) nthr = omp_get_num_threads();
+            for(int i = 0; i < omp_get_num_threads(); i++) {
+                #pragma omp barrier
+                if (i == ithr) {
+                    for(auto & tc : type_config_names)
+                        events.emplace_back(new linux_perf_event(std::get<0>(tc), std::get<1>(tc), std::get<2>(tc)));
+                }
+            }
+        }
+        reserve(128*nthr);
+    }
+
+    template<typename Callable>
+    void operator()(const Callable & c) {
+        int ithr = omp_get_thread_num();
+        auto ev_offset = ithr*m_events;
+
+        auto* log = &m_counters[m_count.fetch_add(2 + m_events)];
+        for(int i = 0; i<m_events; i++)
+            log[i] = events[i + ev_offset]->rdpmc_read();
+
+        auto start = __rdtsc();
+        c();
+        auto finish = __rdtsc();
+
+        for(int i = 0; i<m_events; i++)
+            log[i] = events[i + ev_offset]->rdpmc_read() - log[i];
+
+        log[m_events] = finish-start;
+        log[m_events + 1] = ithr;
+    }
+
+    ~perf_log() {
+        for(int i = 0; i < m_count; i+= (2+m_events)) {
+            auto tsc = m_counters[i + m_events];
+            auto ithr = m_counters[i + m_events + 1];
+            std::cout << std::fixed << std::setprecision(2) << ANSIcolor("0;33") << " thread[" << std::setw(3) << ithr << "] : " << std::setw(6) << tsc2second(tsc) * 1e6 << "us";
+            for(int k = 0; k < m_events; k++) {
+                std::cout << ", " << events[k]->name << "=" << m_counters[i+k];
+            }
+            std::cout << ANSIcolor() << std::endl;
+        }
+    }
+};
+
 // timeit will record best latency for each problem in a csv log file
 // and it will also show hint about whether it's improved or descreased
 // over changes
@@ -156,6 +220,7 @@ struct timeit {
     std::vector<std::shared_ptr<linux_perf_event>> events;
     int override_expect_times_milliseconds;
 
+    std::vector<uint64_t> pmu_cnt;
     timeit(const std::vector<std::tuple<uint32_t, uint32_t, const char *>> & type_config_names = {}) {
         override_expect_times_milliseconds = 0;
 
@@ -165,8 +230,19 @@ struct timeit {
         for(auto & tc : type_config_names) {
             events.emplace_back(new linux_perf_event(std::get<0>(tc), std::get<1>(tc), std::get<2>(tc)));
         }
-        std::cout << ANSIcolor("0;33") << "   Test name    :   AvgLatency x repeats "
-                  << "  HW usage (measured / theoretical_peak) , PMU0 = value, .... " << ANSIcolor() << std::endl;
+        pmu_cnt.resize(events.size(), 0);
+        //std::cout << ANSIcolor("0;33") << "   Test name    :   AvgLatency x repeats "
+        //          << "  HW usage (measured / theoretical_peak) , PMU0 = value, .... " << ANSIcolor() << std::endl;
+    }
+
+    void set_perf_counters(bool initial) {
+        if (initial) {
+            for(int i = 0; i<events.size(); i++)
+                pmu_cnt[i] = events[i]->rdpmc_read();
+        } else {
+            for(int i = 0; i<events.size(); i++)
+                pmu_cnt[i] = events[i]->rdpmc_read() - pmu_cnt[i];
+        }
     }
 
     std::vector<uint64_t> get_perf_counters() {

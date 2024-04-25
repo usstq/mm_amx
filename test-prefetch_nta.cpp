@@ -64,10 +64,9 @@ class MemAccessPattern : public jit_generator {
                 // SW prefetch also triggers HW prefetch
                 //prefetchw(ptr[reg_addr + i*64]);
                 //prefetcht2(ptr[reg_addr + i*64]); 
-                //prefetchnta(ptr[reg_addr + i*64]);
-                prefetchwt1(ptr[reg_addr + i*64]);
+                prefetchnta(ptr[reg_addr + i*64]);
             } else {
-                //prefetchnta(ptr[reg_addr + i*64]);
+                prefetchnta(ptr[reg_addr + i*64]);
                 vmovups(zmm1, ptr[reg_addr + i*64]);
                 vaddps(zmm0, zmm0, zmm1);
             }
@@ -115,6 +114,7 @@ class MeasureAccess : public jit_generator {
     // dummy access
     vmovups(zmm0, ptr[reg_addr]);
 
+    prefetchwt1
     mfence();
 
     // delta tsc
@@ -127,88 +127,58 @@ class MeasureAccess : public jit_generator {
   }
 };
 
-void test_read_prefetch() {
 
-    EnvVar WRMEM("WRMEM", 0);
-    EnvVar CLSTRIDE("CLSTRIDE", 1);
+void spin_wait(double seconds){
+    auto wait_tsc = second2tsc(seconds);
+    auto t0 = __rdtsc();
+    while(__rdtsc() - t0 < wait_tsc);
+}
 
-    std::vector<int> read_pattern;
-    for(int i = 0; i < 5; i++) {
-        read_pattern.push_back(i*(int)CLSTRIDE);
-    }
-    //std::vector<int> read_pattern = {0, 4, 4*2};    // +3
-    //std::vector<int> read_pattern = {0, 4};       // +2~3
+
+
+// when NTA prefetched data is evicted from L1, it was dropped siliently
+// not into L2 or L3.
+void test_prefetch_nta() {
     MeasureAccess measure_access;
-    MemAccessPattern mem_prefetch_nta(read_pattern, WRMEM, true);
-    MemAccessPattern mem_reads_writes(read_pattern, WRMEM, false);
-    MSRConfig _msr1;
 
-    std::vector<uint8_t> big_buffer(1024*1024*128, 0);
-
-    uint64_t nbytes = 8192;
+    // 1MB
+    uint64_t nbytes = 1024*128;
     auto* data = reinterpret_cast<uint8_t*>(aligned_alloc(4096, nbytes));
     for(int i = 0; i < nbytes; i++) data[i] = 1;
 
-    auto wait_tsc = second2tsc(1e-5);
-    auto wait = [&](){
-        auto t0 = __rdtsc();
-        while(__rdtsc() - t0 < wait_tsc);
-    };
+    // clear cache by memset & load
+    std::vector<uint8_t> big_buffer(1024*1024*128, 0);
+    for(int cache_line = 0; cache_line < nbytes/64; cache_line ++) {
+        
+        memset(&big_buffer[0], cache_line, big_buffer.size());
+        load_prefetch_L2(&big_buffer[0], big_buffer.size());
 
-    // 8192 = 128 x 64 = 128 cacheline
-    std::vector<int64_t> access_times(nbytes/64, 0);
-
-    const int repeats = 10;
-
-    for(int r = 0; r < repeats; r ++) {
-        for(int cache_line = 0; cache_line < access_times.size(); cache_line++) {
-            // flush the probing array
-            // clflush(data, nbytes);
-            {
-                for (int i = 0; i < nbytes; i += 64) {
-                    _mm_clflush(data + i);
-                    _mm_mfence();
-                }
-
-                // mflush prevent HW prefetcher to work for some reason, need memset
-                memset(&big_buffer[0], cache_line, big_buffer.size());
-                load_prefetch_L2(&big_buffer[0], big_buffer.size());
-                _mm_mfence();
-            }
-
-            //wait();
-
-            // prefetch NTA can bypass L2 cache, and also avoid triggering L2 prefetcher
-            // and after prefetch
-            mem_prefetch_nta(data);
-            wait();
-            mem_reads_writes(data);
-
-            wait();
-
-            // check which elements have been prefetched
-            access_times[cache_line] += measure_access(data + cache_line*64);
+        // prefetch nta
+        for(int i = 0; i < nbytes; i+=64) {
+            _mm_prefetch(data + i, _MM_HINT_NTA);
+            //_mm_prefetch(data + i, _MM_HINT_T2);
         }
-    }
-    ::free(data);
 
-    // show access_times
-    for(int cache_line = 0; cache_line < access_times.size(); cache_line++) {
+        spin_wait(0.001);
+
+        // are data still in L2?
+        auto access_time = measure_access(data + cache_line*64);
+
         // https://en.wikipedia.org/wiki/ANSI_escape_code#3-bit_and_4-bit
         const char * fg_color = "90";
-        if (std::find(read_pattern.begin(), read_pattern.end(), cache_line) != read_pattern.end()) {
-            fg_color = "32";
-        }
+        //if (std::find(read_pattern.begin(), read_pattern.end(), cache_line) != read_pattern.end()) {
+        //    fg_color = "32";
+        //}
 
-        auto nbars = static_cast<int>(tsc2second(access_times[cache_line]/repeats)*1e9 * 100/256);
+        auto nbars = static_cast<int>(tsc2second(access_time)*1e9 * 100/256);
         std::string progress_bar;
         // https://github.com/Changaco/unicode-progress-bars/blob/master/generator.html
         for(int i = 0; i < nbars; i++) progress_bar += "▅";// "█";
-        printf(" cache_line[%3d] : %6.2f ns : \033[1;%sm %s \033[0m\n", cache_line, tsc2second(access_times[cache_line]/repeats)*1e9, fg_color, progress_bar.c_str());
+        printf(" cache_line[%3d] : %6.2f ns : \033[1;%sm %s \033[0m\n", cache_line, tsc2second(access_time)*1e9, fg_color, progress_bar.c_str());
     }
 }
 
 int main() {
-    test_read_prefetch();
+    test_prefetch_nta();
     return 0;
 }

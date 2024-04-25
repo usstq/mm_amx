@@ -204,34 +204,50 @@ bit-2 DCU Hardware Prefetcher Disable (R/W)
 #include <unistd.h>
 
 struct MSRConfig {
-    uint64_t v_old;
-    uint64_t v_new;
-    int offset;
-    EnvVar SETMSR{"SETMSR", 0};
+    int offset = -1;
+    uint32_t mask = 0;
+    EnvVar MSRCONFIG{"MSRCONFIG", 0};
 
-    int cpu;
-    MSRConfig(int offset, uint64_t mask) : offset(offset) {
-        if (SETMSR) {
-            cpu = sched_getcpu();
-            if (cpu < 0) {
-                perror("sched_getcpu failed");
-                abort();
+    std::vector<uint64_t> v_old;
+    std::vector<int> cpus;
+
+    MSRConfig() {
+        std::string msr_cfg = MSRCONFIG;
+        if (sscanf(msr_cfg.c_str(), "%x,%x", &offset, &mask) < 2) {
+            offset = -1;
+            return;
+        }
+
+        cpu_set_t cpu_set;        /* Define your cpu_set bit mask. */
+        CPU_ZERO(&cpu_set); 
+        if(sched_getaffinity(0, sizeof(cpu_set), &cpu_set)) {
+            perror("sched_getaffinity");
+            abort();
+        }
+        auto nproc = sysconf(_SC_NPROCESSORS_ONLN);
+        for (int i = 0; i < nproc; i++) {
+            if (CPU_ISSET(i, &cpu_set)) {
+                cpus.push_back(i);
             }
-            v_old = rdmsr<uint64_t>(cpu, offset);
-            printf("v_old=%lX\n", v_old);
-            v_new = v_old | mask;
-            printf("v_new=%lX\n", v_new);
-            wrmsr(cpu, offset, v_new);
-            auto v_now = rdmsr<uint64_t>(cpu, offset);
-            printf("[cpu %d] MSR[%x] setup  %lx -> %lx  ...\n", cpu, offset, v_old, v_now);
+        }
+
+        v_old.resize(cpus.size(), 0);
+        for (int i=0; i < cpus.size(); i++) {
+            v_old[i] = rdmsr<uint64_t>(cpus[i], offset);
+            auto v_new = v_old[i] | mask;
+            wrmsr(cpus[i], offset, v_new);
+            auto v_now = rdmsr<uint64_t>(cpus[i], offset);
+            printf("[cpu %d] MSR[%x] setup  %lx -> %lx  ...\n", cpus[i], offset, v_old[i], v_now);
         }
     }
 
     ~MSRConfig() {
-        if (SETMSR) {
-            wrmsr(cpu, offset, v_old);
-            auto v_now = rdmsr<uint64_t>(cpu, offset);
-            printf("[cpu %d] MSR[%x] recover to %lx  ...\n", cpu, offset, v_now);
+        if (offset >= 0) {
+            for (int i=0; i < cpus.size(); i++) {
+                wrmsr(cpus[i], offset, v_old[i]);
+                auto v_now = rdmsr<uint64_t>(cpus[i], offset);
+                printf("[cpu %d] MSR[%x] recover to %lx  ...\n", cpus[i], offset, v_now);
+            }
         }
     }
 

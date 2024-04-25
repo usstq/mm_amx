@@ -93,7 +93,7 @@ int main() {
 
     float expected_sum = N;
 
-    MSRConfig _msr1(0x1A4, MASK_1A4_PF);
+    MSRConfig _msr1;
 
     printf("base=%p\n", base);
 
