@@ -605,6 +605,7 @@ int amx_dnnl(const int M, const int N, int K, int times = 100) {
 int main(int argc, const char* argv[]) {
     int nthr = get_nthr();
 
+    MSRConfig _msr;
     srand(0);
     bool initAMX = initXTILE();
     timer.set_app(argv[0]);
@@ -613,6 +614,7 @@ int main(int argc, const char* argv[]) {
     std::cout << ANSIcolor("31") << "nthr = " << nthr << std::endl << ANSIcolor();
 
     if (1) {
+        /*
         if (nthr == 1) {
             for (int i = 0; i < 3; i++) {
                 amx_jit2(256, 256, 11008, 100, false); // 4096);
@@ -622,11 +624,13 @@ int main(int argc, const char* argv[]) {
                 amx_jit2(512, 512, 11008, 100, false); // 4096);
             }
         }
+        */
         std::cout << "==================== nthr = " << nthr << "==================================\n";
         for (int i = 0; i < 3; i++) {
             amx_dnnl(256, 256 * nthr, 11008); // 4096);
             amx_jit2(256, 256 * nthr, 11008); // 4096);
         }
+        return 0;
         std::cout << "==================== nthr = " << nthr << "==================================\n";
         for (int i = 0; i < 3; i++) {
             amx_dnnl(320, 320 * nthr, 11008); // 4096);

@@ -144,6 +144,7 @@ double read_all(void* pv, int bytes, int rounds = 1) {
     return tsc2second(__rdtsc() - t0);
 };
 
+
 void cross_core_L2_read2(size_t nbytes = 128 * 1024) {
     uint8_t* common_src;
     int nthr = get_nthr();
@@ -169,6 +170,7 @@ void cross_core_L2_read2(size_t nbytes = 128 * 1024) {
         if (ithr == 0) {
             common_src = reinterpret_cast<uint8_t*>(aligned_alloc(64, nbytes));
             my_memset(common_src, 1, nbytes);
+            //clflush(common_src, nbytes);
         }
 
 
@@ -243,6 +245,50 @@ void cross_core_L2_read3(size_t nbytes = 128 * 1024) {
     }
 }
 
+void cross_core_L2_prefetch(size_t nbytes = 128 * 1024) {
+    uint8_t* common_src;
+    perf_log plog({
+        //{PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES, "HW_CYCLES"},
+        //{PERF_TYPE_RAW, 0x02d1, "L2_HIT"},
+        //{PERF_TYPE_RAW, 0x04d1, "L3_HIT"},
+        {PERF_TYPE_RAW, 0x01d2, "XSNP_MISS"},
+        {PERF_TYPE_RAW, 0x02d2, "XSNP_NO_FWD"},
+        {PERF_TYPE_RAW, 0x04d2, "XSNP_FWD"},
+        {PERF_TYPE_RAW, 0x08d2, "XSNP_NONE"},
+    });
+    int nthr = get_nthr();
+    common_src = reinterpret_cast<uint8_t*>(aligned_alloc(64, nbytes));
+    my_memset(common_src, 1, nbytes);
+
+    clr_cache();
+    printf("======== concurrent multi-threads prefetch from a common 128K buffer written by thread0 ===========\n");
+
+    std::vector<std::stringstream> ss(nthr);
+#pragma omp parallel
+    {
+        int ithr = omp_get_thread_num();
+        // common_src buffer in core0's local L2 cache
+        // in `exclusive` state.
+        // now following read_all latency test may have 2 results:
+        //  1. core0 starts early than other threads
+        //     it can read the buffer very quick from local L2 cache.
+        //     other cores needs to read from cache-to-cache flush so is slow
+        //  2. other cores starts early, core0's data in L2 must transit to `Shared`
+        //     and put flush with cached data on bus, this also would block core0's
+        //     execution because L2's read bandwidth is taken by cache-to-cache
+        //     transfer. so all cores are slow.
+
+        #pragma omp barrier
+        plog([&]() {sw_prefetch_L2<_MM_HINT_T2>(common_src, nbytes);});
+
+        #pragma omp barrier
+        plog([&]() {sw_prefetch_L2<_MM_HINT_T2>(common_src, nbytes);});
+
+        #pragma omp barrier
+        plog([&]() {sw_prefetch_L2<_MM_HINT_T2>(common_src, nbytes);});
+    }
+}
+
 int main() {
     MSRConfig _msr1;
 
@@ -252,5 +298,9 @@ int main() {
     cross_core_L2_read2(1024*128);
     clr_cache();
     cross_core_L2_read3(1024*128);
+    clr_cache();
+    cross_core_L2_read3(1024*1024*2);
+    clr_cache();
+    cross_core_L2_prefetch();
     return 0;
 }

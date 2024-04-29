@@ -168,15 +168,11 @@ int test_copy_out(int subN = 8) {
 void my_memset(void* dst_mem, int stride, int H, int W, float f = 0.1f) {
     auto* dst0 = reinterpret_cast<uint8_t*>(dst_mem);
     auto vf = _mm256_set1_ps(f);
-    for (int w = 0; w < W; w += 32) {
-        _mm_prefetch(dst0 + w, _MM_HINT_NTA);
-    }
+    for (int w = 0; w < W; w += 32) _mm_prefetch(dst0 + w, _MM_HINT_NTA);
 
     for (int h = 0; h < H; h++, dst0 += stride) {
         // 256bits/32bytes/8floats
-        for (int w = 0; w < W; w += 32) {
-            _mm_prefetch(dst0 + stride + w, _MM_HINT_NTA);
-        }
+        for (int w = 0; w < W; w += 32) _mm_prefetch(dst0 + stride + w, _MM_HINT_NTA);
 
         for (int w = 0; w < W; w += 32) {
             _mm256_storeu_ps(reinterpret_cast<float*>(dst0 + w), vf);

@@ -300,17 +300,18 @@ void clflush(void* pv, int bytes) {
     _mm_mfence();
 };
 
+template<int hint = _MM_HINT_T2>
 void sw_prefetch_L2(void* pv, int bytes) {
     auto* p = reinterpret_cast<uint8_t*>(pv);
     int i;
     for (i = 0; i + 256 <= bytes; i += 64 * 4) {
-        _mm_prefetch(p + i, _MM_HINT_T2);
-        _mm_prefetch(p + i + 64, _MM_HINT_T2);
-        _mm_prefetch(p + i + 64 * 2, _MM_HINT_T2);
-        _mm_prefetch(p + i + 64 * 3, _MM_HINT_T2);
+        _mm_prefetch(p + i, hint);
+        _mm_prefetch(p + i + 64, hint);
+        _mm_prefetch(p + i + 64 * 2, hint);
+        _mm_prefetch(p + i + 64 * 3, hint);
     }
     for (; i < bytes; i += 64) {
-        _mm_prefetch(p + i, _MM_HINT_T2);
+        _mm_prefetch(p + i, hint);
     }
     _mm_mfence();
 };

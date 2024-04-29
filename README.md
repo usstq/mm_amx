@@ -81,16 +81,89 @@ so in bf16 case:
  - 2 tiles in 2x1 represents 32x16 bf16 sub-matrix of A
  - 2 tiles in 1x2 represents 16x32 bf16 sub-matrix of B
 
+### [amx-L2](./tests/amx-l2.cpp)
+
+this test shows that when blocked A matrix can archieve higher AMX usage while normal layout A matrix cannot.
+since the test didn't flush cache and all A/B/C can be resident in L2, so L1D (DCU) Hardware Prefetcher (Stream Prefetcher)
+will has major impact on the performance.
+
+to explain why blocked A is faster, we use [tile-load.cpp](./tests/tile-load.cpp) and we found it's related to the stride of A, as
+[Tip6](https://www.intel.com/content/www/us/en/developer/articles/technical/a-simple-example-to-measure-the-performance-of-an-intel-mkl-function.html)
+pointed out, there are 32 cache lines to be accessed by 2 tileloads of A tiles, we can get highest bandwidth if they are not located in same cache-way
+and according to the test, this can only happen if stride contains odd number of cache-line (not just avoid power of 2, but any multiple of 2).
+
+we can see :
+ - padding stride of A matrix to odd number of cache line size can boost performance to level of blocked A matrix!
+ - this is important only when your algorithm consumed a lot of L2 bandwidth, if only A matrix is load, it's OK, if we add B matrix, it's getting worse.
+ - performance is much more stable (and fast) if we disable L1D HW prefetcher by `MSRCONFIG=0x1a4,4 sudo -E numactl -C56 -l ./a.out`
+   so here the prefetcher is somehow interfere the performance a little.
+
+this odd-number of cache line stride is not easy to satisfy, consider Llama's MLP, the feature dimension do not satisfy this: `4096*2/64=128`,`11008*2/64=344`.
+
+```bash
+$ numactl -C56 -l ./a.out 
+ENV: USE_NUMA = 0
+ENV: MSRCONFIG = 0
+initXTILE success!
+rdtsc is calibrating ... done.
+================[ perf_log : test_L2_256_256_256_[PASS]_padK_256 ]================
+   #  thr    latency, HW_CYCLES,  CPU(GHz), Ops/cycle,  GOps/sec,BOUND_ON_LOADS
+   0     0   73.86us,    187615,      2.54,       178,    454.29,    764707
+   1     0   40.53us,     80160,      1.98,       418,    827.88,    358720
+   2     0   30.38us,     51812,      1.71,       647,   1104.41,    228481
+   3     0   28.40us,     48441,      1.71,       692,   1181.39,    213362
+   4     0   28.25us,     48203,      1.71,       696,   1187.71,    212530
+[WARNING] K padded from 256 to 288
+================[ perf_log : test_L2_256_256_256_[PASS]_padK_288 ]================
+   #  thr    latency, HW_CYCLES,  CPU(GHz), Ops/cycle,  GOps/sec,BOUND_ON_LOADS
+   0     0   67.42us,    172852,      2.56,       194,    497.67,    689249
+   1     0   31.55us,     61087,      1.94,       549,   1063.57,    270380
+   2     0   26.36us,     44969,      1.71,       746,   1272.86,    195132
+   3     0   26.43us,     45090,      1.71,       744,   1269.65,    195626
+   4     0   26.46us,     45167,      1.71,       742,   1268.00,    195793
+
+================[ perf_log : prepareA_256_256_256 ]================
+   #  thr    latency
+   0     0   54.61us
+   1     0    3.47us
+   2     0    3.60us
+   3     0    3.49us
+================[ perf_log : test_L2_blocked_256_256_256_[PASS] ]================
+   #  thr    latency, HW_CYCLES,  CPU(GHz), Ops/cycle,  GOps/sec,BOUND_ON_LOADS
+   0     0   96.36us,    239086,      2.48,       140,    348.20,   1011280
+   1     0   26.68us,     46479,      1.74,       721,   1257.80,    201350
+   2     0   26.36us,     44966,      1.71,       746,   1272.86,    195108
+   3     0   26.64us,     45461,      1.71,       738,   1259.48,    197757
+   4     0   26.47us,     45157,      1.71,       743,   1267.41,    196012
+```
+so as long as A&B&C can fit in L2, AMX usage is good, and padding is helpful (by 10%).
+
+with K fixed, M & N has to be big enough to make compute-bound possible (see below), but not too big
+to oveflow the L2 cache size.
+
+
+| M, N (K=256)      |   GOps/sec | Ops/cycle | with padK       |
+| :---------------- | :--------: | --------: | :-------------: |
+| 128, 128          |    1192.21 |     685   | 1221.74/710     |
+| 128, 256          |    1218.87 |   **710** | **1272.50/740** |
+| 128, 512          |    1286.36 |   **711** | **1292.71/715** |
+|  |  |  | |
+| 256, 128          |    1200.93 |     697   | 1217.02/711     |
+| 256, 256          |    1299.47 |   **719** | **1315.57/728** |
+| 256, 512          |    1262.48 |     702   | 1292.02/716     |
+|  |  |  | |
+| 512, 256          |    1293.38 |   **713** | 1285.31/712     |
+| 512, 512          |    1136.08 |     628   | 1186.56/658     |
+
+when run on 1 SPR socket with 56 cores:
+ - each core has it's own copy of A/B/C & jit kernel.
+ - all cores run same 256x256x256 kernels for 2 times for warm-up.
+ - all cores run same 256x256x256 kernels for 10 times for measurement, (L2-miss is almost zero).
+ - only 1136/1127/1090 `GOps/sec` can be reached for each core in blocked/odd-CL-stride/normal-stride case
+ - thus we can say L2 AMX kernel's peak-Glops upper-compute-bound (per 56-cores socket) is 1136*56/1e3 = 63 `Tflops/sec`
+   which is bounded by L2 bandwidth.
+
 ## Cache blocking
-
-Tile registers are loaded from cache, reuse cached memories as much as possible can further increase load bandwidth.
-
-Since we want to keep sub-matrix C in tile registers all the time w/o store/load into temporary buffers, the cache blocking is basically done in 2 dimensions of C matrix, the loop order of sub-matrix of C determines how we reuse the required memories of A & B sub0-matrixies.
-
-If we only considering L2 cache, we have following cache blocking scheme which divide M dimension into smaller pieces with size m, so sub-row of A with size m⨯K can fit into L2 cache totally, to be reused to generate a m⨯N sub-row of result matrix C.
-
-![cache_blk.png](./cache_blk.png)
-
 
 Throughput of Memory hierarchy:
 
@@ -113,43 +186,90 @@ Throughput of Memory hierarchy:
 @BufferSize     2 G :    13 GB/s  x 1
 ```
 
+Fist let's think about compute-memory ratio of a general matmul problem, to see how can a MatMul become compute-bounded:
 
-```bash
-amx_jit_ (M=_256_,N=_256_,K=_512_)_[PASS]       : 117.97 us x 11, HW_CYCLES=396832 169.11(Ops/cycle)
-amx_jit_ (M=_256_,N=_256_,K=_1024_)_[PASS]      : 189.19 us x 11, HW_CYCLES=599602 223.84(Ops/cycle)
-amx_jit_ (M=_256_,N=_256_,K=_2048_)_[PASS]      : 273.17 us x 11, HW_CYCLES=835525 321.28(Ops/cycle) <======= 
-amx_jit_ (M=_512_,N=_512_,K=_1024_)_[PASS]      : 501.86 us x 11, HW_CYCLES=1549072 346.58(Ops/cycle) <======= 
-amx_jit_ (M=_256_,N=_256_,K=_4096_)_[PASS]      : 685.72 us x 11, HW_CYCLES=2115576 253.77(Ops/cycle)
-```
-
- - when A/B fits L2 cache, prefer bigger M/N than K, to get higher Ops/byte.
- - when B matrix cannot fit into L2, Ops/cycle would reduce.
-
-thus we prefer to split along K dimension to fit L2 (to preserve M/N dimension size for higher Ops/byte).
-
-using 32x32 kernel (2x2 tiles):
-
- - we need to access a new (MxK) A matrix for (2*MxKxN) Flops, so memory access vs Flops is 1:2N = 1/(2N):1
- - we need to access whole (N*K) B matrix for (2*MxKxN) Flops, so memory access vs Flops is 1:2M = 1/(2M):1
- - in total 1 Flops needs [1/(2N) + 1/(2M)] elements, or (1/N + 1/M) bytes in BF16 format.
+ - we need to access a new `(MxK)` A matrix for `(2*MxKxN)` Flops, so memory access vs Flops is 1:2N = 1/(2N):1
+ - we need to access whole `(NxK)` B matrix for `(2*MxKxN)` Flops, so memory access vs Flops is 1:2M = 1/(2M):1
+ - in total 1 Flops needs `[1/(2N) + 1/(2M)]` elements, or `(1/N + 1/M)` bytes in BF16 format.
  - AMX peak MAdds per cycle is 1024 Flops/cycle, with CPU frequency 1.8 GHz (when all cores are busy), 1843.2 GFlops
- - due to limitation of L2 bandwidth, 60~70% of peak GFlops can be archieved, which is 1843.2 * 75% ~= 1382.4
+ - due to limitation of L2 bandwidth, 60~70% of peak GFlops can be archieved, if A is in normal layout, only 1242 GFlops can be reached (67%)
  - as a comparison, AVX512 FP32 peak Gflops is 64 Flops/cycle with CPU frequency 2.6 GHz, 166 GFlops,
-   so in practice we should expect AMX's thoughput to be 1382.4/166 ~ **8X** of AVX512.
+   so in practice we should expect AMX's thoughput to be 1242/166 ~ **7.5X** of AVX512.
  - per core DDR bandwidth is BW/cores, which generate `BW/cores/(1/N + 1/M)` GFlops computations for each core.
- - so AMX ALU usage is `BW/cores/(1/N + 1/M)/1843.2`
+ - so AMX L2-bounded ALU usage is `BW/cores/(1/N + 1/M)/1242`
 
-| M, N              | total BW (GB/s) |  GFlops | AMX Usage |
-| :---------------- | :------: | ----: | ----: |
-| 256, 256          |   260   | 594 | 32% |
-| 512, 512          |   260   | 1188 | 64% |
-| 256, 256          |   520   | 1188 | 64% |
+| M, N              | total BW (GB/s) |  GFlops | AMX Usage(L2) |
+| :---------------- | :-------------: | ------: | ------------: |
+| 256, 256          |         260     |   594   |     48%       |
+| 512, 512          |         260     |  1188   |     95%       |
+| 256, 256          |         520     |  1188   |     95%       |
 
 Thus we need to keep M/N big to get better AMX usage, so for cache-blocking in single core, we shouldn't parallel by splitting along M & N dimension,
-we should split slong K dimension, so in each sub-block [M x BK] [BK x N] => [M, N] we can get better AMX Usage.
+we should split slong K dimension in single core when doing cache blocking, so in each sub-block [M x BK] [BK x N] => [M, N] we can get better AMX Usage.
+
+sub-matrix A can be prefetched row by row. but sub-matrix B must be prefetched in whole (because it's being reused/accessed as a whole).
+
+### [amx-ddr](./tests/amx-ddr.cpp)
+
+with prefetch of B matrix added, we have 602 Ops/cycle in cache-COLD which is slower than L2 cache-HOT case (660)
+which means prefetch is not completely hidden by computation.
+
+```bash
+# ============================
+   #  thr    latency, HW_CYCLES,  CPU(GHz), Ops/cycle,  GOps/sec,BOUND_ON_LOADS,ICACHE_DATA.STALLS,ICACHE_TAG.STALLS
+   0     0   65.18us,    161405,      2.48,       207,    514.78,    640797,       259,       184
+   1     0   30.86us,     52677,      1.71,       636,   1087.15,    230414,         0,        71
+   2     0   49.96us,     67786,      1.36,       495,    671.64,    254693,       104,        77
+   3     0   30.87us,     52688,      1.71,       636,   1086.96,    230482,         0,         0
+   4     0   30.84us,     52606,      1.71,       637,   1088.09,    230884,         0,         0
+   5     0   30.95us,     52809,      1.71,       635,   1084.19,    230935,         0,         0
+   6     0   30.45us,     52637,      1.73,       637,   1101.79,    229837,         0,         0
+   7     0   29.21us,     52760,      1.81,       635,   1148.55,    230968,         0,         0
+   8     0   29.22us,     52758,      1.81,       636,   1148.33,    231265,         0,         0
+   9     0   29.12us,     52595,      1.81,       637,   1152.14,    230490,         0,         0
+#================================
+  10     0   51.47us,     96009,      1.87,       349,    651.98,    402421,       125,      2245
+  11     0   30.39us,     54912,      1.81,       611,   1104.12,    241408,        24,       122
+  12     0   30.47us,     55065,      1.81,       609,   1101.26,    242417,         0,         0
+  13     0   30.32us,     54791,      1.81,       612,   1106.67,    241386,         0,         0
+  14     0   30.37us,     54869,      1.81,       611,   1104.89,    241890,         0,         0
+  15     0   30.32us,     54785,      1.81,       612,   1106.55,    241155,         0,         0
+  16     0   30.62us,     55323,      1.81,       606,   1095.95,    243948,         0,         0
+  17     0   39.34us,     60638,      1.54,       553,    852.86,    250099,       155,         0
+  18     0   31.09us,     56152,      1.81,       597,   1079.19,    247694,         0,         0
+  19     0   30.64us,     55361,      1.81,       606,   1095.00,    243810,         0,         0
+# ============================
+  20     0  507.68us,    917373,      1.81,       585,   1057.49,   4035017,         0,        56
+```
+we can see the first (256x256) kernel execution take 70us (doubled) latency, due to ICACHE miss & DCACHE miss.
+and this explains the overall average Ops/cycle is only `585` (`(600*15+348)/16 ~ 584`).
+ - all cache hit: `636` Ops/cycle
+ - prefetch miss: `610` Ops/cycle
+ - average      : `585` Ops/cycle
 
 
-A can be prefetched row by row. but B must be prefetched in whole (because it's being reused/accessed as a whole).
+On multi-core case, all 56 cores perform:
+ - same kernel 
+ - same A
+ - different set of (16) B sub-blocks
+ - different C
+ - no prefetch of A since A is reused for each B and it should be in L2 cache.
+
+we need to care about `GOps/sec` instead of `Ops/cycle` since CPU frequency changes a lot,
+but DDR bandwidth is stable, so it limits the `Ops/cycle`, thus we focus on `GOps/sec` which
+is directly sensible by user.
+
+| M, N              | Cores |  GOps/sec | total TOps/sec |
+| :---------------- | :---: | --------: |--------------: |
+| 256, 256  1st     | 32    |    992    |  31.744        |
+| 256, 256          | 32    |   1245    |  39.84         |
+| 256, 256  1st     | 48    |    690    |  33.12         |
+| 256, 256          | 48    |    898    |  43.104        |
+| 256, 256  1st     | 56    |    618    |  34.6          |
+| 256, 256          | 56    |    800    |  44.8          |
+
+
+Why first time run is slow?
 
 SW prefetch instructions can also block CPU pipeline if there are too many of them, so we have to evenly distribute them into kernel.
 but how many prefetches is required in each (32x32) AMX kernel is determined by: `32*K*sizeof(bf16)/(K/32)/P = (2048/P)`, here P is the number of (32x32) kernel invocations which maybe a variable rather than a compile time constant.
@@ -187,77 +307,112 @@ Reading B matrix cannot be shared since they are not the same block, so whole DD
 
 C matrix is written
 
-# MESI protocol
+# [cross-core-read.cpp](./tests/cross-core-read.cpp)
 
+cross-core data access involves many concepts:
+ - [MESI protocol](https://en.wikipedia.org/wiki/MESI_protocol)
+ - [MESIF protocol](https://www.realworldtech.com/common-system-interface/5/)
+ - [intel Uncore programming guide](323535-intel-xeon-processor-7500-series-uncore.pdf)
+   - CPU core is composed of ALU/FPU,L1/L2 cache;
+   - all access to shared LLC is directed to a C-Box(LLC coherent engine) via ring interconnet;
+   - there is a proprietary hashing algorithm maps target physical addresses into target C-Box slice
+     to keep the traffic across the C-Box instances relatively uniform for a wide range of possible
+     address patterns.
+   - C-Box is responsible for maintaining coherence between:
+     - cores within same socket sharing same LLC
+     - generating snoops & collecting snoop responses when MESI protocol requires
+     - cross-socket coherent through QPI
+
+ - [L3 slice/cache](https://repositories.lib.utexas.edu/server/api/core/bitstreams/15430f7d-4595-4669-9473-21c0706a08a9/content)
+ - [Snoop filter events](https://hadibrais.wordpress.com/2019/04/25/considering-snoops-when-counting-cache-hit-and-miss-events-on-client-processors/)
+   - XSNP_MISS   : Retired load instructions whose data sources were L3 hit and cross-core snoop missed in on-pkg core cache
+   - XSNP_NO_FWD : Retired load instructions whose data sources were L3 and cross-core snoop hits in on-pkg core cache
+                   (data was `shared`/`clean` in another core's local cache)
+   - XSNP_FWD    : Retired load instructions whose data sources were HitM responses from shared L3
+                   (data was `exclusivly`/`dirty` owned by another core's local cache)
+   - XSNP_NONE   : Retired load instructions whose data sources were hits in L3 without snoops required
+
+ - [Data_Sharing](https://github.com/andikleen/pmu-tools/blob/4b5d2e4f677317e00cbbee47f48c3d590e8db42b/spr_server_ratios.py#L1832)
+   - L2 to L2 data transfer is even slower than L3_HIT (near DDR latency), XSNP_FWD/XSNP_NO_FWD events can measure it.
+   - from experiments, the 1st/2nd core access/share same cache-line with 0th core will trigger this penalty.
+     and also this penalty brings data into L3 cache (as an optimization attemp) so the rest cores will load from L3 w/o suffering the same penalty.
+   - case 1:
+      - when core0 read it's own data, no snoop overhead incurs at all. (`Exclusive` in core0)
+      - when core1 read the same data as core0 just read: XSNP_FWD happens and the data is filled into L3.  (`Shared` in core0 & core1)
+   - case 2:
+      - when core0 generate/write it's own data, no snoop overhead. (`Modified` in core0)
+      - when core1 read the same data that core0 has just produced: XSNP_FWD happens (`Eclusive` in core1, `Invalid` in core0)
+      - when core2 read the same data again, XSNP_NO_FWD happens and data is filled into L3 (`Shared` in core1&2)
 
 ```bash
-# cross-core cache read is only slow in first time
-# according to MESI protocol:
-#   local read makes cache lines in `Exclusive` state
-#   snooped BusRd request (made by cross core read) will:
-#  1. Transition to Shared  (Since it implies a read taking place in other cache).
-#  2. Put FlushOpt (Cache to Cache transfers) on bus together with contents of block.
-#
-# after that, both original core & cross-read core has a copy of the data in their cache lines in `Shared` state
-# so further read can be done as fast as local read.
-#
-2_threads       : 2.88 us x 1, HW_CYCLES=11357 CPU~3.95GHz, L2_HIT=4121, L3_HIT=0, L3_MISS=0
-2_threads       : 2.87 us x 1, HW_CYCLES=11352 CPU~3.95GHz, L2_HIT=4121, L3_HIT=0, L3_MISS=0
-2_threads       : 2.85 us x 1, HW_CYCLES=11247 CPU~3.94GHz, L2_HIT=4129, L3_HIT=0, L3_MISS=0
-2_threads       : 2.70 us x 1, HW_CYCLES=10672 CPU~3.95GHz, L2_HIT=4119, L3_HIT=0, L3_MISS=0
-======= cross-core-cache-read r=0
-2_threads       : 15.80 us x 1, HW_CYCLES=60785 CPU~3.85GHz, L2_HIT=1567, L3_HIT=1, L3_MISS=0
-2_threads       : 15.14 us x 1, HW_CYCLES=58521 CPU~3.87GHz, L2_HIT=1546, L3_HIT=11, L3_MISS=0
-2_threads       : 2.72 us x 1, HW_CYCLES=10738 CPU~3.95GHz, L2_HIT=4124, L3_HIT=0, L3_MISS=0
-2_threads       : 2.75 us x 1, HW_CYCLES=10866 CPU~3.95GHz, L2_HIT=4122, L3_HIT=0, L3_MISS=0
-2_threads       : 2.89 us x 1, HW_CYCLES=11401 CPU~3.94GHz, L2_HIT=4115, L3_HIT=0, L3_MISS=0
-2_threads       : 2.75 us x 1, HW_CYCLES=10860 CPU~3.96GHz, L2_HIT=4123, L3_HIT=0, L3_MISS=0
-======= cross-core-cache-read r=2
-2_threads       : 2.95 us x 1, HW_CYCLES=11613 CPU~3.94GHz, L2_HIT=4126, L3_HIT=0, L3_MISS=0
-2_threads       : 2.94 us x 1, HW_CYCLES=11287 CPU~3.83GHz, L2_HIT=4100, L3_HIT=0, L3_MISS=0
+$ numactl -C0-4 -l ./a.out
+========= a common 128KB buffer read by other cores one-by-one ==========
+ thread  id  : latency, XSNP_MISS, XSNP_NO_FWD, XSNP_FWD, XSNP_NONE
+ thread[  0] :   1.96us,        0,        0,        0,        8
+ thread[  0] :   1.71us,        0,        0,        0,        0
+ thread[  0] :   1.33us,        0,        0,        0,        0
+ thread[  1] :  11.89us,        0,        0,     1413,        0
+ thread[  1] :   1.23us,        0,        0,        0,        0
+ thread[  1] :   1.25us,        0,        0,        0,        0
+ thread[  2] :  11.06us,        0,     1331,        0,        3
+ thread[  2] :   1.23us,        0,        0,        0,        4
+ thread[  2] :   1.23us,        0,        0,        0,        0
+ thread[  3] :   4.99us,        0,        0,        0,     1261
+ thread[  3] :   1.71us,        0,        0,        0,        1
+ thread[  3] :   1.72us,        0,        0,        0,        0
+ thread[  0] :   4.60us,        0,        0,        0,     1329
+ thread[  0] :   1.22us,        0,        0,        0,        1
+ thread[  0] :   1.13us,        0,        0,        0,        0
+ thread[  1] :   1.33us,        0,        0,        0,        0
+ thread[  1] :   1.24us,        0,        0,        0,        0
+ thread[  1] :   1.19us,        0,        0,        0,        0
+ thread[  2] :   1.33us,        0,        0,        0,        0
+ thread[  2] :   1.15us,        0,        0,        0,        0
+ thread[  2] :   1.26us,        0,        0,        0,        0
+ thread[  3] :   1.72us,        0,        1,        0,        0
+ thread[  3] :   1.19us,        0,        0,        0,        0
+ thread[  3] :   1.23us,        0,        0,        0,        0
+ thread[  0] :   1.31us,        0,        0,        0,        0
+ thread[  0] :   1.22us,        0,        0,        0,        0
+ thread[  0] :   1.14us,        0,        0,        0,        0
+ thread[  1] :   1.30us,        0,        0,        0,        0
+ thread[  1] :   1.20us,        0,        0,        0,        0
+ thread[  1] :   1.24us,        0,        0,        0,        0
+ thread[  2] :   1.28us,        0,        0,        0,        0
+ thread[  2] :   1.24us,        0,        0,        0,        0
+ thread[  2] :   1.19us,        0,        0,        0,        0
+ thread[  3] :   1.77us,        0,        0,        0,        0
+ thread[  3] :   1.20us,        0,        0,        0,        0
+ thread[  3] :   1.20us,        0,        0,        0,        0
+ thread[  4] :   5.17us,        0,        0,        0,     1273
+ thread[  4] :   1.23us,        0,        0,        0,        2
+ thread[  4] :   1.24us,        0,        0,        0,        0
+======== concurrent multi-threads reading from a common 128K buffer written by thread0 ===========
+ thread  id  : latency, XSNP_MISS, XSNP_NO_FWD, XSNP_FWD, XSNP_NONE
+ thread[  0] :  10.43us,        0,       31,       48,      922
+ thread[  3] :  11.27us,        0,       65,      135,      709
+ thread[  2] :  12.41us,        0,       40,      219,      499
+ thread[  4] :  12.97us,        0,       40,       80,      375
+ thread[  1] :  10.69us,        0,       36,       89,      821
+ thread[  4] :   1.27us,        0,        0,        0,       22
+ thread[  3] :   1.26us,        0,        0,        0,       10
+ thread[  0] :   1.24us,        0,        0,        0,        9
+ thread[  2] :   1.29us,        0,        0,        0,        6
+ thread[  1] :   1.44us,        0,        0,        0,        0
+ thread[  4] :   1.24us,        0,        0,        1,        0
+ thread[  3] :   1.29us,        0,        0,        0,        1
+ thread[  0] :   1.20us,        0,        2,        0,        0
+ thread[  1] :   1.24us,        0,        1,        0,        1
+ thread[  2] :   1.31us,        0,        0,        0,        1
+```
 
-56_threads      : 10.76 us x 1, HW_CYCLES=29322 CPU~2.73GHz, L2_HIT=2642, L3_HIT=3, L3_MISS=0
-56_threads      : 11.10 us x 1, HW_CYCLES=29427 CPU~2.65GHz, L2_HIT=2727, L3_HIT=4, L3_MISS=0
-======= cross-core-cache-read r=0
-56_threads      : 152.19 us x 1, HW_CYCLES=409497 CPU~2.69GHz, L2_HIT=472, L3_HIT=4, L3_MISS=0
-56_threads      : 29.83 us x 1, HW_CYCLES=79511 CPU~2.67GHz, L2_HIT=733, L3_HIT=18, L3_MISS=12
+# [interleave-write.cpp](./tests/interleave-write.cpp)
 
-56_threads      : 10.94 us x 1, HW_CYCLES=30585 CPU~2.80GHz, L2_HIT=3813, L3_HIT=1, L3_MISS=0
-56_threads      : 11.50 us x 1, HW_CYCLES=31963 CPU~2.78GHz, L2_HIT=3864, L3_HIT=2, L3_MISS=0
-56_threads      : 10.97 us x 1, HW_CYCLES=30532 CPU~2.78GHz, L2_HIT=3809, L3_HIT=3, L3_MISS=0
-======= cross-core-cache-read r=3
-56_threads      : 11.17 us x 1, HW_CYCLES=31272 CPU~2.80GHz, L2_HIT=3796, L3_HIT=8, L3_MISS=0
-56_threads      : 10.93 us x 1, HW_CYCLES=30393 CPU~2.78GHz, L2_HIT=3834, L3_HIT=2, L3_MISS=0
+multi-cores write to same big buffer in interleaving style is slow
+it's not false-sharing since each core writes in unit of cache-line size (64B) aligned at cache-line boundary.
+when interleaving step is bigger than 4KB, the speed is recovered most.
 
-# cross-core cache write is extremely slow 
-# according to MESI protocol:
-#  local-L2-write makes the cache lines in `Modified(M)` state
-#  snooped BusRdX request will:
-#   1. Transition to (I)Invalid. (ownership is transfered)
-#   2. Put FlushOpt (Cache to Cache transfers) on Bus with data. Received by sender of BusRdx and Memory Controller, which writes to Main memory.
-#
-# after that original owner becomes Invalid, thus on next buffer write it will issue BusRdX to
-# take owner-ship back (only one owner in (M)Modified state can exists)
-
-2_threads       : 5.65 us x 1, HW_CYCLES=22188 CPU~3.93GHz, L2_HIT=32, L3_HIT=2, L3_MISS=0
-2_threads       : 5.25 us x 1, HW_CYCLES=20591 CPU~3.92GHz, L2_HIT=32, L3_HIT=0, L3_MISS=0
-2_threads       : 5.10 us x 1, HW_CYCLES=20026 CPU~3.93GHz, L2_HIT=33, L3_HIT=0, L3_MISS=0
-2_threads       : 5.11 us x 1, HW_CYCLES=20149 CPU~3.94GHz, L2_HIT=27, L3_HIT=0, L3_MISS=0
-======= cross-core-cache-write r=1
-2_threads       : 20.09 us x 1, HW_CYCLES=78634 CPU~3.91GHz, L2_HIT=33, L3_HIT=0, L3_MISS=0
-2_threads       : 20.25 us x 1, HW_CYCLES=79460 CPU~3.92GHz, L2_HIT=28, L3_HIT=0, L3_MISS=0
-
-56_threads      : 15.88 us x 1, HW_CYCLES=44422 CPU~2.80GHz, L2_HIT=18, L3_HIT=3, L3_MISS=0
-56_threads      : 15.19 us x 1, HW_CYCLES=41261 CPU~2.72GHz, L2_HIT=14, L3_HIT=3, L3_MISS=0
-56_threads      : 16.91 us x 1, HW_CYCLES=46986 CPU~2.78GHz, L2_HIT=14, L3_HIT=4, L3_MISS=0
-56_threads      : 16.27 us x 1, HW_CYCLES=45389 CPU~2.79GHz, L2_HIT=18, L3_HIT=2, L3_MISS=0
-======= cross-core-cache-write r=1
-56_threads      : 36.26 us x 1, HW_CYCLES=101033 CPU~2.79GHz, L2_HIT=20, L3_HIT=2, L3_MISS=0
-56_threads      : 38.09 us x 1, HW_CYCLES=104733 CPU~2.75GHz, L2_HIT=17, L3_HIT=3, L3_MISS=0
-
-# multi-cores write to same big buffer in interleaving style is slow
-# it's not false-sharing since the interleaving step is of multiple-cache-line size.
-# when interleaving step is bigger than 4KB, the speed is recovered most.
+```bash
 #
 full_256_x_1024_Bytes_2_Threads : 22.78 us x 100, HW_CYCLES=88188 CPU~3.87GHz 5.95(Ops/cycle), L2_HIT=8, L3_HIT=0, L3_MISS=0 23.01(GOps/s)
 part_256_x_1024_Bytes_2_Threads : 5.24 us x 100, HW_CYCLES=19801 CPU~3.78GHz 26.48(Ops/cycle), L2_HIT=18, L3_HIT=0, L3_MISS=0 100.14(GOps/s)
