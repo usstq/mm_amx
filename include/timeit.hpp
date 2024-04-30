@@ -182,6 +182,17 @@ struct perf_log {
         log[m_events + 2] = opsPerCall;
     }
 
+    // add empty separator log
+    void operator()() {
+        int ithr = omp_get_thread_num();
+        auto ev_offset = ithr * m_events;
+
+        auto* log = &m_counters[m_count.fetch_add(3 + m_events)];
+        log[m_events] = 0;
+        log[m_events + 1] = ithr;
+        log[m_events + 2] = 0;
+    }
+
     ~perf_log() {
         #pragma omp critical
         {
@@ -207,6 +218,11 @@ struct perf_log {
                 auto opsPerCall = m_counters[i + m_events + 2];
 
                 std::cout << std::fixed << std::setprecision(2) << ansi_color << std::setw(4) << round << std::setw(6) << ithr << std::setw(8);
+                if (dt == 0) {
+                    std::cout << "-------------------------------------------" << ANSIcolor() << std::endl;
+                    continue;
+                }
+
                 if (dt > 1e-3)
                     std::cout << dt * 1e3 << "ms";
                 else

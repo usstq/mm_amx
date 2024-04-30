@@ -38,10 +38,10 @@ static tensor2D<ov::bfloat16> repack_weights(tensor2D<ov::bfloat16>& Bt) {
     return BPacked;
 }
 
-//================================================================================================================
 EnvVar NOSWPF("NOSWPF", 0);
+EnvVar SWPFA("SWPFA", 0);   // prefetch A is slower, so disable it
 
-class Linear32x32_AMXL2_swpfB : public jit_generator {
+class Linear32x32_AMX_mkernel : public jit_generator {
 public:
     TileConfig m_tile_cfg;
 
@@ -52,7 +52,7 @@ public:
     int m_BN; // blockN: L2-cache kernel
 
     bool m_do_accumulation;
-    bool m_is_C_blocked;
+
     int m_prefetch_Blines;
 
     // both A & B data will be prefetched from memory for next kernel invokation
@@ -63,11 +63,32 @@ public:
     // for next round, so next B is also of size (KxN) elements
     //    distributes into (BM/32)*(BN/32) kernels:
     //    each kernel has (BK/32) iterations, thus each kernel iteration
-    //    need to prefetch (BKxBN)/(BMxBNxBK/32768) = 32768/BM elements
+    //    need to prefetch (BKxBN)/(BMxBNxBK/32768) = 32768/BM bfloat16-elements
     //    which is 1024/BM cache lines, this has to be determined at
     //    code-generation time. with BM=256, this is only 4.
     //
-    Linear32x32_AMXL2_swpfB(int BM = 256, int BK = 256, int BN = 256, bool do_accumulation = false, bool is_C_blocked = false) : m_BM(BM), m_BK(BK), m_BN(BN), m_do_accumulation(do_accumulation), m_is_C_blocked(is_C_blocked) {
+    // prefetch A can be done in unit of 32xBK elements, which must be evenly distributed
+    // into (BN/32)*(BK/32) kernel iterations, each iteration prefetch/copy 32xBK/(BN*BK/1024) = 32768/BN bfloat16-elements
+    // or 1024/BN cache lines. with BM=256, this is only 4 too.
+    //
+    // prefetch or copy?
+    //   prefetch strided sub-matrix of A is tricky, consider each 32x32 AMX jit kernel has [BK/32] iterations
+    //   and it's called (BN/32) times, each kernel must prefetch 32*BK/(BN/32) = (1024/BN)*BK elements
+    //   since each kernel has [BK/32] loop iterations, each iteration fetch (1024/BN)*BK/(BK/32) = 1024*32/BN
+    //   bytes.
+    //
+    //   when 1024 is not divisible by BN, it's fine, just prefetch more
+    //
+    // copy data from A to a ping-pong buffer has advantage:
+    //    - read can be done in continous way most suitable for HW prefetcher
+    //    - write to ping-pong buffer is within L2 cache, which should be fast
+    //    - data transfer rate is small comparing to L2-bandwidth, shouldn't be a big issue for interleaved write to L2.
+    //    - read from ping-pong buffer is much faster and free of odd-multiple-cache-line restriction.
+    // so we prefer distribute the repacking of A sub-matrix into ping-pong buffer into kernel.
+    // for BN=256, each kernel read 4*BK elements into ping-pong, each iteration read 4*BK*sizeof(bfloat16)/(BK/32)=256bytes = 4-512bits zmm registers
+    //
+    //
+    Linear32x32_AMX_mkernel(int BM = 256, int BK = 256, int BN = 256, bool do_accumulation = false) : m_BM(BM), m_BK(BK), m_BN(BN), m_do_accumulation(do_accumulation) {
 
         // B: [K, N]
         m_ktiles = m_BK / 32;
@@ -79,7 +100,7 @@ public:
             m_prefetch_Blines = 0;
         }
 
-        create_kernel("Linear32x32_AMXL2_swpfB");
+        create_kernel("Linear32x32_AMX_mkernel");
         m_tile_cfg.reset(1, 0,
                          {
                              {16, 64}, // C:0
@@ -102,6 +123,8 @@ public:
     Xbyak::Reg64 reg_prefetch = abi_param6; // prefetch B
 
     Xbyak::Reg64 reg_ktiles = rax;
+    Xbyak::Reg64 reg_prefetch_A = r9;
+    Xbyak::Reg64 reg_prefetch_A1 = r12;
     Xbyak::Reg64 reg_B_stride = r10;
     Xbyak::Reg64 reg_A1_addr = r11;
 
@@ -113,6 +136,8 @@ public:
     Xbyak::Tmm tmmA1 = tmm5;
     Xbyak::Tmm tmmB0 = tmm6;
     Xbyak::Tmm tmmB1 = tmm7;
+
+    uint8_t * prefetch_next_A_addr;
 
     void generate() {
         auto num_PFB = m_prefetch_Blines;
@@ -148,6 +173,13 @@ public:
         mov(reg_B_stride, reinterpret_cast<uintptr_t>(&m_ktiles));
         mov(reg_ktiles, ptr[reg_B_stride + 0]);
 
+        if (SWPFA) {
+            push(reg_prefetch_A1);
+            mov(reg_B_stride, reinterpret_cast<uintptr_t>(&prefetch_next_A_addr));
+            mov(reg_prefetch_A, ptr[reg_B_stride + 0]);
+            mov(reg_prefetch_A1, ptr[reg_prefetch_A + 2*reg_A_stride]);
+        }
+
         lea(reg_A1_addr, ptr[reg_A_addr + reg_A_stride * 8]);
         lea(reg_A1_addr, ptr[reg_A1_addr + reg_A_stride * 8]);
         mov(reg_B_stride, 64);
@@ -167,12 +199,15 @@ public:
             cur_PFB++;
         }
 
+        if (SWPFA) prefetcht2(ptr[reg_prefetch_A]);
+
         tileloadd(tmmA1, ptr[reg_A1_addr + reg_A_stride]);
         tdpbf16ps(tmmC10, tmmA1, tmmB0);
         if (cur_PFB < num_PFB) {
             prefetcht2(ptr[reg_prefetch + cur_PFB * 64]);
             cur_PFB++;
         }
+        if (SWPFA) prefetcht2(ptr[reg_prefetch_A + reg_A_stride]);
 
         tileloadd(tmmB1, ptr[reg_B_addr + reg_B_stride]);
 
@@ -183,6 +218,7 @@ public:
             prefetcht2(ptr[reg_prefetch + cur_PFB * 64]);
             cur_PFB++;
         }
+        if (SWPFA) prefetcht2(ptr[reg_prefetch_A1]);
 
         tdpbf16ps(tmmC11, tmmA1, tmmB1);
         // prefetch next sub-block B matrix
@@ -191,8 +227,12 @@ public:
                 prefetcht2(ptr[reg_prefetch + pi * 64]);
             }
         }
+        if (SWPFA) prefetcht2(ptr[reg_prefetch_A1 + reg_A_stride]);
 
         lea(reg_prefetch, ptr[reg_prefetch + 64 * num_PFB]);
+
+        if (SWPFA) lea(reg_prefetch_A, ptr[reg_prefetch_A + 64]);
+        if (SWPFA) lea(reg_prefetch_A1, ptr[reg_prefetch_A1 + 64]);
 
         //}
         lea(reg_A_addr, ptr[reg_A_addr + const_A_steps]);
@@ -214,11 +254,16 @@ public:
         tilestored(ptr[reg_C_addr + reg_C_stride], tmmC10);
         tilestored(ptr[reg_C_addr + reg_C_stride + 64], tmmC11);
 #endif
+        if (SWPFA) pop(reg_prefetch_A1);
         ret();
     }
 
     // run L2 cache blocking kernel with size:
     //    [BM, BK]*[BK, BN] => [BM, BN]
+    //
+    // prefetch of A can be done inside of this level of kernel
+    // since it's done in unit of 32-rows
+    // but prefetch of next B must be specified by caller.
     //
     void run(uint8_t* pA, int strideA, // A
              uint8_t* pB, int strideB, // strideB is special
@@ -229,8 +274,12 @@ public:
 
         for (int m = 0; m < m_BM; m += 32, pA += 32 * strideA, pC += 32 * strideC) {
             auto* pB1 = pB;
+            prefetch_next_A_addr = pA + 32 * strideA;
+            if (m + 32 >= m_BM)
+                prefetch_next_A_addr = pA;
             for (int n = 0; n < m_BN; n += 32, pB1 += strideB, prefetch_B += prefetch_step) {
                 (*this)(pA, strideA, pB1, pC + n * sizeof(float), strideC, prefetch_B);
+                prefetch_next_A_addr += 4*strideA;
             }
         }
     }
@@ -242,37 +291,21 @@ void clr_cache() {
     load_prefetch_L2(&big_buffer[0], big_buffer.size());
 };
 
-int fix_stride(int stride) {
-    // according to [Tip6](https://www.intel.com/content/www/us/en/developer/articles/technical/a-simple-example-to-measure-the-performance-of-an-intel-mkl-function.html)
-    int best_stride_cache_lines = (stride + 63) / 64;
-    if ((best_stride_cache_lines % 1) == 0)
-        best_stride_cache_lines++;
-    return best_stride_cache_lines * 64;
-}
+void test(int BM, int BK, int BN) {
+    tensor2D<ov::bfloat16> A(BM, BK, true);
+    tensor2D<ov::bfloat16> B(BK, BN, true);
+    tensor2D<float> C0(BM, BN, true); // reference result
+    tensor2D<float> C1(BM, BN, true); // reference result
 
-EnvVar FLAGX("FLAGX",0);
-
-void test_prefetch_B(int M, int K, int N, int num_blkB = 160) {
-
-    int nthr = get_nthr();
-    int best_pad_K = fix_stride(K * sizeof(ov::bfloat16)) / sizeof(ov::bfloat16);
-    tensor2D<ov::bfloat16> A_padded(M, best_pad_K, true);
-
-    tensor2D<ov::bfloat16> A(M, K, &A_padded[0], A_padded.stride);
-    tensor2D<ov::bfloat16> B(K, N, true);
-    tensor2D<float> C0(M, N, true); // reference result
-    tensor2D<float> C1(M, N, true); // reference result
-
-    Linear32x32_AMXL2_swpfB jit_amx(M, K, N, true);
+    Linear32x32_AMX_mkernel jit_amx(BM, BK, BN, false);
 
     auto Bt = B.Tr();
     auto B1 = repack_weights(Bt);
 
     C0 = 0;
-    C1 = 0;
     matmul(A, B, C0);
 
-    auto strideB = (K / 32) * 2048;
+    auto strideB = (BK / 32) * 2048;
     {
         TileConfigScope tcfg(jit_amx.m_tile_cfg);
         jit_amx.run(reinterpret_cast<uint8_t*>(&A[0]), A.stride,   //
@@ -301,144 +334,97 @@ void test_prefetch_B(int M, int K, int N, int num_blkB = 160) {
     perf_log plog({
         {PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES, "HW_CYCLES"},
         {PERF_TYPE_RAW, 0x21a6, "BOUND_ON_LOADS"},
-        //{PERF_TYPE_RAW, 0x019c,"IDQ_UOPS_NOT_DELIVERED"},
-        {PERF_TYPE_RAW, 0x10d1, "L2_MISS"},
-        //{PERF_TYPE_RAW, 0x20d1, "L3_MISS"},
-        //{PERF_TYPE_RAW, 0x04d2, "XSNP_FWD"},
-        //{PERF_TYPE_RAW, 0x2224, "RFO_MISS"},
-        //{PERF_TYPE_RAW, 0x3024, "L2.HWPF_MISS"},
-        //{PERF_TYPE_RAW, 0x04a3, "STALLS_TOTAL"},
-        //{PERF_TYPE_RAW, 0x06a3, "STALLS_L3_MISS"},
-        {PERF_TYPE_RAW, 0x05a3, "STALLS_L2_MISS"},
-        //{PERF_TYPE_RAW, 0x0480, "ICACHE_DATA.STALLS"},
-        //{PERF_TYPE_RAW, 0x0483, "ICACHE_TAG.STALLS"},
     });
     plog.reserve(512);
-    plog.tag("cache-COLD", M, K, N, acc);
+    plog.tag("cache-COLD", BM, BK, BN, acc);
     plog.color(acc_color);
+
+    const int num_AB_pairs = 43;
+    std::vector<tensor2D<ov::bfloat16>> A1s;
+    tensor2D<ov::bfloat16> Abig(BM, num_AB_pairs * BK, true);
+    for (int i = 0; i < num_AB_pairs; i++) {
+        A1s.emplace_back(BM, BK, &Abig(0, i*BK), Abig.stride);
+        // A1s.emplace_back(A.clone());
+    }
 
 #pragma omp parallel
     {
-        tensor2D<ov::bfloat16> A2_padded(M, best_pad_K, true);
-        tensor2D<ov::bfloat16> A2(M, K, &A2_padded[0], A2_padded.stride);
-
-        Linear32x32_AMXL2_swpfB jit_amx(M, K, N, true);
         int ithr = omp_get_thread_num();
 
-        tensor2D<float> C2(M, N, true); // reference result
-        TileConfigScope tcfg(jit_amx.m_tile_cfg);
-        // we will clone many B1 to test if prefetch works
+        tensor2D<float> C2(BM, BN, true);
         std::vector<tensor2D<ov::bfloat16>> B1s;
-        for (int i = 0; i < num_blkB; i++) {
+        for (int i = 0; i < num_AB_pairs; i++) {
             B1s.emplace_back(B1.clone());
         }
+        Linear32x32_AMX_mkernel jit_amx0(BM, BK, BN, false);
+        Linear32x32_AMX_mkernel jit_amx1(BM, BK, BN, true);
+        TileConfigScope tcfg(jit_amx0.m_tile_cfg);
 
+#if 0
 #pragma omp barrier
-
-        if (nthr == 1) {
-            tensor2D<ov::bfloat16>& blockB = B1s[0];
-            for(int i = 0; i < (int)(FLAGX); i++) {
-                plog([&]() {
-                            jit_amx.run(reinterpret_cast<uint8_t*>(&A2[0]), A2.stride,     //
-                                        reinterpret_cast<uint8_t*>(&blockB[0]), strideB, //
-                                        reinterpret_cast<uint8_t*>(&C2[0]), C2.stride,   //
-                                        reinterpret_cast<uint8_t*>(&blockB[0]));
-                        },
-                        2.0 * M * N * K // OPS per call per core
-                    );
-            }
-        }
-        if (nthr == 1) {
-            clr_cache();
-            clr_cache();
-            clr_cache();
-            clr_cache();
-
-            for (int r = 0; r < (int)(FLAGX); r++) {
+        {
+            // plog.tag("cache-HOT", M, K, N, acc);
+            // plog.color(acc_color);
+            for (int r = 0; r < 10; r++) {
                 tensor2D<ov::bfloat16>& blockB = B1s[0];
-                auto r1 = r + 1;
-                tensor2D<ov::bfloat16>& blockB1 = B1s[r1 < B1s.size() ? r1 : r];
+                tensor2D<ov::bfloat16>& blockB1 = B1s[0];
                 plog(
                     [&]() {
-                        jit_amx.run(reinterpret_cast<uint8_t*>(&A2[0]), A2.stride,     //
+                        jit_amx.run(reinterpret_cast<uint8_t*>(&A[0]), A.stride,     //
                                     reinterpret_cast<uint8_t*>(&blockB[0]), strideB, //
                                     reinterpret_cast<uint8_t*>(&C2[0]), C2.stride,   //
                                     reinterpret_cast<uint8_t*>(&blockB1[0]));
                     },
                     2.0 * M * N * K // OPS per call per core
                 );
-            }
+            };
         }
-
+#endif
         clr_cache();
         clr_cache();
         clr_cache();
-        clr_cache();
-
-#pragma omp barrier
-        plog(
-            [&]() {
-                for (int r = 0; r < B1s.size(); r++) {
-                    tensor2D<ov::bfloat16>& blockB = B1s[r];
-                    auto r1 = r + 1;
-                    tensor2D<ov::bfloat16>& blockB1 = B1s[r1 < B1s.size() ? r1 : r];
-                    jit_amx.run(reinterpret_cast<uint8_t*>(&A2[0]), A2.stride,     //
-                                reinterpret_cast<uint8_t*>(&blockB[0]), strideB, //
-                                reinterpret_cast<uint8_t*>(&C2[0]), C2.stride,   //
-                                reinterpret_cast<uint8_t*>(&blockB1[0]));
-                }
-            },
-            (B1s.size()) * 2.0 * M * N * K // OPS per call per core
-        ); 
-
-        // add separator
-        if (ithr == 0) plog();
 
 #pragma omp barrier
         plog(
             [&]() {
-                for (int r = 0; r < B1s.size(); r++) {
+                Linear32x32_AMX_mkernel* pkernel = &jit_amx0;
+                for (int r = 0; r < num_AB_pairs; r++) {
+                    tensor2D<ov::bfloat16>& blockA = A1s[r];
                     tensor2D<ov::bfloat16>& blockB = B1s[r];
                     auto r1 = r + 1;
                     tensor2D<ov::bfloat16>& blockB1 = B1s[r1 < B1s.size() ? r1 : r];
-                    jit_amx.run(reinterpret_cast<uint8_t*>(&A2[0]), A2.stride,     //
-                                reinterpret_cast<uint8_t*>(&blockB[0]), strideB, //
-                                reinterpret_cast<uint8_t*>(&C2[0]), C2.stride,   //
-                                reinterpret_cast<uint8_t*>(&blockB1[0]));
+
+                    pkernel->run(reinterpret_cast<uint8_t*>(&blockA[0]), blockA.stride, reinterpret_cast<uint8_t*>(&blockB[0]), strideB, reinterpret_cast<uint8_t*>(&C2[0]), C2.stride, reinterpret_cast<uint8_t*>(&blockB1[0]));
+                    pkernel = &jit_amx1;
                 }
             },
-            (B1s.size()) * 2.0 * M * N * K // OPS per call per core
+            (num_AB_pairs) * 2.0 * BM * BN * BK // OPS per call per core
         );
 
-        // add separator
-        if (ithr == 0) plog();
+        if (ithr == 0) plog(); // add separator
 
 #pragma omp barrier
         plog(
             [&]() {
-                for (int r = 0; r < B1s.size(); r++) {
+                Linear32x32_AMX_mkernel* pkernel = &jit_amx0;
+                for (int r = 0; r < num_AB_pairs; r++) {
+                    tensor2D<ov::bfloat16>& blockA = A1s[r];
                     tensor2D<ov::bfloat16>& blockB = B1s[r];
                     auto r1 = r + 1;
                     tensor2D<ov::bfloat16>& blockB1 = B1s[r1 < B1s.size() ? r1 : r];
-                    jit_amx.run(reinterpret_cast<uint8_t*>(&A2[0]), A2.stride,     //
-                                reinterpret_cast<uint8_t*>(&blockB[0]), strideB, //
-                                reinterpret_cast<uint8_t*>(&C2[0]), C2.stride,   //
-                                reinterpret_cast<uint8_t*>(&blockB1[0]));
+
+                    pkernel->run(reinterpret_cast<uint8_t*>(&blockA[0]), blockA.stride, reinterpret_cast<uint8_t*>(&blockB[0]), strideB, reinterpret_cast<uint8_t*>(&C2[0]), C2.stride, reinterpret_cast<uint8_t*>(&blockB1[0]));
+                    pkernel = &jit_amx1;
                 }
             },
-            (B1s.size()) * 2.0 * M * N * K // OPS per call per core
+            (num_AB_pairs) * 2.0 * BM * BN * BK // OPS per call per core
         );
-
     }
 }
 
 int main() {
     MSRConfig _msr;
     bool initAMX = initXTILE();
-    // running 56 cores
-    test_prefetch_B(256, 256, 256);
-    test_prefetch_B(256, 256, 256);
-    //test_prefetch_B(256, 256, 384); // 579 1040
-    // test_prefetch_B(256, 256, 512); // 535 1000
+    test(256, 256, 256);
     return 0;
 }

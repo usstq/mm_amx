@@ -155,7 +155,7 @@ to oveflow the L2 cache size.
 | 512, 256          |    1293.38 |   **713** | 1285.31/712     |
 | 512, 512          |    1136.08 |     628   | 1186.56/658     |
 
-when run on 1 SPR socket with 56 cores:
+when run on 1 SPR socket with 56 cores, we should focus on `GOps/second` since CPU frequency is changing (while L2 bandwidth is not?):
  - each core has it's own copy of A/B/C & jit kernel.
  - all cores run same 256x256x256 kernels for 2 times for warm-up.
  - all cores run same 256x256x256 kernels for 10 times for measurement, (L2-miss is almost zero).
@@ -209,7 +209,7 @@ we should split slong K dimension in single core when doing cache blocking, so i
 
 sub-matrix A can be prefetched row by row. but sub-matrix B must be prefetched in whole (because it's being reused/accessed as a whole).
 
-### [amx-ddr](./tests/amx-ddr.cpp)
+### With B sub-block prefetched [amx-ddr](./tests/amx-ddr.cpp)
 
 with prefetch of B matrix added, we have 602 Ops/cycle in cache-COLD which is slower than L2 cache-HOT case (660)
 which means prefetch is not completely hidden by computation.
@@ -259,21 +259,43 @@ we need to care about `GOps/sec` instead of `Ops/cycle` since CPU frequency chan
 but DDR bandwidth is stable, so it limits the `Ops/cycle`, thus we focus on `GOps/sec` which
 is directly sensible by user.
 
-| M, N              | Cores |  GOps/sec | total TOps/sec |
-| :---------------- | :---: | --------: |--------------: |
-| 256, 256  1st     | 32    |    992    |  31.744        |
-| 256, 256          | 32    |   1245    |  39.84         |
-| 256, 256  1st     | 48    |    690    |  33.12         |
-| 256, 256          | 48    |    898    |  43.104        |
-| 256, 256  1st     | 56    |    618    |  34.6          |
-| 256, 256          | 56    |    800    |  44.8          |
+| M, N, num_of_B    | Cores |  GOps/sec/core |
+| :---------------- | :---: | -------------: |
+| 256, 256 16 1st   | 56    |    643         |
+| 256, 256 16       | 56    |    959         |
 
+we can see first time execution (w/o warmup) took significantly more time, `BOUND_ON_LOADS` & `STALLS_L2_MISS` is also higher.
+It's due to that we only use 16 256x256 bf16 B matrix for the experiment above which is only 2MB per core, the data is located
+in DDR for first time, and it's been loaded into L3 after that.
 
-Why first time run is slow?
+if we increase the number of 256x256 B matrix to 160, this gap is much lower:
 
-SW prefetch instructions can also block CPU pipeline if there are too many of them, so we have to evenly distribute them into kernel.
-but how many prefetches is required in each (32x32) AMX kernel is determined by: `32*K*sizeof(bf16)/(K/32)/P = (2048/P)`, here P is the number of (32x32) kernel invocations which maybe a variable rather than a compile time constant.
+| M, N  num_of_B    | Cores |  GOps/sec/core |
+| :---------------- | :---: | -------------: |
+| 256, 256 160 1st  | 56    |    916         |
+| 256, 256 160      | 56    |    992         |
 
+we also see the Gops was higher, since the penalty of the first cache-cold B matrix was amortized over much more number of following B matrixes.
+(but in reality or practical problem maybe we don't have so many B matrixes to amortize the first cache-cold cost).
+
+the average latency is 5.4ms, consider the total size of B matrixes loaded, effective DDR bandwidth consumed is `160*256*256*2/5.4e-3/1e9*56 ~= 217 GB/s`,
+which didn't reach the peak,  if we remove the computation instruction `tdpbf16ps` out of the jit kernel, we can get much better DDR bandwidth `160*256*256*2/4.7e-3/1e9*56 ~= 250 GB/s`,
+but we also got much higher CPU frequency (~2.8GHz) in this case since the power-consuming AMX ALU is not working. so prefetch & ALU is not 100% in parallel.
+
+ - ALU usage didn't reach L2-bound `700 Ops/cycle`;
+ - DDR bandwidth didn't reach `260 GB/s` peak;
+
+the prefetch instructions have been distributed into the inner loop evenly, what can be done more?
+
+### With A&B sub-block prefetched [amx-mm](./tests/amx-mm.cpp)
+
+| M, N  num_of_B    | Cores |  GOps/sec/core               |
+| :---------------- | :---: | ---------------------------: |
+| 256, 256 43 1st   | 56    |  769 / 463 / 645 / 705 / 623 | 
+| 256, 256 43       | 56    |  953 / 549 / 867 / 864 / 695 |
+
+> GOps/sec/core : `common 1x256x256 A` / `per-thread 43x256x256 A` / `common 43x256x256 A` / `common 256x11008 A` / `+prefetcA`
+so prefetch of A actually not working well. we disable it by default.
 
 ## Multicore parallelism
 
