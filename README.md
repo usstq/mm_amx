@@ -291,8 +291,8 @@ the prefetch instructions have been distributed into the inner loop evenly, what
 
 | M, N  num_of_B    | Cores |  GOps/sec/core               |
 | :---------------- | :---: | ---------------------------: |
-| 256, 256 43 1st   | 56    |  769 / 463 / 645 / 705 / 623 | 
-| 256, 256 43       | 56    |  953 / 549 / 867 / 864 / 695 |
+| 256, 256 43 1st   | 56    |  769 / 463 / 645 / 708 / 623 | 
+| 256, 256 43       | 56    |  953 / 549 / 867 / 876 / 695 |
 
 > GOps/sec/core : `common 1x256x256 A` / `per-thread 43x256x256 A` / `common 43x256x256 A` / `common 256x11008 A` / `+prefetcA`
 so prefetch of A actually not working well. we disable it by default.

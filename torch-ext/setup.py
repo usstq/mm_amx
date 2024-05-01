@@ -7,10 +7,10 @@ setup(name='lltm_cpp',
       cmdclass={'build_ext': cpp_extension.BuildExtension})
 '''
 
-setup(name='mlp_opt',
+setup(name='amx_mlp',
       ext_modules=[
         cpp_extension.CppExtension(
-                    'mlp_opt', ['mlp_opt.cpp'],
+                    'amx_mlp', ['amx_mlp.cpp'],
                     extra_compile_args=[ '-fopenmp',
                                         '-mno-avx256-split-unaligned-load',
                                         '-mno-avx256-split-unaligned-store',
