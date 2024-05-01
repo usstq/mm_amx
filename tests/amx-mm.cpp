@@ -498,85 +498,102 @@ void test(int BM, int BK, int BN, const int num_AB_pairs = 43) {
     }
 }
 
-#if 0
 class LinearAMX {
 public:
     Linear32x32_AMX_mkernel* p_jit_amx0;
     Linear32x32_AMX_mkernel* p_jit_amx1;
 
-    std::vector<tensor2D<ov::bfloat16>> weights;
+    std::vector<std::vector<tensor2D<ov::bfloat16>>> weights;
     int num_blk_N;
     int num_blk_K;
     std::vector<tensor2D<float>> Cs; // per-thread result
+    std::vector<int> n_offsets;
 
     LinearAMX() {}
 
     // weight [N, K]
 
-    template <typename T, int BN = 256>
+    template <typename T, int BM = 256>
     void setup(T* p_weight, int stride, int N, int K) {
-        static Linear32x32_AMX_mkernel jit_amx0(256, 256, BN, false);
-        static Linear32x32_AMX_mkernel jit_amx1(256, 256, BN, true);
+        static Linear32x32_AMX_mkernel jit_amx0(BM, false);
+        static Linear32x32_AMX_mkernel jit_amx1(BM, true);
         p_jit_amx0 = &jit_amx0;
         p_jit_amx1 = &jit_amx1;
 
-        // prepare weights, N split among threads
+        // prepare weights, split N among threads
+        // in unit of 32
+        ASSERT((N % 32) == 0);
+        ASSERT((K % 256) == 0);
         auto nthr = get_nthr();
-        num_blk_N = N / BN;
+        num_blk_N = N / 32;
         num_blk_K = K / 256;
-        ASSERT(num_blk_N < nthr);
-        weights.resize(num_blk_N * num_blk_K);
+        weights.resize(nthr);
+        for(auto& vw : weights) {
+            vw.resize(num_blk_K);
+        }
         Cs.resize(num_blk_N);
+        n_offsets.resize(num_blk_N);
 #pragma omp parallel
         {
             int ithr = omp_get_thread_num();
-            if (ithr < num_blk_N) {
-                auto wid = num_blk_K * ithr;
-                auto* pw = p_weight + (ithr * BN) * stride / sizeof(T);
-                for (int k = 0; k < K; k += 256, wid++) {
-                    weights[wid] = jit_amx0.prepareB(pw + k, stride, BN, 256);
-                }
-                Cs[ithr].resize(256, BN);
+            int nthr = omp_get_num_threads();
+            int start, end;
+            splitter(num_blk_N, nthr, ithr, start, end);
+            auto& vw = weights[ithr];
+            start *= 32;
+            end *= 32;
+            int BN = end - start;
+            n_offsets[ithr] = start;
+
+            auto* pw = p_weight + start * stride / sizeof(T);
+            for (int k = 0; k < num_blk_K; k++) {
+                vw[k] = jit_amx0.prepareB(pw + k*256, stride, BN, 256);
             }
+            Cs[ithr].resize(BM, BN);
         }
     }
 
     // A bfloat16 [256,  num_blk_K * 256]
-    void run(uint8_t* pA, int strideA) {
+    void run(uint8_t* pA, int strideA, int M) {
 #pragma omp parallel
         {
-            int ni = omp_get_thread_num();
-            if (ni < num_blk_N) {
-                TileConfigScope tcfg(p_jit_amx0->m_tile_cfg);
-                tensor2D<float>& C = Cs[ni];
-                auto offset = ni * num_blk_K;
-                Linear32x32_AMX_mkernel* pkernel = p_jit_amx0;
-                for (int ki = 0; ki < num_blk_K; ki++) {
-                    auto wi = offset + ki;
-                    tensor2D<ov::bfloat16>& blockB = weights[wi];
-                    tensor2D<ov::bfloat16>& blockB1 = weights[(ki + 1) < num_blk_K ? (wi + 1) : wi];
+            int ithr = omp_get_thread_num();
+            int nthr = omp_get_num_threads();
+            int start, end;
+            splitter(num_blk_N, nthr, ithr, start, end);
+            auto& vw = weights[ithr];
+            start *= 32;
+            end *= 32;
 
-                    pkernel->run(pA + ki * 256 * sizeof(ov::bfloat16), strideA, blockB, reinterpret_cast<uint8_t*>(&C[0]), C.stride, reinterpret_cast<uint8_t*>(&blockB1[0]), 256);
-                    pkernel = p_jit_amx1;
-                }
+            TileConfigScope tcfg(p_jit_amx0->m_tile_cfg);
+            tensor2D<float>& C = Cs[ithr];
+            Linear32x32_AMX_mkernel* pkernel = p_jit_amx0;
+            for (int ki = 0; ki < num_blk_K; ki++) {
+                tensor2D<ov::bfloat16>& blockB = vw[ki];
+                tensor2D<ov::bfloat16>& blockB1 = vw[(ki + 1) < num_blk_K ? (ki + 1) : ki];
+
+                pkernel->run(M, pA + ki * 256 * sizeof(ov::bfloat16), strideA, blockB, reinterpret_cast<uint8_t*>(&C[0]), C.stride, reinterpret_cast<uint8_t*>(&blockB1[0]));
+                pkernel = p_jit_amx1;
             }
         }
     }
 };
 
-void test2(int K = 4096, int N = 11008) {
+void test2(int K = 4096, int N = 11008*2) {
     tensor2D<ov::bfloat16> A(256, K, true);
     tensor2D<ov::bfloat16> B(K, N, true);
     tensor2D<float> C0(256, N, true); // reference result
     tensor2D<float> C1(256, N, true); // reference result
 
     LinearAMX linear;
-    LinearAMX linear2;
+    std::vector<LinearAMX> allLinears(64);
 
     auto Bt = B.Tr();
-
     linear.setup(&Bt[0], Bt.stride, N, K);
-    linear2.setup(&Bt[0], Bt.stride, N, K);
+
+    for(int i = 0; i < allLinears.size(); i++) {
+        allLinears[i].setup(&Bt[0], Bt.stride, N, K);
+    }
 
     C0 = 0;
     matmul(A, B, C0);
@@ -586,14 +603,22 @@ void test2(int K = 4096, int N = 11008) {
         {PERF_TYPE_RAW, 0x21a6, "BOUND_ON_LOADS"},
     });
 
-    plog([&]() { linear.run(reinterpret_cast<uint8_t*>(&A[0]), A.stride); }, 256.0 * N * K * 2);
+    for(int i = 0; i < allLinears.size(); i++) {
+        plog([&]() { allLinears[i].run(reinterpret_cast<uint8_t*>(&A[0]), A.stride, 256); }, 256.0 * N * K * 2);
+    }
+    plog();
+    for(int i = 0; i < allLinears.size(); i++) {
+        plog([&]() { allLinears[i].run(reinterpret_cast<uint8_t*>(&A[0]), A.stride, 256); }, 256.0 * N * K * 2);
+    }
+
+    plog([&]() { linear.run(reinterpret_cast<uint8_t*>(&A[0]), A.stride, 256); }, 256.0 * N * K * 2);
 
     // concat all Cs into C1
     auto concat_Cs = [&]() {
         for (int i = 0; i < linear.Cs.size(); i++) {
             auto& blkC = linear.Cs[i];
             for (int r = 0; r < 256; r++) {
-                memcpy(&C1(r, i * 256), &blkC(r, 0), 256 * sizeof(float));
+                memcpy(&C1(r, linear.n_offsets[i]), &blkC(r, 0), blkC.dims[1] * sizeof(float));
             }
         }
     };
@@ -617,17 +642,21 @@ void test2(int K = 4096, int N = 11008) {
     }
     std::cout << acc << std::endl;
 
-    for (int i = 0; i < 5; i++) {
-        plog([&]() { linear.run(reinterpret_cast<uint8_t*>(&A[0]), A.stride); }, 256.0 * N * K * 2);
-        concat_Cs();
-    }
+    //for (int i = 0; i < 5; i++) {
+    //    plog([&]() { linear.run(reinterpret_cast<uint8_t*>(&A[0]), A.stride, 256); }, 256.0 * N * K * 2);
+    //   concat_Cs();
+    //}
 }
-#endif
+
+
+EnvVar BN("BN", 256);
+EnvVar BK("BK", 256);
+EnvVar NK("NK", 16);
 
 int main() {
     MSRConfig _msr;
     bool initAMX = initXTILE();
-    test(256, 256, 256);
-    //test2();
+    //test(256, (int)BK, (int)BN, (int)NK);
+    test2();
     return 0;
 }
