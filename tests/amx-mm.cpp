@@ -498,6 +498,81 @@ void test(int BM, int BK, int BN, const int num_AB_pairs = 43) {
     }
 }
 
+inline void exp_ps_avx512(__m512& src) {
+    static __m512 exp_ln_flt_min_f = _mm512_castsi512_ps(_mm512_set1_epi32(0xc2aeac50)); // log(FLT_MIN)
+    static __m512 exp_ln_flt_max_f = _mm512_castsi512_ps(_mm512_set1_epi32(0x42b17218)); // log(FLT_MAX)
+    static __m512 exp_log2ef = _mm512_castsi512_ps(_mm512_set1_epi32(0x3fb8aa3b));       // log2(e)
+    static __m512 half = _mm512_castsi512_ps(_mm512_set1_epi32(0x3f000000));             // 0.5f
+    static __m512 ln2f = _mm512_castsi512_ps(_mm512_set1_epi32(0x3f317218));             // ln(2)
+    static __m512 one = _mm512_castsi512_ps(_mm512_set1_epi32(0x3f800000));              // 1.0f
+    static __m512i exponent_bias = _mm512_set1_epi32(0x0000007f);                        // 127
+    static constexpr int n_mantissa_bits = 23;
+    static __m512 exp_pol1 = _mm512_castsi512_ps(_mm512_set1_epi32(0x3f7ffffb)); // p1 = 0.999999701f
+    static __m512 exp_pol2 = _mm512_castsi512_ps(_mm512_set1_epi32(0x3efffee3)); // p2 = 0.499991506f
+    static __m512 exp_pol3 = _mm512_castsi512_ps(_mm512_set1_epi32(0x3e2aad40)); // p3 = 0.166676521f
+    static __m512 exp_pol4 = _mm512_castsi512_ps(_mm512_set1_epi32(0x3d2b9d0d)); // p4 = 0.0418978221f
+    static __m512 exp_pol5 = _mm512_castsi512_ps(_mm512_set1_epi32(0x3c07cfce)); // p5 = 0.00828929059f
+    static __m512 two = _mm512_castsi512_ps(_mm512_set1_epi32(0x40000000));      // 2
+    // exp(x) =
+    // = exp(n * ln(2) + r) // divide x by ln(2) and get quot and rem
+    // = 2^n * exp(r)       // simplify the exp(n*ln(2)) expression
+
+    // get mask of values lower than log(FLT_MIN) to zero them in the output
+    auto zero_mask = _mm512_cmp_ps_mask(src, exp_ln_flt_min_f, _CMP_LT_OS);
+
+    // clip src
+    src = _mm512_min_ps(src, exp_ln_flt_max_f);
+    src = _mm512_max_ps(src, exp_ln_flt_min_f);
+
+    // aux1 : r
+    auto aux1 = src;
+
+    // calculate exp(x)
+    // fx = x * log2(e) + 0.5
+    src = _mm512_mul_ps(src, exp_log2ef);
+    src = _mm512_add_ps(src, half);
+
+    // tmp = floorf(fx)
+    src = _mm512_floor_ps(src);
+
+    // aux1 = x - fx * ln2
+    aux1 = _mm512_fnmadd_ps(src, ln2f, aux1);
+    // We do not count 2^n here, because n can reach 128 and 2^128 is not
+    // representable by fp32, so to get around this problem, instead of computing
+    // 2^n * exp(r) will be counted 2*2^(n-1)*exp(r), because 2^127
+    // and 2 are numbers representable in fp32.
+
+    // compute 2^(n-1)
+    src = _mm512_sub_ps(src, one);
+    auto aux2_i = _mm512_cvtps_epi32(src);
+    aux2_i = _mm512_add_epi32(aux2_i, exponent_bias);
+    aux2_i = _mm512_slli_epi32(aux2_i, n_mantissa_bits);
+
+    // set zeroes at those points which were < log(FLT_MIN)
+    auto zero = _mm512_setzero_ps();
+    auto aux2 = _mm512_mask_blend_ps(zero_mask, _mm512_castsi512_ps(aux2_i), zero);
+
+    // compute polynomial
+    src = exp_pol5;
+    src = _mm512_fmadd_ps(src, aux1, exp_pol4);
+    src = _mm512_fmadd_ps(src, aux1, exp_pol3);
+    src = _mm512_fmadd_ps(src, aux1, exp_pol2);
+    src = _mm512_fmadd_ps(src, aux1, exp_pol1);
+    src = _mm512_fmadd_ps(src, aux1, one);
+
+    // y = y * 2^n
+    src = _mm512_mul_ps(src, aux2);
+    src = _mm512_mul_ps(src, two);
+}
+
+inline __m512 silu_ps_avx512(const __m512 x) {
+    static __m512 one = _mm512_castsi512_ps(_mm512_set1_epi32(0x3f800000)); // 1.0f
+    auto negx = _mm512_sub_ps(_mm512_setzero_ps(), x);                      // -x
+    exp_ps_avx512(negx);                                                    // exp(-x)
+    auto sigmoidx = _mm512_rcp14_ps(_mm512_add_ps(one, negx));              // 1/[1+exp(-x)]
+    return _mm512_mul_ps(x, sigmoidx);
+}
+
 class LinearAMX {
 public:
     Linear32x32_AMX_mkernel* p_jit_amx0;
@@ -507,6 +582,8 @@ public:
     int num_blk_N;
     int num_blk_K;
     std::vector<tensor2D<float>> Cs; // per-thread result
+    std::vector<tensor2D<ov::bfloat16>> CsBF16;
+    tensor2D<ov::bfloat16> CdstBF16;
     std::vector<int> n_offsets;
 
     LinearAMX() {}
@@ -532,6 +609,7 @@ public:
             vw.resize(num_blk_K);
         }
         Cs.resize(num_blk_N);
+        CsBF16.resize(num_blk_N);
         n_offsets.resize(num_blk_N);
 #pragma omp parallel
         {
@@ -550,6 +628,7 @@ public:
                 vw[k] = jit_amx0.prepareB(pw + k*256, stride, BN, 256);
             }
             Cs[ithr].resize(BM, BN);
+            CsBF16[ithr].resize(BM, BN/2);
         }
     }
 
@@ -564,6 +643,38 @@ public:
             auto& vw = weights[ithr];
             start *= 32;
             end *= 32;
+            int BN = end - start;
+
+            TileConfigScope tcfg(p_jit_amx0->m_tile_cfg);
+            tensor2D<float>& C = Cs[ithr];
+            Linear32x32_AMX_mkernel* pkernel = p_jit_amx0;
+            for (int ki = 0; ki < num_blk_K; ki++) {
+                tensor2D<ov::bfloat16>& blockB = vw[ki];
+                tensor2D<ov::bfloat16>& blockB1 = vw[(ki + 1) < num_blk_K ? (ki + 1) : ki];
+
+                pkernel->run(M, pA + ki * 256 * sizeof(ov::bfloat16), strideA, blockB, reinterpret_cast<uint8_t*>(&C[0]), C.stride, reinterpret_cast<uint8_t*>(&blockB1[0]));
+                pkernel = p_jit_amx1;
+                // results of [M, BN] sub-block is ready in L2.
+                // Cs[ithr].resize(BM, BN);
+
+            }
+        }
+    }
+
+    // gate & up are interleaved: 16 gates + 16 up
+
+    void runGateUp(uint8_t* pA, int strideA, int M) {
+        CdstBF16.resize(M, num_blk_N*32);
+#pragma omp parallel
+        {
+            int ithr = omp_get_thread_num();
+            int nthr = omp_get_num_threads();
+            int start, end;
+            splitter(num_blk_N, nthr, ithr, start, end);
+            auto& vw = weights[ithr];
+            start *= 32;
+            end *= 32;
+            int BN = end - start;
 
             TileConfigScope tcfg(p_jit_amx0->m_tile_cfg);
             tensor2D<float>& C = Cs[ithr];
@@ -575,15 +686,42 @@ public:
                 pkernel->run(M, pA + ki * 256 * sizeof(ov::bfloat16), strideA, blockB, reinterpret_cast<uint8_t*>(&C[0]), C.stride, reinterpret_cast<uint8_t*>(&blockB1[0]));
                 pkernel = p_jit_amx1;
             }
+
+            // K reduce is done, results of [M, BN] sub-block is ready in L2.
+            tensor2D<ov::bfloat16>& Cbf16 = CsBF16[ithr];
+            // combine Gate & Up
+            auto* src = &C[0];
+            //auto* dst = &Cbf16[0];
+            auto* dst = &CdstBF16[start];
+            auto strideC = CdstBF16.stride/sizeof(ov::bfloat16);
+            for (int m = 0; m < M; m++, src += C.stride/sizeof(*src), dst += strideC) {
+
+                auto* prefetch_dst = (m+1 < M)? (dst + strideC):(dst);
+                for (int n = 0, i = 0; n < BN; n += 32, i+=16) {
+                    auto v_gate = _mm512_loadu_ps(src + n);
+                    auto v_up = _mm512_loadu_ps(src + n + 16);
+                    auto v1 = silu_ps_avx512(v_gate);
+                    v_up = _mm512_mul_ps(v1, v_up);
+                    auto v_bh = _mm512_cvtneps_pbh(v_up);
+                    // Greate Optimization:
+                    //  following prefetchnta prevents L2 HW prefetcher prefetch interleaved
+                    //  channels belonging to other cores which will causes too much cross-core cache coherent cost.
+                    _mm_prefetch(prefetch_dst + i, _MM_HINT_NTA);
+                    _mm256_storeu_si256(reinterpret_cast<__m256i *>(dst + i), reinterpret_cast<__m256i&>(v_bh));
+                }
+            }
         }
     }
 };
+
+
 
 void test2(int K = 4096, int N = 11008*2) {
     tensor2D<ov::bfloat16> A(256, K, true);
     tensor2D<ov::bfloat16> B(K, N, true);
     tensor2D<float> C0(256, N, true); // reference result
     tensor2D<float> C1(256, N, true); // reference result
+
 
     LinearAMX linear;
     std::vector<LinearAMX> allLinears(64);
@@ -604,11 +742,19 @@ void test2(int K = 4096, int N = 11008*2) {
     });
 
     for(int i = 0; i < allLinears.size(); i++) {
-        plog([&]() { allLinears[i].run(reinterpret_cast<uint8_t*>(&A[0]), A.stride, 256); }, 256.0 * N * K * 2);
+        plog([&]() { allLinears[i].runGateUp(reinterpret_cast<uint8_t*>(&A[0]), A.stride, 256); }, 256.0 * N * K * 2);
     }
     plog();
     for(int i = 0; i < allLinears.size(); i++) {
-        plog([&]() { allLinears[i].run(reinterpret_cast<uint8_t*>(&A[0]), A.stride, 256); }, 256.0 * N * K * 2);
+        plog([&]() { allLinears[i].runGateUp(reinterpret_cast<uint8_t*>(&A[0]), A.stride, 256); }, 256.0 * N * K * 2);
+    }
+    #pragma omp parallel
+    {
+        clr_cache();
+    }
+    plog();
+    for(int i = 0; i < allLinears.size(); i++) {
+        plog([&]() { allLinears[i].runGateUp(reinterpret_cast<uint8_t*>(&A[0]), A.stride, 256); }, 256.0 * N * K * 2);
     }
 
     plog([&]() { linear.run(reinterpret_cast<uint8_t*>(&A[0]), A.stride, 256); }, 256.0 * N * K * 2);
