@@ -327,15 +327,15 @@ public:
     // since it's done in unit of 32-rows
     // but prefetch of next B must be specified by caller.
     //
-    void run(int M,                                 // actual M
-             uint8_t* pA, int strideA,              // A [M, K]
-             tensor2D<ov::bfloat16>& repacked_B,    // B [N/32, K*32]
-             uint8_t* pC, int strideC,              // C [M, N]
-             uint8_t* prefetch_B                    // prefetch B
+    void run(int M,                              // actual M
+             uint8_t* pA, int strideA,           // A [M, K]
+             tensor2D<ov::bfloat16>& repacked_B, // B [N/32, K*32]
+             uint8_t* pC, int strideC,           // C [M, N]
+             uint8_t* prefetch_B                 // prefetch B
     ) {
         // number of blocks in N dimension (in unit of 32 columns)
         auto num_blkN = repacked_B.dims[0];
-        auto K = repacked_B.dims[1]/32;
+        auto K = repacked_B.dims[1] / 32;
         auto* pB = reinterpret_cast<uint8_t*>(&repacked_B[0]);
         auto strideB = repacked_B.stride;
         m_ktiles = K / 32;
@@ -350,7 +350,7 @@ public:
             // prefetch_next_A_addr = pA + 32 * strideA;
             // if (m + 32 >= BM)
             //     prefetch_next_A_addr = pA;
-            for (int ni = 0; ni < num_blkN; ni ++, pB1 += strideB, prefetch_B += prefetch_step) {
+            for (int ni = 0; ni < num_blkN; ni++, pB1 += strideB, prefetch_B += prefetch_step) {
                 (*this)(pA, strideA, pB1, pC + ni * 32 * sizeof(float), strideC, prefetch_B);
                 // prefetch_next_A_addr += 4 * strideA;
             }
@@ -383,10 +383,9 @@ void test(int BM, int BK, int BN, const int num_AB_pairs = 43) {
     auto strideB = (BK / 32) * 2048;
     {
         TileConfigScope tcfg(jit_amx.m_tile_cfg);
-        jit_amx.run(BM,
-                    reinterpret_cast<uint8_t*>(&A[0]), A.stride,   //
-                    B1,                                            //
-                    reinterpret_cast<uint8_t*>(&C1[0]), C1.stride, //
+        jit_amx.run(BM, reinterpret_cast<uint8_t*>(&A[0]), A.stride, //
+                    B1,                                              //
+                    reinterpret_cast<uint8_t*>(&C1[0]), C1.stride,   //
                     reinterpret_cast<uint8_t*>(&B1[0]));
     }
 
@@ -469,7 +468,8 @@ void test(int BM, int BK, int BN, const int num_AB_pairs = 43) {
                     auto r1 = r + 1;
                     tensor2D<ov::bfloat16>& blockB1 = B1s[r1 < B1s.size() ? r1 : r];
 
-                    pkernel->run(BM, reinterpret_cast<uint8_t*>(&blockA[0]), blockA.stride, blockB, reinterpret_cast<uint8_t*>(&C2[0]), C2.stride, reinterpret_cast<uint8_t*>(&blockB1[0]));
+                    pkernel->run(BM, reinterpret_cast<uint8_t*>(&blockA[0]), blockA.stride, blockB, reinterpret_cast<uint8_t*>(&C2[0]), C2.stride,
+                                 reinterpret_cast<uint8_t*>(&blockB1[0]));
                     pkernel = &jit_amx1;
                 }
             },
@@ -489,7 +489,8 @@ void test(int BM, int BK, int BN, const int num_AB_pairs = 43) {
                     auto r1 = r + 1;
                     tensor2D<ov::bfloat16>& blockB1 = B1s[r1 < B1s.size() ? r1 : r];
 
-                    pkernel->run(BM, reinterpret_cast<uint8_t*>(&blockA[0]), blockA.stride, blockB, reinterpret_cast<uint8_t*>(&C2[0]), C2.stride, reinterpret_cast<uint8_t*>(&blockB1[0]));
+                    pkernel->run(BM, reinterpret_cast<uint8_t*>(&blockA[0]), blockA.stride, blockB, reinterpret_cast<uint8_t*>(&C2[0]), C2.stride,
+                                 reinterpret_cast<uint8_t*>(&blockB1[0]));
                     pkernel = &jit_amx1;
                 }
             },
@@ -582,8 +583,6 @@ public:
     int num_blk_N;
     int num_blk_K;
     std::vector<tensor2D<float>> Cs; // per-thread result
-    std::vector<tensor2D<ov::bfloat16>> CsBF16;
-    tensor2D<ov::bfloat16> CdstBF16;
     std::vector<int> n_offsets;
 
     LinearAMX() {}
@@ -605,11 +604,10 @@ public:
         num_blk_N = N / 32;
         num_blk_K = K / 256;
         weights.resize(nthr);
-        for(auto& vw : weights) {
+        for (auto& vw : weights) {
             vw.resize(num_blk_K);
         }
         Cs.resize(num_blk_N);
-        CsBF16.resize(num_blk_N);
         n_offsets.resize(num_blk_N);
 #pragma omp parallel
         {
@@ -625,10 +623,9 @@ public:
 
             auto* pw = p_weight + start * stride / sizeof(T);
             for (int k = 0; k < num_blk_K; k++) {
-                vw[k] = jit_amx0.prepareB(pw + k*256, stride, BN, 256);
+                vw[k] = jit_amx0.prepareB(pw + k * 256, stride, BN, 256);
             }
             Cs[ithr].resize(BM, BN);
-            CsBF16[ithr].resize(BM, BN/2);
         }
     }
 
@@ -652,19 +649,16 @@ public:
                 tensor2D<ov::bfloat16>& blockB = vw[ki];
                 tensor2D<ov::bfloat16>& blockB1 = vw[(ki + 1) < num_blk_K ? (ki + 1) : ki];
 
-                pkernel->run(M, pA + ki * 256 * sizeof(ov::bfloat16), strideA, blockB, reinterpret_cast<uint8_t*>(&C[0]), C.stride, reinterpret_cast<uint8_t*>(&blockB1[0]));
+                pkernel->run(M, pA + ki * 256 * sizeof(ov::bfloat16), strideA, blockB, reinterpret_cast<uint8_t*>(&C[0]), C.stride,
+                             reinterpret_cast<uint8_t*>(&blockB1[0]));
                 pkernel = p_jit_amx1;
                 // results of [M, BN] sub-block is ready in L2.
                 // Cs[ithr].resize(BM, BN);
-
             }
         }
     }
 
-    // gate & up are interleaved: 16 gates + 16 up
-
-    void runGateUp(uint8_t* pA, int strideA, int M) {
-        CdstBF16.resize(M, num_blk_N*32);
+    void run(uint8_t* pA, int strideA, int M, float* dstC, int strideC) {
 #pragma omp parallel
         {
             int ithr = omp_get_thread_num();
@@ -683,21 +677,64 @@ public:
                 tensor2D<ov::bfloat16>& blockB = vw[ki];
                 tensor2D<ov::bfloat16>& blockB1 = vw[(ki + 1) < num_blk_K ? (ki + 1) : ki];
 
-                pkernel->run(M, pA + ki * 256 * sizeof(ov::bfloat16), strideA, blockB, reinterpret_cast<uint8_t*>(&C[0]), C.stride, reinterpret_cast<uint8_t*>(&blockB1[0]));
+                pkernel->run(M, pA + ki * 256 * sizeof(ov::bfloat16), strideA, blockB, reinterpret_cast<uint8_t*>(&C[0]), C.stride,
+                             reinterpret_cast<uint8_t*>(&blockB1[0]));
+                pkernel = p_jit_amx1;
+            }
+            auto* src = &C[0];
+            auto* dst = dstC + start;
+            auto strideS = C.stride / sizeof(*src);
+            auto strideD = strideC / sizeof(*dst);
+            for (int m = 0; m < M; m++, src += strideS, dst += strideD) {
+                auto* prefetch_dst = (m + 1 < M) ? (dst + strideD) : (dst);
+                for (int n = 0; n < BN; n += 32) {
+                    auto d0 = _mm512_loadu_ps(src + n);
+                    auto d1 = _mm512_loadu_ps(src + n + 16);
+                    _mm_prefetch(prefetch_dst + n, _MM_HINT_NTA);
+                    _mm_prefetch(prefetch_dst + n + 16, _MM_HINT_NTA);
+                    _mm512_storeu_ps(dst + n, d0);
+                    _mm512_storeu_ps(dst + n + 16, d1);
+                }
+            }
+        }
+    }
+
+    // gate & up are interleaved: 16 gates + 16 up
+
+    void runGateUp(uint8_t* pA, int strideA, int M, ov::bfloat16* dstC, int strideC) {
+#pragma omp parallel
+        {
+            int ithr = omp_get_thread_num();
+            int nthr = omp_get_num_threads();
+            int start, end;
+            splitter(num_blk_N, nthr, ithr, start, end);
+            auto& vw = weights[ithr];
+            start *= 32;
+            end *= 32;
+            int BN = end - start;
+
+            TileConfigScope tcfg(p_jit_amx0->m_tile_cfg);
+            tensor2D<float>& C = Cs[ithr];
+            Linear32x32_AMX_mkernel* pkernel = p_jit_amx0;
+            for (int ki = 0; ki < num_blk_K; ki++) {
+                tensor2D<ov::bfloat16>& blockB = vw[ki];
+                tensor2D<ov::bfloat16>& blockB1 = vw[(ki + 1) < num_blk_K ? (ki + 1) : ki];
+
+                pkernel->run(M, pA + ki * 256 * sizeof(ov::bfloat16), strideA, blockB, reinterpret_cast<uint8_t*>(&C[0]), C.stride,
+                             reinterpret_cast<uint8_t*>(&blockB1[0]));
                 pkernel = p_jit_amx1;
             }
 
             // K reduce is done, results of [M, BN] sub-block is ready in L2.
-            tensor2D<ov::bfloat16>& Cbf16 = CsBF16[ithr];
             // combine Gate & Up
             auto* src = &C[0];
-            //auto* dst = &Cbf16[0];
-            auto* dst = &CdstBF16[start];
-            auto strideC = CdstBF16.stride/sizeof(ov::bfloat16);
-            for (int m = 0; m < M; m++, src += C.stride/sizeof(*src), dst += strideC) {
-
-                auto* prefetch_dst = (m+1 < M)? (dst + strideC):(dst);
-                for (int n = 0, i = 0; n < BN; n += 32, i+=16) {
+            //tensor2D<ov::bfloat16>& Cbf16 = CsBF16[ithr];
+            // auto* dst = &Cbf16[0];
+            auto* dst = dstC + start;
+            strideC /= sizeof(ov::bfloat16);
+            for (int m = 0; m < M; m++, src += C.stride / sizeof(*src), dst += strideC) {
+                auto* prefetch_dst = (m + 1 < M) ? (dst + strideC) : (dst);
+                for (int n = 0, i = 0; n < BN; n += 32, i += 16) {
                     auto v_gate = _mm512_loadu_ps(src + n);
                     auto v_up = _mm512_loadu_ps(src + n + 16);
                     auto v1 = silu_ps_avx512(v_gate);
@@ -707,21 +744,19 @@ public:
                     //  following prefetchnta prevents L2 HW prefetcher prefetch interleaved
                     //  channels belonging to other cores which will causes too much cross-core cache coherent cost.
                     _mm_prefetch(prefetch_dst + i, _MM_HINT_NTA);
-                    _mm256_storeu_si256(reinterpret_cast<__m256i *>(dst + i), reinterpret_cast<__m256i&>(v_bh));
+                    _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + i), reinterpret_cast<__m256i&>(v_bh));
                 }
             }
         }
     }
 };
 
-
-
-void test2(int K = 4096, int N = 11008*2) {
+void test2(int K = 4096, int N = 11008 * 2) {
     tensor2D<ov::bfloat16> A(256, K, true);
     tensor2D<ov::bfloat16> B(K, N, true);
     tensor2D<float> C0(256, N, true); // reference result
     tensor2D<float> C1(256, N, true); // reference result
-
+    tensor2D<ov::bfloat16> CGateUp(256, N, true);
 
     LinearAMX linear;
     std::vector<LinearAMX> allLinears(64);
@@ -729,7 +764,7 @@ void test2(int K = 4096, int N = 11008*2) {
     auto Bt = B.Tr();
     linear.setup(&Bt[0], Bt.stride, N, K);
 
-    for(int i = 0; i < allLinears.size(); i++) {
+    for (int i = 0; i < allLinears.size(); i++) {
         allLinears[i].setup(&Bt[0], Bt.stride, N, K);
     }
 
@@ -741,34 +776,30 @@ void test2(int K = 4096, int N = 11008*2) {
         {PERF_TYPE_RAW, 0x21a6, "BOUND_ON_LOADS"},
     });
 
-    for(int i = 0; i < allLinears.size(); i++) {
-        plog([&]() { allLinears[i].runGateUp(reinterpret_cast<uint8_t*>(&A[0]), A.stride, 256); }, 256.0 * N * K * 2);
+    for (int i = 0; i < allLinears.size(); i++) {
+        plog([&]() { allLinears[i].runGateUp(reinterpret_cast<uint8_t*>(&A[0]), A.stride, 256, &CGateUp[0], CGateUp.stride); }, 256.0 * N * K * 2);
     }
     plog();
-    for(int i = 0; i < allLinears.size(); i++) {
-        plog([&]() { allLinears[i].runGateUp(reinterpret_cast<uint8_t*>(&A[0]), A.stride, 256); }, 256.0 * N * K * 2);
+    for (int i = 0; i < allLinears.size(); i++) {
+        plog([&]() { allLinears[i].runGateUp(reinterpret_cast<uint8_t*>(&A[0]), A.stride, 256, &CGateUp[0], CGateUp.stride); }, 256.0 * N * K * 2);
     }
-    #pragma omp parallel
-    {
-        clr_cache();
-    }
+#pragma omp parallel
+    { clr_cache(); }
     plog();
-    for(int i = 0; i < allLinears.size(); i++) {
-        plog([&]() { allLinears[i].runGateUp(reinterpret_cast<uint8_t*>(&A[0]), A.stride, 256); }, 256.0 * N * K * 2);
+    for (int i = 0; i < allLinears.size(); i++) {
+        plog([&]() { allLinears[i].runGateUp(reinterpret_cast<uint8_t*>(&A[0]), A.stride, 256, &CGateUp[0], CGateUp.stride); }, 256.0 * N * K * 2);
     }
+    for(int i = 0; i < 2; i++) {
+        plog("---------- with concat ----------");
+        plog([&]() { linear.run(reinterpret_cast<uint8_t*>(&A[0]), A.stride, 256, &C1[0], C1.stride); }, 256.0 * N * K * 2);
+        plog([&]() { linear.run(reinterpret_cast<uint8_t*>(&A[0]), A.stride, 256, &C1[0], C1.stride); }, 256.0 * N * K * 2);
+        plog([&]() { linear.run(reinterpret_cast<uint8_t*>(&A[0]), A.stride, 256, &C1[0], C1.stride); }, 256.0 * N * K * 2);
 
-    plog([&]() { linear.run(reinterpret_cast<uint8_t*>(&A[0]), A.stride, 256); }, 256.0 * N * K * 2);
-
-    // concat all Cs into C1
-    auto concat_Cs = [&]() {
-        for (int i = 0; i < linear.Cs.size(); i++) {
-            auto& blkC = linear.Cs[i];
-            for (int r = 0; r < 256; r++) {
-                memcpy(&C1(r, linear.n_offsets[i]), &blkC(r, 0), blkC.dims[1] * sizeof(float));
-            }
-        }
-    };
-    concat_Cs();
+        plog("---------- no concat ----------");
+        plog([&]() { linear.run(reinterpret_cast<uint8_t*>(&A[0]), A.stride, 256); }, 256.0 * N * K * 2);
+        plog([&]() { linear.run(reinterpret_cast<uint8_t*>(&A[0]), A.stride, 256); }, 256.0 * N * K * 2);
+        plog([&]() { linear.run(reinterpret_cast<uint8_t*>(&A[0]), A.stride, 256); }, 256.0 * N * K * 2);
+    }
 
     std::string acc;
     const char* acc_color = nullptr;
@@ -786,14 +817,13 @@ void test2(int K = 4096, int N = 11008*2) {
         acc = "[FAIL]";
         acc_color = "1;31";
     }
-    std::cout << acc << std::endl;
-
-    //for (int i = 0; i < 5; i++) {
-    //    plog([&]() { linear.run(reinterpret_cast<uint8_t*>(&A[0]), A.stride, 256); }, 256.0 * N * K * 2);
-    //   concat_Cs();
-    //}
+    plog.tag("", 256, K, N, acc);
+    plog.color(acc_color);
+    // for (int i = 0; i < 5; i++) {
+    //     plog([&]() { linear.run(reinterpret_cast<uint8_t*>(&A[0]), A.stride, 256); }, 256.0 * N * K * 2);
+    //    concat_Cs();
+    // }
 }
-
 
 EnvVar BN("BN", 256);
 EnvVar BK("BK", 256);
@@ -802,7 +832,7 @@ EnvVar NK("NK", 16);
 int main() {
     MSRConfig _msr;
     bool initAMX = initXTILE();
-    //test(256, (int)BK, (int)BN, (int)NK);
+    // test(256, (int)BK, (int)BN, (int)NK);
     test2();
     return 0;
 }

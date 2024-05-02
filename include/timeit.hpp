@@ -183,14 +183,14 @@ struct perf_log {
     }
 
     // add empty separator log
-    void operator()() {
+    void operator()(const char * info = "-------------------------------------------") {
         int ithr = omp_get_thread_num();
         auto ev_offset = ithr * m_events;
 
         auto* log = &m_counters[m_count.fetch_add(3 + m_events)];
         log[m_events] = 0;
         log[m_events + 1] = ithr;
-        log[m_events + 2] = 0;
+        log[m_events + 2] = reinterpret_cast<uintptr_t>(info);
     }
 
     ~perf_log() {
@@ -219,7 +219,7 @@ struct perf_log {
 
                 std::cout << std::fixed << std::setprecision(2) << ansi_color << std::setw(4) << round << std::setw(6) << ithr << std::setw(8);
                 if (dt == 0) {
-                    std::cout << "-------------------------------------------" << ANSIcolor() << std::endl;
+                    std::cout << reinterpret_cast<const char*>(opsPerCall) << ANSIcolor() << std::endl;
                     continue;
                 }
 
