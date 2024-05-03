@@ -38,8 +38,8 @@ static tensor2D<ov::bfloat16> repack_weights(tensor2D<ov::bfloat16>& Bt) {
     return BPacked;
 }
 
-EnvVar NOSWPF("NOSWPF", 0);
 EnvVar SWPFA("SWPFA", 0); // prefetch A is slower, so disable it
+EnvVar MHINT("MHINT", 256);
 
 class Linear32x32_AMX_mkernel : public jit_generator {
 public:
@@ -93,9 +93,9 @@ public:
     void setup(int M_hint = 0, //  M_hint is only a hint for prefetching, set to 0 to avoid prefetch
                bool do_accumulation = false) {
         m_do_accumulation = do_accumulation;
-        m_BM_hint = M_hint;
+        m_BM_hint = MHINT; //M_hint;
 
-        if (m_BM_hint == 0 || NOSWPF) {
+        if (m_BM_hint == 0) {
             m_prefetch_Blines = 0;
         } else {
             m_prefetch_Blines = 32768 * sizeof(ov::bfloat16) / 64 / m_BM_hint;
@@ -576,56 +576,72 @@ inline __m512 silu_ps_avx512(const __m512 x) {
 
 class LinearAMX {
 public:
-    Linear32x32_AMX_mkernel* p_jit_amx0;
-    Linear32x32_AMX_mkernel* p_jit_amx1;
 
-    std::vector<std::vector<tensor2D<ov::bfloat16>>> weights;
-    int num_blk_N;
-    int num_blk_K;
-    std::vector<tensor2D<float>> Cs; // per-thread result
-    std::vector<int> n_offsets;
+    struct Work {
+        Linear32x32_AMX_mkernel* p_jit_amx0;
+        Linear32x32_AMX_mkernel* p_jit_amx1;
+        std::vector<tensor2D<ov::bfloat16>> weights;
+        tensor2D<float> C;
+        int start;
+        int end;
+
+        void run(int M, uint8_t * pA, int strideA) {
+            int num_blk_K = weights.size();
+            int BN = end - start;
+            C.resize(M, BN);
+
+            TileConfigScope tcfg(p_jit_amx0->m_tile_cfg);
+            Linear32x32_AMX_mkernel* pkernel = p_jit_amx0;
+            for (int ki = 0; ki < num_blk_K; ki++) {
+                tensor2D<ov::bfloat16>& blockB = weights[ki];
+                tensor2D<ov::bfloat16>& blockB1 = weights[(ki + 1) < num_blk_K ? (ki + 1) : ki];
+
+                pkernel->run(M, pA + ki * 256 * sizeof(ov::bfloat16), strideA, blockB, reinterpret_cast<uint8_t*>(&C[0]), C.stride,
+                             reinterpret_cast<uint8_t*>(&blockB1[0]));
+                pkernel = p_jit_amx1;
+            }
+        }
+    };
+    std::vector<Work> works;
 
     LinearAMX() {}
 
     // weight [N, K]
 
-    template <typename T, int BM = 256>
+    template <typename T, int BM = 192>
     void setup(T* p_weight, int stride, int N, int K) {
         static Linear32x32_AMX_mkernel jit_amx0(BM, false);
         static Linear32x32_AMX_mkernel jit_amx1(BM, true);
-        p_jit_amx0 = &jit_amx0;
-        p_jit_amx1 = &jit_amx1;
 
         // prepare weights, split N among threads
         // in unit of 32
         ASSERT((N % 32) == 0);
         ASSERT((K % 256) == 0);
         auto nthr = get_nthr();
-        num_blk_N = N / 32;
-        num_blk_K = K / 256;
-        weights.resize(nthr);
-        for (auto& vw : weights) {
-            vw.resize(num_blk_K);
-        }
-        Cs.resize(num_blk_N);
-        n_offsets.resize(num_blk_N);
+        auto num_blk_N = N / 32;
+        auto num_blk_K = K / 256;
+        works.resize(nthr);
+
 #pragma omp parallel
         {
             int ithr = omp_get_thread_num();
             int nthr = omp_get_num_threads();
             int start, end;
             splitter(num_blk_N, nthr, ithr, start, end);
-            auto& vw = weights[ithr];
+            auto& work = works[ithr];
             start *= 32;
             end *= 32;
             int BN = end - start;
-            n_offsets[ithr] = start;
+            work.start = start;
+            work.end = end;
+            work.weights.resize(num_blk_K);
+            work.p_jit_amx0 = &jit_amx0;
+            work.p_jit_amx1 = &jit_amx1;
 
             auto* pw = p_weight + start * stride / sizeof(T);
             for (int k = 0; k < num_blk_K; k++) {
-                vw[k] = jit_amx0.prepareB(pw + k * 256, stride, BN, 256);
+                work.weights[k] = jit_amx0.prepareB(pw + k * 256, stride, BN, 256);
             }
-            Cs[ithr].resize(BM, BN);
         }
     }
 
@@ -634,27 +650,7 @@ public:
 #pragma omp parallel
         {
             int ithr = omp_get_thread_num();
-            int nthr = omp_get_num_threads();
-            int start, end;
-            splitter(num_blk_N, nthr, ithr, start, end);
-            auto& vw = weights[ithr];
-            start *= 32;
-            end *= 32;
-            int BN = end - start;
-
-            TileConfigScope tcfg(p_jit_amx0->m_tile_cfg);
-            tensor2D<float>& C = Cs[ithr];
-            Linear32x32_AMX_mkernel* pkernel = p_jit_amx0;
-            for (int ki = 0; ki < num_blk_K; ki++) {
-                tensor2D<ov::bfloat16>& blockB = vw[ki];
-                tensor2D<ov::bfloat16>& blockB1 = vw[(ki + 1) < num_blk_K ? (ki + 1) : ki];
-
-                pkernel->run(M, pA + ki * 256 * sizeof(ov::bfloat16), strideA, blockB, reinterpret_cast<uint8_t*>(&C[0]), C.stride,
-                             reinterpret_cast<uint8_t*>(&blockB1[0]));
-                pkernel = p_jit_amx1;
-                // results of [M, BN] sub-block is ready in L2.
-                // Cs[ithr].resize(BM, BN);
-            }
+            works[ithr].run(M, pA, strideA);
         }
     }
 
@@ -662,36 +658,22 @@ public:
 #pragma omp parallel
         {
             int ithr = omp_get_thread_num();
-            int nthr = omp_get_num_threads();
-            int start, end;
-            splitter(num_blk_N, nthr, ithr, start, end);
-            auto& vw = weights[ithr];
-            start *= 32;
-            end *= 32;
-            int BN = end - start;
-
-            TileConfigScope tcfg(p_jit_amx0->m_tile_cfg);
-            tensor2D<float>& C = Cs[ithr];
-            Linear32x32_AMX_mkernel* pkernel = p_jit_amx0;
-            for (int ki = 0; ki < num_blk_K; ki++) {
-                tensor2D<ov::bfloat16>& blockB = vw[ki];
-                tensor2D<ov::bfloat16>& blockB1 = vw[(ki + 1) < num_blk_K ? (ki + 1) : ki];
-
-                pkernel->run(M, pA + ki * 256 * sizeof(ov::bfloat16), strideA, blockB, reinterpret_cast<uint8_t*>(&C[0]), C.stride,
-                             reinterpret_cast<uint8_t*>(&blockB1[0]));
-                pkernel = p_jit_amx1;
-            }
-            auto* src = &C[0];
-            auto* dst = dstC + start;
-            auto strideS = C.stride / sizeof(*src);
+            auto& work = works[ithr];
+            work.run(M, pA, strideA);
+            auto* src = &work.C[0];
+            auto BN = work.end - work.start;
+            auto* dst = dstC + work.start;
+            auto strideS = work.C.stride / sizeof(*src);
             auto strideD = strideC / sizeof(*dst);
             for (int m = 0; m < M; m++, src += strideS, dst += strideD) {
-                auto* prefetch_dst = (m + 1 < M) ? (dst + strideD) : (dst);
+                // the prefetch distance is increased to ensure by the time store happens
+                // prefetch has done and no HW prefetcher is triggered
+                auto* prefetch_dst = (m + 2 < M) ? (dst + 2*strideD) : (dst);
                 for (int n = 0; n < BN; n += 32) {
                     auto d0 = _mm512_loadu_ps(src + n);
                     auto d1 = _mm512_loadu_ps(src + n + 16);
-                    _mm_prefetch(prefetch_dst + n, _MM_HINT_NTA);
-                    _mm_prefetch(prefetch_dst + n + 16, _MM_HINT_NTA);
+                    _mm_prefetch(prefetch_dst + n, _MM_HINT_ET1);
+                    _mm_prefetch(prefetch_dst + n + 16, _MM_HINT_ET1);
                     _mm512_storeu_ps(dst + n, d0);
                     _mm512_storeu_ps(dst + n + 16, d1);
                 }
@@ -705,35 +687,18 @@ public:
 #pragma omp parallel
         {
             int ithr = omp_get_thread_num();
-            int nthr = omp_get_num_threads();
-            int start, end;
-            splitter(num_blk_N, nthr, ithr, start, end);
-            auto& vw = weights[ithr];
-            start *= 32;
-            end *= 32;
-            int BN = end - start;
-
-            TileConfigScope tcfg(p_jit_amx0->m_tile_cfg);
-            tensor2D<float>& C = Cs[ithr];
-            Linear32x32_AMX_mkernel* pkernel = p_jit_amx0;
-            for (int ki = 0; ki < num_blk_K; ki++) {
-                tensor2D<ov::bfloat16>& blockB = vw[ki];
-                tensor2D<ov::bfloat16>& blockB1 = vw[(ki + 1) < num_blk_K ? (ki + 1) : ki];
-
-                pkernel->run(M, pA + ki * 256 * sizeof(ov::bfloat16), strideA, blockB, reinterpret_cast<uint8_t*>(&C[0]), C.stride,
-                             reinterpret_cast<uint8_t*>(&blockB1[0]));
-                pkernel = p_jit_amx1;
-            }
+            auto& work = works[ithr];
+            work.run(M, pA, strideA);
 
             // K reduce is done, results of [M, BN] sub-block is ready in L2.
             // combine Gate & Up
-            auto* src = &C[0];
-            //tensor2D<ov::bfloat16>& Cbf16 = CsBF16[ithr];
-            // auto* dst = &Cbf16[0];
-            auto* dst = dstC + start;
-            strideC /= sizeof(ov::bfloat16);
-            for (int m = 0; m < M; m++, src += C.stride / sizeof(*src), dst += strideC) {
-                auto* prefetch_dst = (m + 1 < M) ? (dst + strideC) : (dst);
+            auto* src = &work.C[0];
+            auto strideS = work.C.stride / sizeof(*src);
+            auto BN = work.end - work.start;
+            auto* dst = dstC + work.start;
+            auto strideD = strideC / sizeof(*dst);
+            for (int m = 0; m < M; m++, src += strideS, dst += strideD) {
+                auto* prefetch_dst = (m + 1 < M) ? (dst + strideD) : (dst);
                 for (int n = 0, i = 0; n < BN; n += 32, i += 16) {
                     auto v_gate = _mm512_loadu_ps(src + n);
                     auto v_up = _mm512_loadu_ps(src + n + 16);
@@ -743,7 +708,7 @@ public:
                     // Greate Optimization:
                     //  following prefetchnta prevents L2 HW prefetcher prefetch interleaved
                     //  channels belonging to other cores which will causes too much cross-core cache coherent cost.
-                    _mm_prefetch(prefetch_dst + i, _MM_HINT_NTA);
+                    _mm_prefetch(prefetch_dst + i, _MM_HINT_ET1);
                     _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + i), reinterpret_cast<__m256i&>(v_bh));
                 }
             }
@@ -751,15 +716,15 @@ public:
     }
 };
 
-void test2(int K = 4096, int N = 11008 * 2) {
-    tensor2D<ov::bfloat16> A(256, K, true);
+void test2(int BM = 256, int K = 4096, int N = 11008 * 2) {
+    tensor2D<ov::bfloat16> A(BM, K, true);
     tensor2D<ov::bfloat16> B(K, N, true);
-    tensor2D<float> C0(256, N, true); // reference result
-    tensor2D<float> C1(256, N, true); // reference result
-    tensor2D<ov::bfloat16> CGateUp(256, N, true);
+    tensor2D<float> C0(BM, N, true); // reference result
+    tensor2D<float> C1(BM, N, true); // reference result
+    tensor2D<ov::bfloat16> CGateUp(BM, N, true);
 
     LinearAMX linear;
-    std::vector<LinearAMX> allLinears(64);
+    std::vector<LinearAMX> allLinears(128);
 
     auto Bt = B.Tr();
     linear.setup(&Bt[0], Bt.stride, N, K);
@@ -777,28 +742,28 @@ void test2(int K = 4096, int N = 11008 * 2) {
     });
 
     for (int i = 0; i < allLinears.size(); i++) {
-        plog([&]() { allLinears[i].runGateUp(reinterpret_cast<uint8_t*>(&A[0]), A.stride, 256, &CGateUp[0], CGateUp.stride); }, 256.0 * N * K * 2);
+        plog([&]() { allLinears[i].runGateUp(reinterpret_cast<uint8_t*>(&A[0]), A.stride, BM, &CGateUp[0], CGateUp.stride); }, 2.0 * BM * N * K);
     }
     plog();
     for (int i = 0; i < allLinears.size(); i++) {
-        plog([&]() { allLinears[i].runGateUp(reinterpret_cast<uint8_t*>(&A[0]), A.stride, 256, &CGateUp[0], CGateUp.stride); }, 256.0 * N * K * 2);
+        plog([&]() { allLinears[i].runGateUp(reinterpret_cast<uint8_t*>(&A[0]), A.stride, BM, &CGateUp[0], CGateUp.stride); }, 2.0 * BM * N * K);
     }
 #pragma omp parallel
     { clr_cache(); }
     plog();
     for (int i = 0; i < allLinears.size(); i++) {
-        plog([&]() { allLinears[i].runGateUp(reinterpret_cast<uint8_t*>(&A[0]), A.stride, 256, &CGateUp[0], CGateUp.stride); }, 256.0 * N * K * 2);
+        plog([&]() { allLinears[i].runGateUp(reinterpret_cast<uint8_t*>(&A[0]), A.stride, BM, &CGateUp[0], CGateUp.stride); }, 2.0 * BM * N * K);
     }
-    for(int i = 0; i < 2; i++) {
+    for (int i = 0; i < 2; i++) {
         plog("---------- with concat ----------");
-        plog([&]() { linear.run(reinterpret_cast<uint8_t*>(&A[0]), A.stride, 256, &C1[0], C1.stride); }, 256.0 * N * K * 2);
-        plog([&]() { linear.run(reinterpret_cast<uint8_t*>(&A[0]), A.stride, 256, &C1[0], C1.stride); }, 256.0 * N * K * 2);
-        plog([&]() { linear.run(reinterpret_cast<uint8_t*>(&A[0]), A.stride, 256, &C1[0], C1.stride); }, 256.0 * N * K * 2);
+        plog([&]() { linear.run(reinterpret_cast<uint8_t*>(&A[0]), A.stride, BM, &C1[0], C1.stride); }, 2.0 * BM * N * K);
+        plog([&]() { linear.run(reinterpret_cast<uint8_t*>(&A[0]), A.stride, BM, &C1[0], C1.stride); }, 2.0 * BM * N * K);
+        plog([&]() { linear.run(reinterpret_cast<uint8_t*>(&A[0]), A.stride, BM, &C1[0], C1.stride); }, 2.0 * BM * N * K);
 
         plog("---------- no concat ----------");
-        plog([&]() { linear.run(reinterpret_cast<uint8_t*>(&A[0]), A.stride, 256); }, 256.0 * N * K * 2);
-        plog([&]() { linear.run(reinterpret_cast<uint8_t*>(&A[0]), A.stride, 256); }, 256.0 * N * K * 2);
-        plog([&]() { linear.run(reinterpret_cast<uint8_t*>(&A[0]), A.stride, 256); }, 256.0 * N * K * 2);
+        plog([&]() { linear.run(reinterpret_cast<uint8_t*>(&A[0]), A.stride, BM); }, 2.0 * BM * N * K);
+        plog([&]() { linear.run(reinterpret_cast<uint8_t*>(&A[0]), A.stride, BM); }, 2.0 * BM * N * K);
+        plog([&]() { linear.run(reinterpret_cast<uint8_t*>(&A[0]), A.stride, BM); }, 2.0 * BM * N * K);
     }
 
     std::string acc;
@@ -817,14 +782,14 @@ void test2(int K = 4096, int N = 11008 * 2) {
         acc = "[FAIL]";
         acc_color = "1;31";
     }
-    plog.tag("", 256, K, N, acc);
+    plog.tag("", BM, K, N, acc);
     plog.color(acc_color);
     // for (int i = 0; i < 5; i++) {
     //     plog([&]() { linear.run(reinterpret_cast<uint8_t*>(&A[0]), A.stride, 256); }, 256.0 * N * K * 2);
     //    concat_Cs();
     // }
 }
-
+EnvVar BM("BM", 256);
 EnvVar BN("BN", 256);
 EnvVar BK("BK", 256);
 EnvVar NK("NK", 16);
@@ -833,6 +798,6 @@ int main() {
     MSRConfig _msr;
     bool initAMX = initXTILE();
     // test(256, (int)BK, (int)BN, (int)NK);
-    test2();
+    test2(BM);
     return 0;
 }
