@@ -23,25 +23,15 @@
 #include "kernels_amx.hpp"
 #include "tensor2D.hpp"
 
-static tensor2D<ov::bfloat16> repack_weights(tensor2D<ov::bfloat16>& Bt) {
-    int N = Bt.dims[0];
-    int K = Bt.dims[1];
-    tensor2D<ov::bfloat16> BPacked(K * N, 1, true);
-    for (int n = 0, i = 0; n < N; n += 32) {
-        for (int k = 0; k < K; k += 32) {
-            amx_kernel::functional::transpose_epi32_16x16(&BPacked[i * 16 * 32], &Bt(n, k), Bt.stride);
-            i++;
-            amx_kernel::functional::transpose_epi32_16x16(&BPacked[i * 16 * 32], &Bt(n + 16, k), Bt.stride);
-            i++;
-        }
-    }
-    return BPacked;
-}
+namespace AMX_MLP {
 
 EnvVar SWPFA("SWPFA", 0); // prefetch A is slower, so disable it
 EnvVar MHINT("MHINT", 256);
 
-class Linear32x32_AMX_mkernel : public jit_generator {
+//
+// MKernel make linear a compute-bound kernel (as much as possible)
+//
+class MKernel : public jit_generator {
 public:
     TileConfig m_tile_cfg;
 
@@ -86,14 +76,14 @@ public:
     // for BN=256, each kernel read 4*BK elements into ping-pong, each iteration read 4*BK*sizeof(bfloat16)/(BK/32)=256bytes = 4-512bits zmm registers
     //
     //
-    Linear32x32_AMX_mkernel() = default;
+    MKernel() = default;
 
-    Linear32x32_AMX_mkernel(int M_hint, bool do_accumulation) { setup(M_hint, do_accumulation); }
+    MKernel(int M_hint, bool do_accumulation) { setup(M_hint, do_accumulation); }
 
     void setup(int M_hint = 0, //  M_hint is only a hint for prefetching, set to 0 to avoid prefetch
                bool do_accumulation = false) {
         m_do_accumulation = do_accumulation;
-        m_BM_hint = MHINT; //M_hint;
+        m_BM_hint = MHINT; // M_hint;
 
         if (m_BM_hint == 0) {
             m_prefetch_Blines = 0;
@@ -101,7 +91,7 @@ public:
             m_prefetch_Blines = 32768 * sizeof(ov::bfloat16) / 64 / m_BM_hint;
         }
 
-        create_kernel("Linear32x32_AMX_mkernel");
+        create_kernel("MKernel");
         m_tile_cfg.reset(1, 0,
                          {
                              {16, 64}, // C:0
@@ -358,147 +348,6 @@ public:
     }
 };
 
-// multi-threaded kernel, decoupled from weight
-void clr_cache() {
-    thread_local std::vector<uint8_t> big_buffer(1024 * 1024 * 2, 0);
-    memset(&big_buffer[0], 1, big_buffer.size());
-    load_prefetch_L2(&big_buffer[0], big_buffer.size());
-};
-
-void test(int BM, int BK, int BN, const int num_AB_pairs = 43) {
-    tensor2D<ov::bfloat16> A(BM, BK, true);
-    tensor2D<ov::bfloat16> B(BK, BN, true);
-    tensor2D<float> C0(BM, BN, true); // reference result
-    tensor2D<float> C1(BM, BN, true); // reference result
-
-    Linear32x32_AMX_mkernel jit_amx(BM, false);
-
-    auto Bt = B.Tr();
-    // auto B1 = repack_weights(Bt);
-    auto B1 = jit_amx.prepareB(&Bt[0], Bt.stride, BN, BK);
-
-    C0 = 0;
-    matmul(A, B, C0);
-
-    auto strideB = (BK / 32) * 2048;
-    {
-        TileConfigScope tcfg(jit_amx.m_tile_cfg);
-        jit_amx.run(BM, reinterpret_cast<uint8_t*>(&A[0]), A.stride, //
-                    B1,                                              //
-                    reinterpret_cast<uint8_t*>(&C1[0]), C1.stride,   //
-                    reinterpret_cast<uint8_t*>(&B1[0]));
-    }
-
-    std::string acc;
-    const char* acc_color = nullptr;
-    if (C0 == C1) {
-        acc = "[PASS]";
-    } else {
-        if (std::getenv("SHOW_ERR")) {
-            std::cout << "============= A ================ " << std::endl;
-            std::cout << A << std::endl;
-            std::cout << "============= B ================ " << std::endl;
-            std::cout << B << std::endl;
-            logger() << C0 << std::endl;
-            logger() << C1 << std::endl;
-        }
-        acc = "[FAIL]";
-        acc_color = "1;31";
-    }
-
-    perf_log plog({
-        {PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES, "HW_CYCLES"},
-        {PERF_TYPE_RAW, 0x21a6, "BOUND_ON_LOADS"},
-    });
-    plog.reserve(512);
-    plog.tag("cache-COLD", BM, BK, BN, acc);
-    plog.color(acc_color);
-
-    std::vector<tensor2D<ov::bfloat16>> A1s;
-    tensor2D<ov::bfloat16> Abig(BM, num_AB_pairs * BK, true);
-    for (int i = 0; i < num_AB_pairs; i++) {
-        A1s.emplace_back(BM, BK, &Abig(0, i * BK), Abig.stride);
-        // A1s.emplace_back(A.clone());
-    }
-
-#pragma omp parallel
-    {
-        int ithr = omp_get_thread_num();
-
-        tensor2D<float> C2(BM, BN, true);
-        std::vector<tensor2D<ov::bfloat16>> B1s;
-        for (int i = 0; i < num_AB_pairs; i++) {
-            B1s.emplace_back(B1.clone());
-        }
-        Linear32x32_AMX_mkernel jit_amx0(BM, false);
-        Linear32x32_AMX_mkernel jit_amx1(BM, true);
-        TileConfigScope tcfg(jit_amx0.m_tile_cfg);
-
-#if 0
-#pragma omp barrier
-        {
-            // plog.tag("cache-HOT", M, K, N, acc);
-            // plog.color(acc_color);
-            for (int r = 0; r < 10; r++) {
-                tensor2D<ov::bfloat16>& blockB = B1s[0];
-                tensor2D<ov::bfloat16>& blockB1 = B1s[0];
-                plog(
-                    [&]() {
-                        jit_amx.run(reinterpret_cast<uint8_t*>(&A[0]), A.stride,     //
-                                    reinterpret_cast<uint8_t*>(&blockB[0]), strideB, //
-                                    reinterpret_cast<uint8_t*>(&C2[0]), C2.stride,   //
-                                    reinterpret_cast<uint8_t*>(&blockB1[0]));
-                    },
-                    2.0 * M * N * K // OPS per call per core
-                );
-            };
-        }
-#endif
-        clr_cache();
-        clr_cache();
-        clr_cache();
-
-#pragma omp barrier
-        plog(
-            [&]() {
-                Linear32x32_AMX_mkernel* pkernel = &jit_amx0;
-                for (int r = 0; r < num_AB_pairs; r++) {
-                    tensor2D<ov::bfloat16>& blockA = A1s[r];
-                    tensor2D<ov::bfloat16>& blockB = B1s[r];
-                    auto r1 = r + 1;
-                    tensor2D<ov::bfloat16>& blockB1 = B1s[r1 < B1s.size() ? r1 : r];
-
-                    pkernel->run(BM, reinterpret_cast<uint8_t*>(&blockA[0]), blockA.stride, blockB, reinterpret_cast<uint8_t*>(&C2[0]), C2.stride,
-                                 reinterpret_cast<uint8_t*>(&blockB1[0]));
-                    pkernel = &jit_amx1;
-                }
-            },
-            (num_AB_pairs) * 2.0 * BM * BN * BK // OPS per call per core
-        );
-
-        if (ithr == 0)
-            plog(); // add separator
-
-#pragma omp barrier
-        plog(
-            [&]() {
-                Linear32x32_AMX_mkernel* pkernel = &jit_amx0;
-                for (int r = 0; r < num_AB_pairs; r++) {
-                    tensor2D<ov::bfloat16>& blockA = A1s[r];
-                    tensor2D<ov::bfloat16>& blockB = B1s[r];
-                    auto r1 = r + 1;
-                    tensor2D<ov::bfloat16>& blockB1 = B1s[r1 < B1s.size() ? r1 : r];
-
-                    pkernel->run(BM, reinterpret_cast<uint8_t*>(&blockA[0]), blockA.stride, blockB, reinterpret_cast<uint8_t*>(&C2[0]), C2.stride,
-                                 reinterpret_cast<uint8_t*>(&blockB1[0]));
-                    pkernel = &jit_amx1;
-                }
-            },
-            (num_AB_pairs) * 2.0 * BM * BN * BK // OPS per call per core
-        );
-    }
-}
-
 inline void exp_ps_avx512(__m512& src) {
     static __m512 exp_ln_flt_min_f = _mm512_castsi512_ps(_mm512_set1_epi32(0xc2aeac50)); // log(FLT_MIN)
     static __m512 exp_ln_flt_max_f = _mm512_castsi512_ps(_mm512_set1_epi32(0x42b17218)); // log(FLT_MAX)
@@ -574,24 +423,23 @@ inline __m512 silu_ps_avx512(const __m512 x) {
     return _mm512_mul_ps(x, sigmoidx);
 }
 
-class LinearAMX {
+class Linear {
 public:
-
     struct Work {
-        Linear32x32_AMX_mkernel* p_jit_amx0;
-        Linear32x32_AMX_mkernel* p_jit_amx1;
+        MKernel* p_jit_amx0;
+        MKernel* p_jit_amx1;
         std::vector<tensor2D<ov::bfloat16>> weights;
         tensor2D<float> C;
         int start;
         int end;
+        int BN;
 
-        void run(int M, uint8_t * pA, int strideA) {
+        void run(int M, uint8_t* pA, int strideA) {
             int num_blk_K = weights.size();
-            int BN = end - start;
             C.resize(M, BN);
 
             TileConfigScope tcfg(p_jit_amx0->m_tile_cfg);
-            Linear32x32_AMX_mkernel* pkernel = p_jit_amx0;
+            MKernel* pkernel = p_jit_amx0;
             for (int ki = 0; ki < num_blk_K; ki++) {
                 tensor2D<ov::bfloat16>& blockB = weights[ki];
                 tensor2D<ov::bfloat16>& blockB1 = weights[(ki + 1) < num_blk_K ? (ki + 1) : ki];
@@ -604,14 +452,16 @@ public:
     };
     std::vector<Work> works;
 
-    LinearAMX() {}
+    Linear() {}
 
     // weight [N, K]
-
+    // Gate & Up are interleaved in N dimension: 16-gate / 16-up
+    // and post-ops will compute  silu(gate)*up in unit of 16 elements
+    // and store out as bfloat16.
     template <typename T, int BM = 192>
     void setup(T* p_weight, int stride, int N, int K) {
-        static Linear32x32_AMX_mkernel jit_amx0(BM, false);
-        static Linear32x32_AMX_mkernel jit_amx1(BM, true);
+        static MKernel jit_amx0(BM, false);
+        static MKernel jit_amx1(BM, true);
 
         // prepare weights, split N among threads
         // in unit of 32
@@ -622,25 +472,36 @@ public:
         auto num_blk_K = K / 256;
         works.resize(nthr);
 
+        // every thread should do same amount of work, and some cores can be idle
+        auto blkN_per_thread = (num_blk_N + nthr - 1)/ nthr;
+        auto start_blkN = 0;
+        auto used_nthr = 0;
+        for (int ithr = 0; ithr < nthr; ithr ++) {
+            auto& work = works[ithr];
+            auto blkN = std::min(num_blk_N - start_blkN, blkN_per_thread);
+            work.start = (start_blkN) * 32;
+            work.end = (start_blkN + blkN)*32;
+            work.BN = blkN * 32;
+            start_blkN += blkN;
+            if (blkN)
+                used_nthr ++;
+        }
+
+        std::cout << "Linear N,K=" << N << "," << K << " used_nthr=" << used_nthr << std::endl;
+
 #pragma omp parallel
         {
             int ithr = omp_get_thread_num();
-            int nthr = omp_get_num_threads();
-            int start, end;
-            splitter(num_blk_N, nthr, ithr, start, end);
             auto& work = works[ithr];
-            start *= 32;
-            end *= 32;
-            int BN = end - start;
-            work.start = start;
-            work.end = end;
-            work.weights.resize(num_blk_K);
-            work.p_jit_amx0 = &jit_amx0;
-            work.p_jit_amx1 = &jit_amx1;
+            if (work.BN > 0) {
+                work.weights.resize(num_blk_K);
+                work.p_jit_amx0 = &jit_amx0;
+                work.p_jit_amx1 = &jit_amx1;
 
-            auto* pw = p_weight + start * stride / sizeof(T);
-            for (int k = 0; k < num_blk_K; k++) {
-                work.weights[k] = jit_amx0.prepareB(pw + k * 256, stride, BN, 256);
+                auto* pw = p_weight + work.start * stride / sizeof(T);
+                for (int k = 0; k < num_blk_K; k++) {
+                    work.weights[k] = jit_amx0.prepareB(pw + k * 256, stride, work.BN, 256);
+                }
             }
         }
     }
@@ -650,7 +511,10 @@ public:
 #pragma omp parallel
         {
             int ithr = omp_get_thread_num();
-            works[ithr].run(M, pA, strideA);
+            auto& work = works[ithr];
+            if (work.BN > 0) {
+                work.run(M, pA, strideA);
+            }
         }
     }
 
@@ -659,112 +523,191 @@ public:
         {
             int ithr = omp_get_thread_num();
             auto& work = works[ithr];
-            work.run(M, pA, strideA);
-            auto* src = &work.C[0];
-            auto BN = work.end - work.start;
-            auto* dst = dstC + work.start;
-            auto strideS = work.C.stride / sizeof(*src);
-            auto strideD = strideC / sizeof(*dst);
-            for (int m = 0; m < M; m++, src += strideS, dst += strideD) {
-                // the prefetch distance is increased to ensure by the time store happens
-                // prefetch has done and no HW prefetcher is triggered
-                auto* prefetch_dst = (m + 2 < M) ? (dst + 2*strideD) : (dst);
-                for (int n = 0; n < BN; n += 32) {
-                    auto d0 = _mm512_loadu_ps(src + n);
-                    auto d1 = _mm512_loadu_ps(src + n + 16);
-                    _mm_prefetch(prefetch_dst + n, _MM_HINT_ET1);
-                    _mm_prefetch(prefetch_dst + n + 16, _MM_HINT_ET1);
-                    _mm512_storeu_ps(dst + n, d0);
-                    _mm512_storeu_ps(dst + n + 16, d1);
+            if (work.BN > 0) {
+                work.run(M, pA, strideA);
+                auto* src = &work.C[0];
+                auto* dst = dstC + work.start;
+                auto strideS = work.C.stride / sizeof(*src);
+                auto strideD = strideC / sizeof(*dst);
+                for (int m = 0; m < M; m++, src += strideS, dst += strideD) {
+                    // the prefetch distance is increased to ensure by the time store happens
+                    // prefetch has done and no HW prefetcher is triggered
+                    auto* prefetch_dst = (m + 2 < M) ? (dst + 2 * strideD) : (dst);
+                    for (int n = 0; n < work.BN; n += 32) {
+                        auto d0 = _mm512_loadu_ps(src + n);
+                        auto d1 = _mm512_loadu_ps(src + n + 16);
+                        _mm_prefetch(prefetch_dst + n, _MM_HINT_ET1);
+                        _mm_prefetch(prefetch_dst + n + 16, _MM_HINT_ET1);
+                        _mm512_storeu_ps(dst + n, d0);
+                        _mm512_storeu_ps(dst + n + 16, d1);
+                    }
+                }
+            }
+        }
+    }
+
+    void run(uint8_t* pA, int strideA, int M, ov::bfloat16* dstC, int strideC) {
+#pragma omp parallel
+        {
+            int ithr = omp_get_thread_num();
+            auto& work = works[ithr];
+            if (work.BN > 0) {
+                work.run(M, pA, strideA);
+                auto* src = &work.C[0];
+                auto* dst = dstC + work.start;
+                auto strideS = work.C.stride / sizeof(*src);
+                auto strideD = strideC / sizeof(*dst);
+                for (int m = 0; m < M; m++, src += strideS, dst += strideD) {
+                    // the prefetch distance is increased to ensure by the time store happens
+                    // prefetch has done and no HW prefetcher is triggered
+                    auto* prefetch_dst = (m + 2 < M) ? (dst + 2 * strideD) : (dst);
+                    for (int n = 0; n < work.BN; n += 32) {
+                        auto d0 = _mm512_loadu_ps(src + n);
+                        auto d1 = _mm512_loadu_ps(src + n + 16);
+                        auto v_bh = _mm512_cvtne2ps_pbh(d1, d0);
+                        _mm_prefetch(prefetch_dst + n, _MM_HINT_ET1);
+                        _mm512_storeu_ps(dst + n, reinterpret_cast<__m512&>(v_bh));
+                    }
                 }
             }
         }
     }
 
     // gate & up are interleaved: 16 gates + 16 up
-
     void runGateUp(uint8_t* pA, int strideA, int M, ov::bfloat16* dstC, int strideC) {
 #pragma omp parallel
         {
             int ithr = omp_get_thread_num();
             auto& work = works[ithr];
-            work.run(M, pA, strideA);
-
-            // K reduce is done, results of [M, BN] sub-block is ready in L2.
-            // combine Gate & Up
-            auto* src = &work.C[0];
-            auto strideS = work.C.stride / sizeof(*src);
-            auto BN = work.end - work.start;
-            auto* dst = dstC + work.start/2;
-            auto strideD = strideC / sizeof(*dst);
-            for (int m = 0; m < M; m++, src += strideS, dst += strideD) {
-                auto* prefetch_dst = (m + 1 < M) ? (dst + strideD) : (dst);
-                for (int n = 0, i = 0; n < BN; n += 32, i += 16) {
-                    auto v_gate = _mm512_loadu_ps(src + n);
-                    auto v_up = _mm512_loadu_ps(src + n + 16);
-                    auto v1 = silu_ps_avx512(v_gate);
-                    v_up = _mm512_mul_ps(v1, v_up);
-                    auto v_bh = _mm512_cvtneps_pbh(v_up);
-                    // Greate Optimization:
-                    //  following prefetchnta prevents L2 HW prefetcher prefetch interleaved
-                    //  channels belonging to other cores which will causes too much cross-core cache coherent cost.
-                    _mm_prefetch(prefetch_dst + i, _MM_HINT_ET1);
-                    _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + i), reinterpret_cast<__m256i&>(v_bh));
+            if (work.BN > 0) {
+                work.run(M, pA, strideA);
+                // K reduce is done, results of [M, BN] sub-block is ready in L2.
+                // combine Gate & Up
+                auto* src = &work.C[0];
+                auto strideS = work.C.stride / sizeof(*src);
+                auto* dst = dstC + (work.start/2); // important output is only half of the total N
+                auto strideD = strideC / sizeof(*dst);
+                for (int m = 0; m < M; m++, src += strideS, dst += strideD) {
+                    auto* prefetch_dst = (m + 1 < M) ? (dst + strideD) : (dst);
+                    for (int n = 0, i = 0; n < work.BN; n += 32, i += 16) {
+                        auto v_gate = _mm512_loadu_ps(src + n);
+                        auto v_up = _mm512_loadu_ps(src + n + 16);
+                        v_gate = silu_ps_avx512(v_gate);
+                        v_up = _mm512_mul_ps(v_gate, v_up);
+                        auto v_bh = _mm512_cvtneps_pbh(v_up);
+                        // Greate Optimization:
+                        //  following prefetchnta prevents L2 HW prefetcher prefetch interleaved
+                        //  channels belonging to other cores which will causes too much cross-core cache coherent cost.
+                        _mm_prefetch(prefetch_dst + i, _MM_HINT_ET1);
+                        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + i), reinterpret_cast<__m256i&>(v_bh));
+                    }
                 }
             }
         }
     }
 };
 
-void test2(int BM = 256, int K = 4096, int N = 11008 * 2) {
-    tensor2D<ov::bfloat16> A(BM, K, true);
-    tensor2D<ov::bfloat16> B(K, N, true);
-    tensor2D<float> C0(BM, N, true); // reference result
-    tensor2D<float> C1(BM, N, true); // reference result
-    tensor2D<ov::bfloat16> CGateUp(BM, N, true);
+struct MLP {
+    Linear gate_up;
+    Linear down;
+    MLP() {}
 
-    LinearAMX linear;
-    std::vector<LinearAMX> allLinears(128);
+    tensor2D<ov::bfloat16> actUp;
+    int m_N;
+    int m_M = 0;
 
-    auto Bt = B.Tr();
-    linear.setup(&Bt[0], Bt.stride, N, K);
+    // [M, K] x [N, K] => [M, N] x [K, N] => [M, K]
+    // w_gate/w_up : [N, K]
+    //     w_down  : [K, N]
+    void setup(ov::bfloat16* pw_gate, ov::bfloat16* pw_up, ov::bfloat16* pw_down, int K, int N) {
+        // [N, K] [N, K] interleave (16-16-...) into [2*N, K]
+        tensor2D<ov::bfloat16> w_gate(N, K, pw_gate, K * sizeof(ov::bfloat16));
+        tensor2D<ov::bfloat16> w_up(N, K, pw_up, K * sizeof(ov::bfloat16));
+        tensor2D<ov::bfloat16> w_down(K, N, pw_down, N * sizeof(ov::bfloat16));
 
-    for (int i = 0; i < allLinears.size(); i++) {
-        allLinears[i].setup(&Bt[0], Bt.stride, N, K);
+        tensor2D<ov::bfloat16> w_gate_up(2 * N, K, true);
+        for (int n = 0; n < N; n += 16) {
+            for (int i = 0; i < 16; i++)
+                memcpy(&w_gate_up(2 * n + i, 0), &w_gate(n + i, 0), K * sizeof(ov::bfloat16));
+            for (int i = 0; i < 16; i++)
+                memcpy(&w_gate_up(2 * n + 16 + i, 0), &w_up(n + i, 0), K * sizeof(ov::bfloat16));
+        }
+        gate_up.setup(&w_gate_up[0], w_gate_up.stride, N * 2, K);
+        down.setup(&w_down[0], w_down.stride, K, N);
+        m_N = N;
     }
 
-    C0 = 0;
-    matmul(A, B, C0);
+    void run(uint8_t* pA, int strideA, int M, ov::bfloat16* dstC, int strideC) {
+        if (m_M < M) {
+            actUp.resize(M, m_N, false);
+            m_M = M;
+        }
 
-    perf_log plog({
-        {PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES, "HW_CYCLES"},
-        {PERF_TYPE_RAW, 0x21a6, "BOUND_ON_LOADS"},
-    });
+        gate_up.runGateUp(pA, strideA, M, &actUp[0], actUp.stride);
+        down.run(reinterpret_cast<uint8_t*>(&actUp[0]), actUp.stride, M, dstC, strideC);
+    }
+};
 
-    for (int i = 0; i < allLinears.size(); i++) {
-        plog([&]() { allLinears[i].runGateUp(reinterpret_cast<uint8_t*>(&A[0]), A.stride, BM, &CGateUp[0], CGateUp.stride); }, 2.0 * BM * N * K);
-    }
-    plog();
-    for (int i = 0; i < allLinears.size(); i++) {
-        plog([&]() { allLinears[i].runGateUp(reinterpret_cast<uint8_t*>(&A[0]), A.stride, BM, &CGateUp[0], CGateUp.stride); }, 2.0 * BM * N * K);
-    }
-#pragma omp parallel
-    { clr_cache(); }
-    plog();
-    for (int i = 0; i < allLinears.size(); i++) {
-        plog([&]() { allLinears[i].runGateUp(reinterpret_cast<uint8_t*>(&A[0]), A.stride, BM, &CGateUp[0], CGateUp.stride); }, 2.0 * BM * N * K);
-    }
-    for (int i = 0; i < 2; i++) {
-        plog("---------- with concat ----------");
-        plog([&]() { linear.run(reinterpret_cast<uint8_t*>(&A[0]), A.stride, BM, &C1[0], C1.stride); }, 2.0 * BM * N * K);
-        plog([&]() { linear.run(reinterpret_cast<uint8_t*>(&A[0]), A.stride, BM, &C1[0], C1.stride); }, 2.0 * BM * N * K);
-        plog([&]() { linear.run(reinterpret_cast<uint8_t*>(&A[0]), A.stride, BM, &C1[0], C1.stride); }, 2.0 * BM * N * K);
+}; // namespace AMX_MLP
 
-        plog("---------- no concat ----------");
-        plog([&]() { linear.run(reinterpret_cast<uint8_t*>(&A[0]), A.stride, BM); }, 2.0 * BM * N * K);
-        plog([&]() { linear.run(reinterpret_cast<uint8_t*>(&A[0]), A.stride, BM); }, 2.0 * BM * N * K);
-        plog([&]() { linear.run(reinterpret_cast<uint8_t*>(&A[0]), A.stride, BM); }, 2.0 * BM * N * K);
+void mlp_ref(tensor2D<ov::bfloat16>& A, tensor2D<ov::bfloat16>& gate, tensor2D<ov::bfloat16>& up, tensor2D<ov::bfloat16>& down,
+             tensor2D<ov::bfloat16>& result) {
+    auto M = A.dims[0];
+    auto K = gate.dims[0];
+    auto N = gate.dims[1];
+    ASSERT(A.dims[1] == K);
+    ASSERT(up.dims[0] == K);
+    ASSERT(up.dims[1] == N);
+    ASSERT(down.dims[0] == N);
+    ASSERT(down.dims[1] == K);
+
+    tensor2D<float> Agate(M, N, true);
+    tensor2D<float> Aup(M, N, true);
+    tensor2D<ov::bfloat16> act2(M, N, true);
+
+    matmul(A, gate, Agate);
+    matmul(A, up, Aup);
+
+    // SiLu(gate) * up
+    auto silu = [](float x) { return x * 1.0f  / (1.0f + std::exp(-x)); };
+    for (int m = 0; m < M; m++) {
+        for (int n = 0; n < N; n++) {
+            act2(m, n) = silu(Agate(m, n)) * Aup(m, n);
+        }
     }
+
+    matmul(act2, down, result);
+}
+
+void test1() {
+    int M = 256;
+    int K = 4096;
+    int N = 11008;
+    std::vector<AMX_MLP::MLP> mlps(64);
+    tensor2D<ov::bfloat16> gate(K, N, true);
+    tensor2D<ov::bfloat16> up(K, N, true);
+    tensor2D<ov::bfloat16> down(N, K, true);
+    tensor2D<ov::bfloat16> A(M, K, true);
+    tensor2D<ov::bfloat16> C1(M, K, true);
+    tensor2D<ov::bfloat16> C0(M, K, true);
+
+    auto nthr = get_nthr();
+
+    std::cout << __LINE__ << std::endl;
+    mlp_ref(A, gate, up, down, C0);
+
+    std::cout << __LINE__ << std::endl;
+    auto gateT = gate.Tr();
+    auto upT = up.Tr();
+    auto downT = down.Tr();
+    std::cout << __LINE__ << std::endl;
+
+    for (auto& mlp: mlps)
+        mlp.setup(&gateT[0], &upT[0], &downT[0], K, N);
+    std::cout << __LINE__ << std::endl;
+
+    mlps[0].run(reinterpret_cast<uint8_t*>(&A[0]), A.stride, M, &C1[0], C1.stride);
+    std::cout << __LINE__ << std::endl;
 
     std::string acc;
     const char* acc_color = nullptr;
@@ -774,30 +717,39 @@ void test2(int BM = 256, int K = 4096, int N = 11008 * 2) {
         if (std::getenv("SHOW_ERR")) {
             std::cout << "============= A ================ " << std::endl;
             std::cout << A << std::endl;
-            std::cout << "============= B ================ " << std::endl;
-            std::cout << B << std::endl;
             logger() << C0 << std::endl;
             logger() << C1 << std::endl;
         }
         acc = "[FAIL]";
         acc_color = "1;31";
     }
-    plog.tag("", BM, K, N, acc);
+    perf_log plog({
+        {PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES, "HW_CYCLES"},
+        {PERF_TYPE_RAW, 0x21a6, "BOUND_ON_LOADS"},
+    });
+    plog.reserve(512);
+    plog.tag("MLP", M, K, N, acc);
     plog.color(acc_color);
-    // for (int i = 0; i < 5; i++) {
-    //     plog([&]() { linear.run(reinterpret_cast<uint8_t*>(&A[0]), A.stride, 256); }, 256.0 * N * K * 2);
-    //    concat_Cs();
-    // }
+
+    for(int r = 0; r < 4; r++) {
+        plog();
+        bool flag = true;
+        for (auto& mlp: mlps) {
+            auto& in = (flag) ? (A) : (C1);
+            auto& out = (!flag) ? (A) : (C1);
+            flag = !flag;
+            plog([&]() { mlp.run(reinterpret_cast<uint8_t*>(&in[0]), in.stride, M, &out[0], out.stride); });
+            // gate_up.runGateUp(pA, strideA, M, &actUp[0], actUp.stride);
+            // down.run(reinterpret_cast<uint8_t*>(&actUp[0]), actUp.stride, M, dstC, strideC);
+            //plog([&]() { mlp.gate_up.runGateUp(reinterpret_cast<uint8_t*>(&A[0]), A.stride, M, &mlp.actUp[0], mlp.actUp.stride); }, 4.0*M*N*K/nthr);
+            //plog([&]() { mlp.down.run(reinterpret_cast<uint8_t*>(&mlp.actUp[0]), mlp.actUp.stride, M, &C1[0], C1.stride); }, 2.0*M*N*K/nthr);
+        }
+    }
 }
-EnvVar BM("BM", 256);
-EnvVar BN("BN", 256);
-EnvVar BK("BK", 256);
-EnvVar NK("NK", 16);
 
 int main() {
     MSRConfig _msr;
     bool initAMX = initXTILE();
-    // test(256, (int)BK, (int)BN, (int)NK);
-    test2(BM);
-    return 0;
+    srand(0);
+    test1();
 }

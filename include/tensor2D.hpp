@@ -149,7 +149,7 @@ struct tensor2D {
         // +1 -1 for integer types
         // 0.5 -0.5 for float point 
         
-        float scale = std::is_integral<T>::value ? 2:1;
+        float scale = std::is_integral<T>::value ? 2.0f : 0.125f;
         #pragma omp parallel for
         for(int i = 0; i <= total - 8; i+=8) {
             // lower mantissa can help to avoid small errors in accuracy comparison
