@@ -797,7 +797,7 @@ EnvVar NK("NK", 16);
 int main() {
     MSRConfig _msr;
     bool initAMX = initXTILE();
-    // test(256, (int)BK, (int)BN, (int)NK);
-    test2(BM);
+    test(256, (int)BK, (int)BN, (int)NK);
+    //test2(BM);
     return 0;
 }

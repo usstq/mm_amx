@@ -207,7 +207,7 @@ struct perf_log {
                 if (std::string("HW_CYCLES") == events[k]->name) {
                     std::cout << "," << std::setw(10) << "CPU(GHz)";
                     std::cout << "," << std::setw(10) << "Ops/cycle";
-                    std::cout << "," << std::setw(10) << "GOps/sec";
+                    std::cout << "," << std::setw(10) << "GFLOPS";
                 }
             }
             std::cout << ANSIcolor() << std::endl;

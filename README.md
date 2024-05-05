@@ -190,15 +190,15 @@ Fist let's think about compute-memory ratio of a general matmul problem, to see 
 
  - we need to access a new `(MxK)` A matrix for `(2*MxKxN)` Flops, so memory access vs Flops is 1:2N = 1/(2N):1
  - we need to access whole `(NxK)` B matrix for `(2*MxKxN)` Flops, so memory access vs Flops is 1:2M = 1/(2M):1
- - in total 1 Flops needs `[1/(2N) + 1/(2M)]` elements, or `(1/N + 1/M)` bytes in BF16 format.
- - AMX peak MAdds per cycle is 1024 Flops/cycle, with CPU frequency 1.8 GHz (when all cores are busy), 1843.2 GFlops
- - due to limitation of L2 bandwidth, 60~70% of peak GFlops can be archieved, if A is in normal layout, only 1242 GFlops can be reached (67%)
+ - in total 1 float-point operation needs `[1/(2N) + 1/(2M)]` elements, or `(1/N + 1/M)` bytes in BF16 format.
+ - AMX peak MAdds per cycle is 1024 Flops/cycle, with CPU frequency 1.8 GHz (when all cores are busy), 1843.2 GFLOPS (giga floating point operations per second)
+ - due to limitation of L2 bandwidth, 60~70% of peak GFLOPS can be archieved, if A is in normal layout, only 1242 GFLOPS can be reached (67%)
  - as a comparison, AVX512 FP32 peak Gflops is 64 Flops/cycle with CPU frequency 2.6 GHz, 166 GFlops,
    so in practice we should expect AMX's thoughput to be 1242/166 ~ **7.5X** of AVX512.
- - per core DDR bandwidth is BW/cores, which generate `BW/cores/(1/N + 1/M)` GFlops computations for each core.
+ - per core DDR bandwidth is BW/cores, which generate `BW/cores/(1/N + 1/M)` GFLOPS computations for each core.
  - so AMX L2-bounded ALU usage is `BW/cores/(1/N + 1/M)/1242`
 
-| M, N              | total BW (GB/s) |  GFlops | AMX Usage(L2) |
+| M, N              | total BW (GB/s) |  GFLOPS | AMX Usage(L2) |
 | :---------------- | :-------------: | ------: | ------------: |
 | 256, 256          |         260     |   594   |     48%       |
 | 512, 512          |         260     |  1188   |     95%       |
@@ -216,7 +216,7 @@ which means prefetch is not completely hidden by computation.
 
 ```bash
 # ============================
-   #  thr    latency, HW_CYCLES,  CPU(GHz), Ops/cycle,  GOps/sec,BOUND_ON_LOADS,ICACHE_DATA.STALLS,ICACHE_TAG.STALLS
+   #  thr    latency, HW_CYCLES,  CPU(GHz), Ops/cycle,  GFLOPS,BOUND_ON_LOADS,ICACHE_DATA.STALLS,ICACHE_TAG.STALLS
    0     0   65.18us,    161405,      2.48,       207,    514.78,    640797,       259,       184
    1     0   30.86us,     52677,      1.71,       636,   1087.15,    230414,         0,        71
    2     0   49.96us,     67786,      1.36,       495,    671.64,    254693,       104,        77
@@ -255,11 +255,14 @@ On multi-core case, all 56 cores perform:
  - different C
  - no prefetch of A since A is reused for each B and it should be in L2 cache.
 
-we need to care about `GOps/sec` instead of `Ops/cycle` since CPU frequency changes a lot,
-but DDR bandwidth is stable, so it limits the `Ops/cycle`, thus we focus on `GOps/sec` which
+we need to care about `GFLOPS` instead of `Ops/cycle` since CPU frequency changes a lot,
+but DDR bandwidth is stable, so it limits the `Ops/cycle`, thus we focus on `GFLOPS` which
 is directly sensible by user.
 
-| M, N, num_of_B    | Cores |  GOps/sec/core |
+in following test, A matrix is fixed 256x256, and B matrix has multiple copies`[num_of_B, 256, 256]`, thus
+only B is prefetched and in theory we have DDR-bandwidth bounded AMX GFLOPS: `260/56/(1/256) ~= 1188.6 GFLOPS`.
+
+| M, N, num_of_B    | Cores |  GFLOPS/core   |
 | :---------------- | :---: | -------------: |
 | 256, 256 16 1st   | 56    |    643         |
 | 256, 256 16       | 56    |    959         |
@@ -270,7 +273,7 @@ in DDR for first time, and it's been loaded into L3 after that.
 
 if we increase the number of 256x256 B matrix to 160, this gap is much lower:
 
-| M, N  num_of_B    | Cores |  GOps/sec/core |
+| M, N  num_of_B    | Cores |  GFLOPS/core   |
 | :---------------- | :---: | -------------: |
 | 256, 256 160 1st  | 56    |    916         |
 | 256, 256 160      | 56    |    992         |
@@ -289,13 +292,24 @@ the prefetch instructions have been distributed into the inner loop evenly, what
 
 ### With A&B sub-block prefetched [amx-mm](./tests/amx-mm.cpp)
 
-| M, N  num_of_B    | Cores |  GOps/sec/core               |
+|  M,N,num_AB_pairs | Cores |  GFLOPS/core               |
 | :---------------- | :---: | ---------------------------: |
-| 256, 256 43 1st   | 56    |  769 / 463 / 645 / 708 / 623 | 
-| 256, 256 43       | 56    |  953 / 549 / 867 / 876 / 695 |
+| 256, 256, 43 1st  | 56    |  769 / 463 / 645 / 708 / 623 | 
+| 256, 256, 43      | 56    |  953 / 549 / 867 / 876 / 695 |
+| 256, 256, 16 1st  | 56    |  --- / --- / --- / 590 / --- | 
+| 256, 256, 16      | 56    |  --- / --- / --- / 712 / --- |
 
-> GOps/sec/core : `common 1x256x256 A` / `per-thread 43x256x256 A` / `common 43x256x256 A` / `common 256x11008 A` / `+prefetcA`
-so prefetch of A actually not working well. we disable it by default.
+> GFLOPS/core : `common 1x256x256 A` / `per-thread 43x256x256 A` / `common 43x256x256 A` / `common 256x11008 A` / `+prefetcA`
+
+we can see:
+ - the non-warm-up test result in `per-thread 43x256x256 A` case is close to `260GB/56/(1/M + 1/N) ~= 594 GFLOPS` prediction.
+ - for `common A` case, GFLOPS/core is higher than predicted by `260GB/56/(1/M + 1/N)` this maybe because A is shared by all cores.
+   and so most cores actually read A from LLC instead of DDR.
+ - if number of AB pairs (size of K) is not big, GFLOPS dropped (by ~18%) due to lacking of prefetch for the first sub-block B.
+ - prefetch of A actually not working well. we disable it by default.
+
+
+
 
 ## Multicore parallelism
 
@@ -328,6 +342,9 @@ we can see:
 Reading B matrix cannot be shared since they are not the same block, so whole DDR bandwidth is divided amoung cores.
 
 C matrix is written
+
+# split strategy
+
 
 # [cross-core-read.cpp](./tests/cross-core-read.cpp)
 

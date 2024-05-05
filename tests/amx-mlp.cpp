@@ -451,6 +451,7 @@ public:
         }
     };
     std::vector<Work> works;
+    int used_nthr = 0;
 
     Linear() {}
 
@@ -475,7 +476,7 @@ public:
         // every thread should do same amount of work, and some cores can be idle
         auto blkN_per_thread = (num_blk_N + nthr - 1)/ nthr;
         auto start_blkN = 0;
-        auto used_nthr = 0;
+        used_nthr = 0;
         for (int ithr = 0; ithr < nthr; ithr ++) {
             auto& work = works[ithr];
             auto blkN = std::min(num_blk_N - start_blkN, blkN_per_thread);
@@ -637,11 +638,15 @@ struct MLP {
         m_N = N;
     }
 
-    void run(uint8_t* pA, int strideA, int M, ov::bfloat16* dstC, int strideC) {
+    void setM(int M) {
         if (m_M < M) {
             actUp.resize(M, m_N, false);
             m_M = M;
         }
+    }
+
+    void run(uint8_t* pA, int strideA, int M, ov::bfloat16* dstC, int strideC) {
+        setM(M);
 
         gate_up.runGateUp(pA, strideA, M, &actUp[0], actUp.stride);
         down.run(reinterpret_cast<uint8_t*>(&actUp[0]), actUp.stride, M, dstC, strideC);
@@ -683,7 +688,7 @@ void test1() {
     int M = 256;
     int K = 4096;
     int N = 11008;
-    std::vector<AMX_MLP::MLP> mlps(64);
+    std::vector<AMX_MLP::MLP> mlps(4);
     tensor2D<ov::bfloat16> gate(K, N, true);
     tensor2D<ov::bfloat16> up(K, N, true);
     tensor2D<ov::bfloat16> down(N, K, true);
@@ -738,11 +743,12 @@ void test1() {
             auto& in = (flag) ? (A) : (C1);
             auto& out = (!flag) ? (A) : (C1);
             flag = !flag;
-            plog([&]() { mlp.run(reinterpret_cast<uint8_t*>(&in[0]), in.stride, M, &out[0], out.stride); });
+            //plog([&]() { mlp.run(reinterpret_cast<uint8_t*>(&in[0]), in.stride, M, &out[0], out.stride); });
             // gate_up.runGateUp(pA, strideA, M, &actUp[0], actUp.stride);
             // down.run(reinterpret_cast<uint8_t*>(&actUp[0]), actUp.stride, M, dstC, strideC);
-            //plog([&]() { mlp.gate_up.runGateUp(reinterpret_cast<uint8_t*>(&A[0]), A.stride, M, &mlp.actUp[0], mlp.actUp.stride); }, 4.0*M*N*K/nthr);
-            //plog([&]() { mlp.down.run(reinterpret_cast<uint8_t*>(&mlp.actUp[0]), mlp.actUp.stride, M, &C1[0], C1.stride); }, 2.0*M*N*K/nthr);
+            mlp.setM(M);
+            plog([&]() { mlp.gate_up.runGateUp(reinterpret_cast<uint8_t*>(&A[0]), A.stride, M, &mlp.actUp[0], mlp.actUp.stride); }, 4.0*M*N*K/mlp.gate_up.used_nthr);
+            plog([&]() { mlp.down.run(reinterpret_cast<uint8_t*>(&mlp.actUp[0]), mlp.actUp.stride, M, &C1[0], C1.stride); }, 2.0*M*N*K/mlp.down.used_nthr);
         }
     }
 }
