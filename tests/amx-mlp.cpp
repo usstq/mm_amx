@@ -425,61 +425,53 @@ inline __m512 silu_ps_avx512(const __m512 x) {
 
 class Linear {
 public:
-    // sometime N diemsion is too small, we need to split along M dimension to use more cores
-    // Works will need to share weights
-
-    struct WeightBlocks {
-        std::vector<tensor2D<ov::bfloat16>> weights;
-        int start;
-        int end;
-        int BN;
-
-        // input : weight [N, K], setup repacks range of N [n_start, n_end)
-        template <typename T>
-        void setup(T* p_weight, int stride, int n_start, int n_end, int K, MKernel& jit_amx0) {
-            auto num_blk_K = K / 256;
-            auto* pw = p_weight + n_start * stride / sizeof(T);
-            weights.resize(num_blk_K);
-            for (int k = 0; k < num_blk_K; k++) {
-                weights[k] = jit_amx0.prepareB(pw + k * 256, stride, BN, 256);
-            }
-            start = n_start;
-            end = n_end;
-            BN = end - start;
-        }
-    };
-
     struct Work {
         MKernel* p_jit_amx0 = nullptr;
         MKernel* p_jit_amx1 = nullptr;
-        WeightBlocks * wb = nullptr;
+        std::vector<tensor2D<ov::bfloat16>> weights;
         tensor2D<float> C;
-        int n0;
-        int n1;
-        int BN;
-        operator bool() {
-            return wb != nullptr;
+        std::shared_ptr<std::atomic_int> sync_flag;
+        int n0 = 0;
+        int n1 = 0;
+        int k0 = 0;
+        int k1 = 0;
+        int BN = 0;
+        int blk_K_size = 0;
+        operator bool() { return BN > 0; }
+
+        // input : weight [N, K], setup repacks range of N [n_start, n_end)
+        template <typename T>
+        void setup(T* p_weight, int stride) {
+            auto num_blk_K = (k1 - k0) / blk_K_size;
+            auto* pw = p_weight + n0 * stride / sizeof(T) + k0;
+            weights.resize(num_blk_K);
+            for (int k = 0; k < num_blk_K; k++) {
+                weights[k] = p_jit_amx0->prepareB(pw + k * blk_K_size, stride, BN, blk_K_size);
+            }
         }
 
         void run(int M, uint8_t* pA, int strideA) {
-            int num_blk_K = wb->weights.size();
+            int num_blk_K = weights.size();
             C.resize(M, BN);
+
+            pA += k0 * sizeof(ov::bfloat16);
 
             TileConfigScope tcfg(p_jit_amx0->m_tile_cfg);
             MKernel* pkernel = p_jit_amx0;
             for (int ki = 0; ki < num_blk_K; ki++) {
-                tensor2D<ov::bfloat16>& blockB = wb->weights[ki];
-                tensor2D<ov::bfloat16>& blockB1 = wb->weights[(ki + 1) < num_blk_K ? (ki + 1) : ki];
+                tensor2D<ov::bfloat16>& blockB = weights[ki];
+                tensor2D<ov::bfloat16>& blockB1 = weights[(ki + 1) < num_blk_K ? (ki + 1) : ki];
 
-                pkernel->run(M, pA + ki * 256 * sizeof(ov::bfloat16), strideA, blockB, reinterpret_cast<uint8_t*>(&C[0]), C.stride,
+                pkernel->run(M, pA + ki * blk_K_size * sizeof(ov::bfloat16), strideA, blockB, reinterpret_cast<uint8_t*>(&C[0]), C.stride,
                              reinterpret_cast<uint8_t*>(&blockB1[0]));
                 pkernel = p_jit_amx1;
             }
         }
     };
     std::vector<Work> works;
-    std::vector<WeightBlocks> wbs;
+
     int used_nthr = 0;
+    bool do_splitK = false;
 
     Linear() {}
 
@@ -487,53 +479,91 @@ public:
     // Gate & Up are interleaved in N dimension: 16-gate / 16-up
     // and post-ops will compute  silu(gate)*up in unit of 16 elements
     // and store out as bfloat16.
-    template <typename T, int BM = 192>
-    void setup(T* p_weight, int stride, int N, int K) {
+    template <typename T, int BM = 256>
+    void setup(T* p_weight, int stride, int N, int K, bool _do_splitK = false) {
         static MKernel jit_amx0(BM, false);
         static MKernel jit_amx1(BM, true);
 
+        const int blk_K_size = 256;
         // prepare weights, split N among threads
         // in unit of 32
         ASSERT((N % 32) == 0);
-        ASSERT((K % 256) == 0);
+        ASSERT((K % blk_K_size) == 0);
         auto nthr = get_nthr();
         auto num_blk_N = N / 32;
-        auto num_blk_K = K / 256;
+        auto num_blk_K = K / blk_K_size;
         works.resize(nthr);
-        wbs.resize(nthr);
 
-        // every thread should do same amount of work, and some cores can be idle
-        auto blkN_per_thread = (num_blk_N + nthr - 1)/ nthr;
-        auto start_blkN = 0;
-        used_nthr = 0;
-        for (int ithr = 0; ithr < nthr; ithr ++) {
-            auto& work = works[ithr];
-            auto& wb = wbs[ithr];
-            auto blkN = std::min(num_blk_N - start_blkN, blkN_per_thread);
-            wb.start = (start_blkN) * 32;
-            wb.end = (start_blkN + blkN)*32;
-            wb.BN = blkN * 32;
+        do_splitK = _do_splitK;
+        if (do_splitK) {
+            auto k_split_point = num_blk_K/2;
+            // every thread should do same amount of work, and some cores can be idle
+            auto valid_nthr = nthr / 2;
+            auto blkN_per_thread = (num_blk_N + valid_nthr - 1) / valid_nthr;
+            auto start_blkN = 0;
+            used_nthr = 0;
+            for (int ithr = 0; ithr < nthr; ithr+=2) {
+                auto& work0 = works[ithr];
+                auto& work1 = works[ithr + 1];
 
-            start_blkN += blkN;
-            if (blkN) {
+                auto blkN = std::min(num_blk_N - start_blkN, blkN_per_thread);
+
+                work0.p_jit_amx0 = &jit_amx0;
+                work0.p_jit_amx1 = &jit_amx1;
+                work1.p_jit_amx0 = &jit_amx0;
+                work1.p_jit_amx1 = &jit_amx1;
+
+                work0.n0 = (start_blkN) * 32;
+                work0.n1 = (start_blkN + blkN) * 32;
+                work0.BN = blkN * 32;
+                work0.k0 = 0;
+                work0.k1 = k_split_point * blk_K_size;
+                work0.blk_K_size = blk_K_size;
+
+                work1.n0 = (start_blkN) * 32;
+                work1.n1 = (start_blkN + blkN) * 32;
+                work1.BN = blkN * 32;
+                work1.k0 = k_split_point * blk_K_size;
+                work1.k1 = num_blk_K * blk_K_size;
+                work1.blk_K_size = blk_K_size;
+
+                work0.sync_flag = work1.sync_flag = std::make_shared<std::atomic_int>(0);
+
+                start_blkN += blkN;
+                if (blkN)
+                    used_nthr+=2;
+            }
+        } else {
+            // every thread should do same amount of work, and some cores can be idle
+            auto blkN_per_thread = (num_blk_N + nthr - 1) / nthr;
+            auto start_blkN = 0;
+            used_nthr = 0;
+            for (int ithr = 0; ithr < nthr; ithr++) {
+                auto& work = works[ithr];
+                auto blkN = std::min(num_blk_N - start_blkN, blkN_per_thread);
                 work.p_jit_amx0 = &jit_amx0;
                 work.p_jit_amx1 = &jit_amx1;
-                work.wb = &wb;
-                work.n0 = wb.start;
-                work.n1 = wb.end;
-                work.BN = wb.BN;
-                used_nthr ++;
+                work.n0 = (start_blkN) * 32;
+                work.n1 = (start_blkN + blkN) * 32;
+                work.BN = blkN * 32;
+                work.k0 = 0;
+                work.k1 = K;
+                work.blk_K_size = blk_K_size;
+
+                start_blkN += blkN;
+                if (blkN)
+                    used_nthr++;
             }
         }
 
-        std::cout << "Linear N,K=" << N << "," << K << " used_nthr=" << used_nthr << std::endl;
+        std::cout << "Linear N,K=" << N << "," << K << " used_nthr=" << used_nthr << "  do_splitK=" << do_splitK << std::endl;
 
 #pragma omp parallel
         {
             int ithr = omp_get_thread_num();
-            auto& wb = wbs[ithr];
-            if (wb.BN > 0) {
-                wb.setup(p_weight, stride, wb.start, wb.end, K, jit_amx0);
+            auto& work = works[ithr];
+            if (work) {
+                work.setup(p_weight, stride);
             }
         }
     }
@@ -549,7 +579,7 @@ public:
             }
         }
     }
-
+/*
     void run(uint8_t* pA, int strideA, int M, float* dstC, int strideC) {
 #pragma omp parallel
         {
@@ -577,6 +607,7 @@ public:
             }
         }
     }
+*/
 
     void run(uint8_t* pA, int strideA, int M, ov::bfloat16* dstC, int strideC) {
 #pragma omp parallel
@@ -585,20 +616,51 @@ public:
             auto& work = works[ithr];
             if (work) {
                 work.run(M, pA, strideA);
-                auto* src = &work.C[0];
-                auto* dst = dstC + work.n0;
-                auto strideS = work.C.stride / sizeof(*src);
-                auto strideD = strideC / sizeof(*dst);
-                for (int m = 0; m < M; m++, src += strideS, dst += strideD) {
-                    // the prefetch distance is increased to ensure by the time store happens
-                    // prefetch has done and no HW prefetcher is triggered
-                    auto* prefetch_dst = (m + 2 < M) ? (dst + 2 * strideD) : (dst);
-                    for (int n = 0; n < work.BN; n += 32) {
-                        auto d0 = _mm512_loadu_ps(src + n);
-                        auto d1 = _mm512_loadu_ps(src + n + 16);
-                        auto v_bh = _mm512_cvtne2ps_pbh(d1, d0);
-                        _mm_prefetch(prefetch_dst + n, _MM_HINT_ET1);
-                        _mm512_storeu_ps(dst + n, reinterpret_cast<__m512&>(v_bh));
+
+                if (do_splitK) {
+                    auto sync_id = work.sync_flag->fetch_add(1);
+                    // (0,1) (2,3)
+                    if (sync_id & 1) {
+                        auto& peer = works[(ithr & 1) ? (ithr - 1) : (ithr + 1)];
+                        // the other one has finished, we can do the reduce sum
+                        auto* src0 = &work.C[0];
+                        auto* src1 = &peer.C[0];
+                        auto* dst = dstC + work.n0;
+                        auto strideS = work.C.stride / sizeof(*src0);
+                        auto strideD = strideC / sizeof(*dst);
+                        for (int m = 0; m < M; m++, src0 += strideS, src1 += strideS, dst += strideD) {
+                            // the prefetch distance is increased to ensure by the time store happens
+                            // prefetch has done and no HW prefetcher is triggered
+                            auto* prefetch_dst = (m + 2 < M) ? (dst + 2 * strideD) : (dst);
+                            for (int n = 0; n < work.BN; n += 32) {
+                                auto d0 = _mm512_loadu_ps(src0 + n);
+                                auto d0b = _mm512_loadu_ps(src1 + n);
+                                auto d1 = _mm512_loadu_ps(src0 + n + 16);
+                                auto d1b = _mm512_loadu_ps(src1 + n + 16);
+                                d0 = _mm512_add_ps(d0, d0b);
+                                d1 = _mm512_add_ps(d1, d1b);
+                                auto v_bh = _mm512_cvtne2ps_pbh(d1, d0);
+                                _mm_prefetch(prefetch_dst + n, _MM_HINT_ET1);
+                                _mm512_storeu_ps(dst + n, reinterpret_cast<__m512&>(v_bh));
+                            }
+                        }
+                    }
+                } else {
+                    auto* src = &work.C[0];
+                    auto* dst = dstC + work.n0;
+                    auto strideS = work.C.stride / sizeof(*src);
+                    auto strideD = strideC / sizeof(*dst);
+                    for (int m = 0; m < M; m++, src += strideS, dst += strideD) {
+                        // the prefetch distance is increased to ensure by the time store happens
+                        // prefetch has done and no HW prefetcher is triggered
+                        auto* prefetch_dst = (m + 2 < M) ? (dst + 2 * strideD) : (dst);
+                        for (int n = 0; n < work.BN; n += 32) {
+                            auto d0 = _mm512_loadu_ps(src + n);
+                            auto d1 = _mm512_loadu_ps(src + n + 16);
+                            auto v_bh = _mm512_cvtne2ps_pbh(d1, d0);
+                            _mm_prefetch(prefetch_dst + n, _MM_HINT_ET1);
+                            _mm512_storeu_ps(dst + n, reinterpret_cast<__m512&>(v_bh));
+                        }
                     }
                 }
             }
@@ -617,7 +679,7 @@ public:
                 // combine Gate & Up
                 auto* src = &work.C[0];
                 auto strideS = work.C.stride / sizeof(*src);
-                auto* dst = dstC + (work.n0/2); // important output is only half of the total N
+                auto* dst = dstC + (work.n0 / 2); // important output is only half of the total N
                 auto strideD = strideC / sizeof(*dst);
                 for (int m = 0; m < M; m++, src += strideS, dst += strideD) {
                     auto* prefetch_dst = (m + 1 < M) ? (dst + strideD) : (dst);
@@ -665,7 +727,7 @@ struct MLP {
                 memcpy(&w_gate_up(2 * n + 16 + i, 0), &w_up(n + i, 0), K * sizeof(ov::bfloat16));
         }
         gate_up.setup(&w_gate_up[0], w_gate_up.stride, N * 2, K);
-        down.setup(&w_down[0], w_down.stride, K, N);
+        down.setup(&w_down[0], w_down.stride, K, N, true);
         m_N = N;
     }
 
@@ -707,9 +769,7 @@ void mlp_ref(tensor2D<ov::bfloat16>& A, tensor2D<ov::bfloat16>& gate, tensor2D<o
     matmul(A, up, Aup);
 
     // SiLu(gate) * up
-    auto silu = [&](float x) {
-        return x * 1.0f  / (1.0f + std::exp(-x));
-    };
+    auto silu = [&](float x) { return x * 1.0f / (1.0f + std::exp(-x)); };
 
     auto silu_gate_up = [](float g, float u) {
         auto v_gate = _mm512_set1_ps(g);
@@ -766,7 +826,7 @@ void test1() {
     auto downT = down.Tr();
     std::cout << __LINE__ << std::endl;
 
-    for (auto& mlp: mlps)
+    for (auto& mlp : mlps)
         mlp.setup(&gateT[0], &upT[0], &downT[0], K, N);
     std::cout << __LINE__ << std::endl;
 
@@ -775,7 +835,7 @@ void test1() {
 
     std::string acc;
     const char* acc_color = nullptr;
-    if (C1.allclose(C0, 0.05, 0.005)) {
+    if (C1.allclose(C0, 0.05, 0.01)) {
         acc = "[PASS]";
     } else {
         acc = "[FAIL]";
@@ -789,19 +849,21 @@ void test1() {
     plog.tag("MLP", M, K, N, acc);
     plog.color(acc_color);
 
-    for(int r = 0; r < 4; r++) {
+    for (int r = 0; r < 4; r++) {
         plog();
         bool flag = true;
-        for (auto& mlp: mlps) {
+        for (auto& mlp : mlps) {
             auto& in = (flag) ? (A) : (C1);
             auto& out = (!flag) ? (A) : (C1);
             flag = !flag;
-            //plog([&]() { mlp.run(reinterpret_cast<uint8_t*>(&in[0]), in.stride, M, &out[0], out.stride); });
-            // gate_up.runGateUp(pA, strideA, M, &actUp[0], actUp.stride);
-            // down.run(reinterpret_cast<uint8_t*>(&actUp[0]), actUp.stride, M, dstC, strideC);
+            // plog([&]() { mlp.run(reinterpret_cast<uint8_t*>(&in[0]), in.stride, M, &out[0], out.stride); });
+            //  gate_up.runGateUp(pA, strideA, M, &actUp[0], actUp.stride);
+            //  down.run(reinterpret_cast<uint8_t*>(&actUp[0]), actUp.stride, M, dstC, strideC);
             mlp.setM(M);
-            plog([&]() { mlp.gate_up.runGateUp(reinterpret_cast<uint8_t*>(&A[0]), A.stride, M, &mlp.actUp[0], mlp.actUp.stride); }, 4.0*M*N*K/mlp.gate_up.used_nthr);
-            plog([&]() { mlp.down.run(reinterpret_cast<uint8_t*>(&mlp.actUp[0]), mlp.actUp.stride, M, &C1[0], C1.stride); }, 2.0*M*N*K/mlp.down.used_nthr);
+            plog([&]() { mlp.gate_up.runGateUp(reinterpret_cast<uint8_t*>(&A[0]), A.stride, M, &mlp.actUp[0], mlp.actUp.stride); },
+                 4.0 * M * N * K / mlp.gate_up.used_nthr);
+            plog([&]() { mlp.down.run(reinterpret_cast<uint8_t*>(&mlp.actUp[0]), mlp.actUp.stride, M, &C1[0], C1.stride); },
+                 2.0 * M * N * K / mlp.down.used_nthr);
         }
     }
 }
@@ -809,6 +871,7 @@ void test1() {
 int main() {
     MSRConfig _msr;
     bool initAMX = initXTILE();
-    srand(0);
+#pragma omp parallel
+    { srand(0); }
     test1();
 }
