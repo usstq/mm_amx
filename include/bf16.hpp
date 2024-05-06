@@ -89,7 +89,16 @@ public:
 #define cu32(x) (F32(x).i)
 
     static uint16_t round_to_nearest_even(float x) {
-        return static_cast<uint16_t>((cu32(x) + ((cu32(x) & 0x00010000) >> 1)) >> 16);
+        // https://www.felixcloutier.com/x86/vcvtneps2bf16
+        // convert_fp32_to_bfloat16
+        // normal number
+        // LSB := x[16]
+        // rounding_bias := 0x00007FFF + LSB
+        // temp[31:0] := x[31:0] + rounding_bias // integer add
+        // dest[15:0] := temp[31:16]
+        //return static_cast<uint16_t>((cu32(x) + ((cu32(x) & 0x00010000) >> 1)) >> 16);
+        auto rounding_bias = 0x00007FFF + ((cu32(x) >> 16) & 1);
+        return static_cast<uint16_t>((cu32(x) + rounding_bias) >> 16);
     }
 
     static uint16_t round_to_nearest(float x) {

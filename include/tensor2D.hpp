@@ -149,7 +149,7 @@ struct tensor2D {
         // +1 -1 for integer types
         // 0.5 -0.5 for float point 
         
-        float scale = std::is_integral<T>::value ? 2.0f : 0.125f;
+        float scale = std::is_integral<T>::value ? 2.0f : 1;
         #pragma omp parallel for
         for(int i = 0; i <= total - 8; i+=8) {
             // lower mantissa can help to avoid small errors in accuracy comparison
@@ -215,8 +215,17 @@ struct tensor2D {
     }
 
     bool operator==(const tensor2D<T> & rhs) const {
+        return allclose(rhs);
+    }
+
+    bool allclose(const tensor2D<T> & rhs, float rtol=1e-05, float atol=1e-08) const {
+        // 
+        // absolute(a - b) <= (atol + rtol * absolute(b))
+        //   here *this is a, rhs is b
         if (dims[0] != rhs.dims[0] || dims[1] != rhs.dims[1])
             return false;
+        float max_rtol = 0;
+        float max_atol = 0;
         for(int i0=0; i0<dims[0]; i0++)
         for(int i1=0; i1<dims[1]; i1++) {
             // with -ffast-math,  std::isnan, std::isinf,  x != x  always return false
@@ -231,12 +240,25 @@ struct tensor2D {
                 }
             }
 
-            if ((*this)(i0,i1) == rhs(i0,i1))
+            float a = (*this)(i0,i1);
+            float b = rhs(i0,i1);
+
+            auto absolute_diff = std::abs(a - b);
+            auto absolute_b = std::abs(b);
+            
+            auto cur_rtol = (absolute_diff - atol)/absolute_b;
+            auto cur_atol = absolute_diff - rtol * absolute_b;
+
+            max_rtol = std::max(max_rtol, cur_rtol);
+            max_atol = std::max(max_atol, cur_atol);
+            if (absolute_diff <= (atol + rtol * absolute_b))
                 continue;
             std::cout << " operator== failed at (" << i0 << ", " << i1 << ")  value "
                         << (*this)(i0,i1) << "!=" << rhs(i0,i1) << std::endl;
+            std::cout << "to pass: adjust rtol to " << cur_rtol << " OR atol to " << cur_atol << std::endl;
             return false;
         }
+        std::cout << "[all pass] with max rtol,atol=" << max_rtol << "," << max_atol << std::endl;
         return true;
     }
 

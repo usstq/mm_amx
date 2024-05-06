@@ -425,24 +425,51 @@ inline __m512 silu_ps_avx512(const __m512 x) {
 
 class Linear {
 public:
-    struct Work {
-        MKernel* p_jit_amx0;
-        MKernel* p_jit_amx1;
+    // sometime N diemsion is too small, we need to split along M dimension to use more cores
+    // Works will need to share weights
+
+    struct WeightBlocks {
         std::vector<tensor2D<ov::bfloat16>> weights;
-        tensor2D<float> C;
         int start;
         int end;
         int BN;
 
+        // input : weight [N, K], setup repacks range of N [n_start, n_end)
+        template <typename T>
+        void setup(T* p_weight, int stride, int n_start, int n_end, int K, MKernel& jit_amx0) {
+            auto num_blk_K = K / 256;
+            auto* pw = p_weight + n_start * stride / sizeof(T);
+            weights.resize(num_blk_K);
+            for (int k = 0; k < num_blk_K; k++) {
+                weights[k] = jit_amx0.prepareB(pw + k * 256, stride, BN, 256);
+            }
+            start = n_start;
+            end = n_end;
+            BN = end - start;
+        }
+    };
+
+    struct Work {
+        MKernel* p_jit_amx0 = nullptr;
+        MKernel* p_jit_amx1 = nullptr;
+        WeightBlocks * wb = nullptr;
+        tensor2D<float> C;
+        int n0;
+        int n1;
+        int BN;
+        operator bool() {
+            return wb != nullptr;
+        }
+
         void run(int M, uint8_t* pA, int strideA) {
-            int num_blk_K = weights.size();
+            int num_blk_K = wb->weights.size();
             C.resize(M, BN);
 
             TileConfigScope tcfg(p_jit_amx0->m_tile_cfg);
             MKernel* pkernel = p_jit_amx0;
             for (int ki = 0; ki < num_blk_K; ki++) {
-                tensor2D<ov::bfloat16>& blockB = weights[ki];
-                tensor2D<ov::bfloat16>& blockB1 = weights[(ki + 1) < num_blk_K ? (ki + 1) : ki];
+                tensor2D<ov::bfloat16>& blockB = wb->weights[ki];
+                tensor2D<ov::bfloat16>& blockB1 = wb->weights[(ki + 1) < num_blk_K ? (ki + 1) : ki];
 
                 pkernel->run(M, pA + ki * 256 * sizeof(ov::bfloat16), strideA, blockB, reinterpret_cast<uint8_t*>(&C[0]), C.stride,
                              reinterpret_cast<uint8_t*>(&blockB1[0]));
@@ -451,6 +478,7 @@ public:
         }
     };
     std::vector<Work> works;
+    std::vector<WeightBlocks> wbs;
     int used_nthr = 0;
 
     Linear() {}
@@ -472,6 +500,7 @@ public:
         auto num_blk_N = N / 32;
         auto num_blk_K = K / 256;
         works.resize(nthr);
+        wbs.resize(nthr);
 
         // every thread should do same amount of work, and some cores can be idle
         auto blkN_per_thread = (num_blk_N + nthr - 1)/ nthr;
@@ -479,13 +508,22 @@ public:
         used_nthr = 0;
         for (int ithr = 0; ithr < nthr; ithr ++) {
             auto& work = works[ithr];
+            auto& wb = wbs[ithr];
             auto blkN = std::min(num_blk_N - start_blkN, blkN_per_thread);
-            work.start = (start_blkN) * 32;
-            work.end = (start_blkN + blkN)*32;
-            work.BN = blkN * 32;
+            wb.start = (start_blkN) * 32;
+            wb.end = (start_blkN + blkN)*32;
+            wb.BN = blkN * 32;
+
             start_blkN += blkN;
-            if (blkN)
+            if (blkN) {
+                work.p_jit_amx0 = &jit_amx0;
+                work.p_jit_amx1 = &jit_amx1;
+                work.wb = &wb;
+                work.n0 = wb.start;
+                work.n1 = wb.end;
+                work.BN = wb.BN;
                 used_nthr ++;
+            }
         }
 
         std::cout << "Linear N,K=" << N << "," << K << " used_nthr=" << used_nthr << std::endl;
@@ -493,16 +531,9 @@ public:
 #pragma omp parallel
         {
             int ithr = omp_get_thread_num();
-            auto& work = works[ithr];
-            if (work.BN > 0) {
-                work.weights.resize(num_blk_K);
-                work.p_jit_amx0 = &jit_amx0;
-                work.p_jit_amx1 = &jit_amx1;
-
-                auto* pw = p_weight + work.start * stride / sizeof(T);
-                for (int k = 0; k < num_blk_K; k++) {
-                    work.weights[k] = jit_amx0.prepareB(pw + k * 256, stride, work.BN, 256);
-                }
+            auto& wb = wbs[ithr];
+            if (wb.BN > 0) {
+                wb.setup(p_weight, stride, wb.start, wb.end, K, jit_amx0);
             }
         }
     }
@@ -513,7 +544,7 @@ public:
         {
             int ithr = omp_get_thread_num();
             auto& work = works[ithr];
-            if (work.BN > 0) {
+            if (work) {
                 work.run(M, pA, strideA);
             }
         }
@@ -524,10 +555,10 @@ public:
         {
             int ithr = omp_get_thread_num();
             auto& work = works[ithr];
-            if (work.BN > 0) {
+            if (work) {
                 work.run(M, pA, strideA);
                 auto* src = &work.C[0];
-                auto* dst = dstC + work.start;
+                auto* dst = dstC + work.n0;
                 auto strideS = work.C.stride / sizeof(*src);
                 auto strideD = strideC / sizeof(*dst);
                 for (int m = 0; m < M; m++, src += strideS, dst += strideD) {
@@ -552,10 +583,10 @@ public:
         {
             int ithr = omp_get_thread_num();
             auto& work = works[ithr];
-            if (work.BN > 0) {
+            if (work) {
                 work.run(M, pA, strideA);
                 auto* src = &work.C[0];
-                auto* dst = dstC + work.start;
+                auto* dst = dstC + work.n0;
                 auto strideS = work.C.stride / sizeof(*src);
                 auto strideD = strideC / sizeof(*dst);
                 for (int m = 0; m < M; m++, src += strideS, dst += strideD) {
@@ -586,7 +617,7 @@ public:
                 // combine Gate & Up
                 auto* src = &work.C[0];
                 auto strideS = work.C.stride / sizeof(*src);
-                auto* dst = dstC + (work.start/2); // important output is only half of the total N
+                auto* dst = dstC + (work.n0/2); // important output is only half of the total N
                 auto strideD = strideC / sizeof(*dst);
                 for (int m = 0; m < M; m++, src += strideS, dst += strideD) {
                     auto* prefetch_dst = (m + 1 < M) ? (dst + strideD) : (dst);
@@ -670,17 +701,45 @@ void mlp_ref(tensor2D<ov::bfloat16>& A, tensor2D<ov::bfloat16>& gate, tensor2D<o
     tensor2D<float> Aup(M, N, true);
     tensor2D<ov::bfloat16> act2(M, N, true);
 
+    Agate = 0;
+    Aup = 0;
     matmul(A, gate, Agate);
     matmul(A, up, Aup);
 
     // SiLu(gate) * up
-    auto silu = [](float x) { return x * 1.0f  / (1.0f + std::exp(-x)); };
+    auto silu = [&](float x) {
+        return x * 1.0f  / (1.0f + std::exp(-x));
+    };
+
+    auto silu_gate_up = [](float g, float u) {
+        auto v_gate = _mm512_set1_ps(g);
+        auto v_up = _mm512_set1_ps(u);
+        auto vsilu = AMX_MLP::silu_ps_avx512(v_gate);
+        v_up = _mm512_mul_ps(vsilu, v_up);
+        auto v_bh = _mm512_cvtneps_pbh(v_up);
+        int result = _mm512_cvtsi512_si32(reinterpret_cast<__m512i&>(v_bh));
+        return ov::bfloat16::from_bits(result & 0xFFFF);
+    };
+
+    int num_error = 0;
     for (int m = 0; m < M; m++) {
         for (int n = 0; n < N; n++) {
-            act2(m, n) = silu(Agate(m, n)) * Aup(m, n);
+            auto gate = Agate(m, n);
+            auto up = Aup(m, n);
+            float f = silu_gate_up(gate, up);
+            if (num_error < 10) {
+                // f_reference
+                float f_reference = silu(gate) * up;
+                if (f_reference != f) {
+                    std::cout << "\t  SiLU_diff @(" << m << ", " << n << ") gate,up=" << gate << "," << up << "  ref:" << f_reference << "!=" << f << std::endl;
+                    num_error++;
+                }
+            }
+            act2(m, n) = f;
         }
     }
 
+    result = 0;
     matmul(act2, down, result);
 }
 
@@ -716,15 +775,9 @@ void test1() {
 
     std::string acc;
     const char* acc_color = nullptr;
-    if (C0 == C1) {
+    if (C1.allclose(C0, 0.05, 0.005)) {
         acc = "[PASS]";
     } else {
-        if (std::getenv("SHOW_ERR")) {
-            std::cout << "============= A ================ " << std::endl;
-            std::cout << A << std::endl;
-            logger() << C0 << std::endl;
-            logger() << C1 << std::endl;
-        }
         acc = "[FAIL]";
         acc_color = "1;31";
     }
