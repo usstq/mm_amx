@@ -534,10 +534,21 @@ inline void splitter(const T& n, const Q& team, const Q& tid, T& n_start, T& n_e
     n_end += n_start;
 }
 
+
+template<int id = 0>
+inline float get_delta_ms() {
+    static auto t0 = std::chrono::high_resolution_clock::now();
+    auto t1 = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> dt = t1 - t0;
+    t0 = t1;
+    return dt.count();
+}
+
 template <typename... Ts>
 void easy_cout(const char* file, const char* func, int line, Ts... args) {
     std::string file_path(file);
     std::string file_name(file);
+
     auto last_sep = file_path.find_last_of('/');
     if (last_sep == std::string::npos)
         last_sep = file_path.find_last_of('\\');
@@ -549,7 +560,7 @@ void easy_cout(const char* file, const char* func, int line, Ts... args) {
 
     std::stringstream ss;
     int dummy[sizeof...(Ts)] = {(ss << args, 0)...};
-    std::cout << tag << " " << ss.str() << std::endl;
+    std::cout << " \033[30;44m+" << std::fixed << std::setprecision(3) << get_delta_ms() << " ms \033[30;46m " << tag << " \033[30;42m " << ss.str() << "\033[0m" << std::endl;
 }
 
 #define ECOUT(...) easy_cout(__FILE__, __func__, __LINE__, __VA_ARGS__)

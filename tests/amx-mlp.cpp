@@ -108,6 +108,14 @@ public:
     // row data is in layout [N, K], maybe smaller than [32, 16]
     template <typename T>
     void repackB(ov::bfloat16* dst, T* src, int N_stride, int N, int K) {
+
+        if (N == 16 && K == 32 && std::is_same<T, ov::bfloat16>::value) {
+            // SIMD optimized version
+            //std::cout << "." << std::flush;
+            amx_kernel::functional::transpose_epi32_16x16(dst, src, N_stride*sizeof(T));
+            return;
+        }
+
         assert(K <= 32);
         assert(N <= 16);
         int k = 0;
@@ -495,68 +503,43 @@ public:
         works.resize(nthr);
 
         do_splitK = _do_splitK;
-        if (do_splitK) {
-            auto k_split_point = num_blk_K/2;
-            // every thread should do same amount of work, and some cores can be idle
-            auto valid_nthr = nthr / 2;
-            auto blkN_per_thread = (num_blk_N + valid_nthr - 1) / valid_nthr;
-            auto start_blkN = 0;
-            used_nthr = 0;
-            for (int ithr = 0; ithr < nthr; ithr+=2) {
-                auto& work0 = works[ithr];
-                auto& work1 = works[ithr + 1];
+        auto K_splits = do_splitK ? 2 : 1;
+        // every thread should do same amount of work, and some cores can be idle
+        auto valid_nthr = nthr / K_splits;
+        auto blkN_per_thread = (num_blk_N + valid_nthr - 1) / valid_nthr;
+        auto start_blkN = 0;
+        used_nthr = 0;
+        auto blkK_per_thread = (num_blk_K + K_splits - 1)/ K_splits;
+        for (int ithr = 0; ithr < nthr; ithr+=K_splits) {
+            auto blkN = std::min(num_blk_N - start_blkN, blkN_per_thread);
 
-                auto blkN = std::min(num_blk_N - start_blkN, blkN_per_thread);
+            if (blkN) {
+                auto shared_atomic = std::make_shared<std::atomic_int>(0);
+                auto start_blkK = 0;
+                for (int ik = 0; ik < K_splits; ik ++) {
+                    auto blk_K = std::min(num_blk_K - start_blkK, blkK_per_thread);
 
-                work0.p_jit_amx0 = &jit_amx0;
-                work0.p_jit_amx1 = &jit_amx1;
-                work1.p_jit_amx0 = &jit_amx0;
-                work1.p_jit_amx1 = &jit_amx1;
+                    auto& work = works[ithr + ik];
 
-                work0.n0 = (start_blkN) * 32;
-                work0.n1 = (start_blkN + blkN) * 32;
-                work0.BN = blkN * 32;
-                work0.k0 = 0;
-                work0.k1 = k_split_point * blk_K_size;
-                work0.blk_K_size = blk_K_size;
+                    work.p_jit_amx0 = &jit_amx0;
+                    work.p_jit_amx1 = &jit_amx1;
+                    work.sync_flag = shared_atomic;
+                    work.blk_K_size = blk_K_size;
 
-                work1.n0 = (start_blkN) * 32;
-                work1.n1 = (start_blkN + blkN) * 32;
-                work1.BN = blkN * 32;
-                work1.k0 = k_split_point * blk_K_size;
-                work1.k1 = num_blk_K * blk_K_size;
-                work1.blk_K_size = blk_K_size;
-
-                work0.sync_flag = work1.sync_flag = std::make_shared<std::atomic_int>(0);
-
-                start_blkN += blkN;
-                if (blkN)
-                    used_nthr+=2;
-            }
-        } else {
-            // every thread should do same amount of work, and some cores can be idle
-            auto blkN_per_thread = (num_blk_N + nthr - 1) / nthr;
-            auto start_blkN = 0;
-            used_nthr = 0;
-            for (int ithr = 0; ithr < nthr; ithr++) {
-                auto& work = works[ithr];
-                auto blkN = std::min(num_blk_N - start_blkN, blkN_per_thread);
-                work.p_jit_amx0 = &jit_amx0;
-                work.p_jit_amx1 = &jit_amx1;
-                work.n0 = (start_blkN) * 32;
-                work.n1 = (start_blkN + blkN) * 32;
-                work.BN = blkN * 32;
-                work.k0 = 0;
-                work.k1 = K;
-                work.blk_K_size = blk_K_size;
-
-                start_blkN += blkN;
-                if (blkN)
+                    work.n0 = (start_blkN) * 32;
+                    work.n1 = (start_blkN + blkN) * 32;
+                    work.BN = blkN * 32;
+                    work.k0 = start_blkK * blk_K_size;
+                    work.k1 = (start_blkK + blk_K) * blk_K_size;
+                    start_blkK += blk_K;
                     used_nthr++;
+                }
             }
+
+            start_blkN += blkN;
         }
 
-        std::cout << "Linear N,K=" << N << "," << K << " used_nthr=" << used_nthr << "  do_splitK=" << do_splitK << std::endl;
+        ECOUT("Linear N,K=", N, ",", K, " used_nthr=", used_nthr, "  do_splitK=", do_splitK);
 
 #pragma omp parallel
         {
@@ -719,7 +702,8 @@ struct MLP {
         tensor2D<ov::bfloat16> w_up(N, K, pw_up, K * sizeof(ov::bfloat16));
         tensor2D<ov::bfloat16> w_down(K, N, pw_down, N * sizeof(ov::bfloat16));
 
-        tensor2D<ov::bfloat16> w_gate_up(2 * N, K, true);
+        tensor2D<ov::bfloat16> w_gate_up;
+        w_gate_up.resize(2 * N, K, true);
         for (int n = 0; n < N; n += 16) {
             for (int i = 0; i < 16; i++)
                 memcpy(&w_gate_up(2 * n + i, 0), &w_gate(n + i, 0), K * sizeof(ov::bfloat16));
@@ -803,11 +787,14 @@ void mlp_ref(tensor2D<ov::bfloat16>& A, tensor2D<ov::bfloat16>& gate, tensor2D<o
     matmul(act2, down, result);
 }
 
+EnvVar envM("M", 256);
+
 void test1() {
-    int M = 256;
+    int M = envM;
     int K = 4096;
     int N = 11008;
-    std::vector<AMX_MLP::MLP> mlps(4);
+    int num_layers = 32;
+    std::vector<AMX_MLP::MLP> mlps(num_layers);
     tensor2D<ov::bfloat16> gate(K, N, true);
     tensor2D<ov::bfloat16> up(K, N, true);
     tensor2D<ov::bfloat16> down(N, K, true);
@@ -817,21 +804,19 @@ void test1() {
 
     auto nthr = get_nthr();
 
-    std::cout << __LINE__ << std::endl;
+    ECOUT("");
     mlp_ref(A, gate, up, down, C0);
 
-    std::cout << __LINE__ << std::endl;
+    ECOUT("");
     auto gateT = gate.Tr();
     auto upT = up.Tr();
     auto downT = down.Tr();
-    std::cout << __LINE__ << std::endl;
+    ECOUT("");
 
     for (auto& mlp : mlps)
         mlp.setup(&gateT[0], &upT[0], &downT[0], K, N);
-    std::cout << __LINE__ << std::endl;
 
     mlps[0].run(reinterpret_cast<uint8_t*>(&A[0]), A.stride, M, &C1[0], C1.stride);
-    std::cout << __LINE__ << std::endl;
 
     std::string acc;
     const char* acc_color = nullptr;
@@ -856,13 +841,18 @@ void test1() {
             auto& in = (flag) ? (A) : (C1);
             auto& out = (!flag) ? (A) : (C1);
             flag = !flag;
-            // plog([&]() { mlp.run(reinterpret_cast<uint8_t*>(&in[0]), in.stride, M, &out[0], out.stride); });
-            //  gate_up.runGateUp(pA, strideA, M, &actUp[0], actUp.stride);
-            //  down.run(reinterpret_cast<uint8_t*>(&actUp[0]), actUp.stride, M, dstC, strideC);
+            plog([&]() { mlp.run(reinterpret_cast<uint8_t*>(&in[0]), in.stride, M, &out[0], out.stride); });
+        }
+        plog();
+        flag = true;
+        for (auto& mlp : mlps) {
+            auto& in = (flag) ? (A) : (C1);
+            auto& out = (!flag) ? (A) : (C1);
+            flag = !flag;
             mlp.setM(M);
-            plog([&]() { mlp.gate_up.runGateUp(reinterpret_cast<uint8_t*>(&A[0]), A.stride, M, &mlp.actUp[0], mlp.actUp.stride); },
+            plog([&]() { mlp.gate_up.runGateUp(reinterpret_cast<uint8_t*>(&in[0]), in.stride, M, &mlp.actUp[0], mlp.actUp.stride); },
                  4.0 * M * N * K / mlp.gate_up.used_nthr);
-            plog([&]() { mlp.down.run(reinterpret_cast<uint8_t*>(&mlp.actUp[0]), mlp.actUp.stride, M, &C1[0], C1.stride); },
+            plog([&]() { mlp.down.run(reinterpret_cast<uint8_t*>(&mlp.actUp[0]), mlp.actUp.stride, M, &out[0], out.stride); },
                  2.0 * M * N * K / mlp.down.used_nthr);
         }
     }
