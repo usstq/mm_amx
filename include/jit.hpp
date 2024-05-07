@@ -53,7 +53,9 @@ constexpr Xbyak::Operand::Code abi_not_param_reg =
 //      The registers RBX, RBP, RDI, RSI, RSP, R12-R15 are considered nonvolatile (callee-saved).[25]
 // https://en.wikipedia.org/wiki/X86_calling_conventions#System_V_AMD64_ABI
 //      If the callee wishes to use registers RBX, RSP, RBP, and R12–R15, it must restore their original values before returning control to the caller. 
-//      so register RAX, R9, R10, R11 are the only 4 registers that need no preserve on the stack
+//      so register can be used w/o saving/restoring:
+//            abi_param1 ~ abi_param6
+//            RAX, R10, R11
 // 
 class jit_generator : public Xbyak::CodeGenerator {
  public:
@@ -227,5 +229,8 @@ class TileConfigScope {
   TileConfigScope(const TileConfig& cfg) {
     (Singleton<TileConfiger>::get())(&cfg);
   };
+  void update(const TileConfig& cfg) {
+    (Singleton<TileConfiger>::get())(&cfg);
+  }
   ~TileConfigScope() { (Singleton<TileConfiger>::get())(nullptr); }
 };

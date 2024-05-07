@@ -26,7 +26,7 @@
 namespace AMX_MLP {
 
 EnvVar SWPFA("SWPFA", 0); // prefetch A is slower, so disable it
-EnvVar MHINT("MHINT", 256);
+EnvVar MHINT("MHINT", 0);
 
 //
 // MKernel make linear a compute-bound kernel (as much as possible)
@@ -34,12 +34,6 @@ EnvVar MHINT("MHINT", 256);
 class MKernel : public jit_generator {
 public:
     TileConfig m_tile_cfg;
-
-    int64_t m_ktiles;
-
-    int m_BM_hint; // blockM: L2-cache kernel
-
-    bool m_do_accumulation;
 
     int m_prefetch_Blines;
 
@@ -78,30 +72,50 @@ public:
     //
     MKernel() = default;
 
-    MKernel(int M_hint, bool do_accumulation) { setup(M_hint, do_accumulation); }
+    MKernel(int M_hint) { setup(M_hint); }
 
-    void setup(int M_hint = 0, //  M_hint is only a hint for prefetching, set to 0 to avoid prefetch
-               bool do_accumulation = false) {
-        m_do_accumulation = do_accumulation;
-        m_BM_hint = MHINT; // M_hint;
+    //  M_hint is only a hint for prefetching, set to 0 to avoid prefetch
+    void setup(int M_hint = 0) {
+        if ((int)MHINT > 0)
+            M_hint = MHINT;
 
-        if (m_BM_hint == 0) {
+        if (M_hint == 0) {
             m_prefetch_Blines = 0;
         } else {
-            m_prefetch_Blines = 32768 * sizeof(ov::bfloat16) / 64 / m_BM_hint;
+            m_prefetch_Blines = 32768 * sizeof(ov::bfloat16) / 64 / M_hint;
         }
 
         create_kernel("MKernel");
-        m_tile_cfg.reset(1, 0,
+        tile_config_M(m_tile_cfg, M_hint);
+    }
+
+    // M can change w/o code-regeneration
+    // with the help of :
+    //  - m_BM_hint controls dynamic behaviour of the kernel
+    //  - tile config controls behaviour of tileload & TMUL
+    void tile_config_M(TileConfig& tile_cfg, int M) {
+        auto rows0 = 16;
+        auto rows1 = 16;
+        if (M < 32) {
+            // kernel is for processing Mtails
+            if (M > 16) {
+                rows0 = 16;
+                rows1 = M - 16;
+            } else {
+                //  both A0 & A1 load from same memory, to avoid code-regeneration
+                rows0 = rows1 = M;
+            }
+        }
+        tile_cfg.reset(1, 0,
                          {
-                             {16, 64}, // C:0
-                             {16, 64}, // C:1
-                             {16, 64}, // C:2
-                             {16, 64}, // C:3
-                             {16, 64}, // A0:4
-                             {16, 64}, // A1:5
-                             {16, 64}, // B0:6
-                             {16, 64}, // B1:7
+                             {rows0, 64}, // C00:0
+                             {rows0, 64}, // C01:1
+                             {rows1, 64}, // C10:2
+                             {rows1, 64}, // C11:3
+                             {rows0, 64}, // A0:4
+                             {rows1, 64}, // A1:5
+                             {16, 64},    // B0:6
+                             {16, 64},    // B1:7
                          });
     }
 
@@ -111,8 +125,8 @@ public:
 
         if (N == 16 && K == 32 && std::is_same<T, ov::bfloat16>::value) {
             // SIMD optimized version
-            //std::cout << "." << std::flush;
-            amx_kernel::functional::transpose_epi32_16x16(dst, src, N_stride*sizeof(T));
+            // std::cout << "." << std::flush;
+            amx_kernel::functional::transpose_epi32_16x16(dst, src, N_stride * sizeof(T));
             return;
         }
 
@@ -170,23 +184,33 @@ public:
     // to save push/pop: do not use `abi_save_gpr_regs`
     uint8_t* prefetch_next_A_addr;
 
+    struct call_args {
+        const uint8_t* pA;  // bfloat16
+        int64_t strideA;    // in bytes
+        const uint8_t* pB;  // bfloat16
+        const uint8_t* pC;  // float32
+        int64_t strideC;    // in bytes
+        const uint8_t* prefetch;
+        int64_t k_tiles;    // K / 32
+        int64_t do_accumulation;
+        int64_t M;
+    };
+
     void generate() {
-        Xbyak::Reg64 reg_A_addr = abi_param1;
-        Xbyak::Reg64 reg_A_stride = abi_param2;
-        Xbyak::Reg64 reg_B_addr = abi_param3;
-        Xbyak::Reg64 reg_C_addr = abi_param4;
-        Xbyak::Reg64 reg_C_stride = abi_param5;
-        Xbyak::Reg64 reg_prefetch = abi_param6; // prefetch B
+        Xbyak::Reg64 reg_A_addr = abi_param2;
+        Xbyak::Reg64 reg_A_stride = abi_param3;
+        Xbyak::Reg64 reg_B_addr = abi_param4;
+        Xbyak::Reg64 reg_C_addr = abi_param5;
+        Xbyak::Reg64 reg_C_stride = abi_param6;
 
         Xbyak::Reg64 reg_ktiles = rax;
-        Xbyak::Reg64 reg_prefetch_A = r9;
-        Xbyak::Reg64 reg_prefetch_A1 = r12;
         Xbyak::Reg64 reg_B_stride = r10;
         Xbyak::Reg64 reg_A1_addr = r11;
+        Xbyak::Reg64 reg_prefetch = r12;
 
         Xbyak::Tmm tmmC00 = tmm0;
-        Xbyak::Tmm tmmC10 = tmm1;
-        Xbyak::Tmm tmmC01 = tmm2;
+        Xbyak::Tmm tmmC01 = tmm1;
+        Xbyak::Tmm tmmC10 = tmm2;
         Xbyak::Tmm tmmC11 = tmm3;
         Xbyak::Tmm tmmA0 = tmm4;
         Xbyak::Tmm tmmA1 = tmm5;
@@ -200,41 +224,47 @@ public:
         A : 2x1 tiles  C: 2x2 tiles
         */
         Xbyak::Label loop_over_ktiles;
+        Xbyak::Label skip_load;
 
-        if (m_do_accumulation) {
-            auto reg_C1_addr = reg_A1_addr; // reuse reg_A1_addr
-#if 0
-            mov(reg_B_stride, 64);
-            tileloadd(tmmC00, ptr[reg_C_addr + reg_B_stride]);
-            tileloadd(tmmC01, ptr[reg_C_addr + reg_B_stride + 1024]);
-            tileloadd(tmmC10, ptr[reg_C_addr + reg_B_stride + 1024 * 2]);
-            tileloadd(tmmC11, ptr[reg_C_addr + reg_B_stride + 1024 * 3]);
-#else
-            tileloadd(tmmC00, ptr[reg_C_addr + reg_C_stride]);
-            tileloadd(tmmC01, ptr[reg_C_addr + reg_C_stride + 64]);
-            lea(reg_C1_addr, ptr[reg_C_addr + reg_C_stride * 8]);
-            lea(reg_C1_addr, ptr[reg_C1_addr + reg_C_stride * 8]);
-            tileloadd(tmmC10, ptr[reg_C1_addr + reg_C_stride]);
-            tileloadd(tmmC11, ptr[reg_C1_addr + reg_C_stride + 64]);
-#endif
-        } else {
+        push(reg_prefetch);
+        {
+            auto reg_tmp = reg_B_stride;
             tilezero(tmmC00);
             tilezero(tmmC01);
             tilezero(tmmC10);
             tilezero(tmmC11);
-        }
-        mov(reg_B_stride, reinterpret_cast<uintptr_t>(&m_ktiles));
-        mov(reg_ktiles, ptr[reg_B_stride + 0]);
 
-        if (SWPFA) {
-            push(reg_prefetch_A1);
-            mov(reg_B_stride, reinterpret_cast<uintptr_t>(&prefetch_next_A_addr));
-            mov(reg_prefetch_A, ptr[reg_B_stride + 0]);
-            mov(reg_prefetch_A1, ptr[reg_prefetch_A + 2 * reg_A_stride]);
+            mov(reg_A_addr, ptr[abi_param1 + offsetof(call_args, pA)]);
+            mov(reg_A_stride, ptr[abi_param1 + offsetof(call_args, strideA)]);
+            mov(reg_B_addr, ptr[abi_param1 + offsetof(call_args, pB)]);
+            mov(reg_C_addr, ptr[abi_param1 + offsetof(call_args, pC)]);
+            mov(reg_C_stride, ptr[abi_param1 + offsetof(call_args, strideC)]);
+            mov(reg_prefetch, ptr[abi_param1 + offsetof(call_args, prefetch)]);
+            mov(reg_ktiles, ptr[abi_param1 + offsetof(call_args, k_tiles)]);
+
+            lea(reg_A1_addr, ptr[reg_A_addr + reg_A_stride * 8]);
+            lea(reg_A1_addr, ptr[reg_A1_addr + reg_A_stride * 8]);
+
+            // reg_A1_addr = reg_A_addr if M <= 16 (to avoid tileloadd segmentfault)
+            mov(reg_tmp, ptr[abi_param1 + offsetof(call_args, M)]);
+            cmp(reg_tmp, 16);
+            cmovle(reg_A1_addr, reg_A_addr);
+
+            mov(reg_tmp, ptr[abi_param1 + offsetof(call_args, do_accumulation)]);
+            and_(reg_tmp, 1);
+            jz(skip_load);
+            {
+                auto reg_C1_addr = reg_tmp;
+                tileloadd(tmmC00, ptr[reg_C_addr + reg_C_stride]);
+                tileloadd(tmmC01, ptr[reg_C_addr + reg_C_stride + 64]);
+                lea(reg_C1_addr, ptr[reg_C_addr + reg_C_stride * 8]);
+                lea(reg_C1_addr, ptr[reg_C1_addr + reg_C_stride * 8]);
+                tileloadd(tmmC10, ptr[reg_C1_addr + reg_C_stride]);
+                tileloadd(tmmC11, ptr[reg_C1_addr + reg_C_stride + 64]);
+            }
+            L(skip_load);
         }
 
-        lea(reg_A1_addr, ptr[reg_A_addr + reg_A_stride * 8]);
-        lea(reg_A1_addr, ptr[reg_A1_addr + reg_A_stride * 8]);
         mov(reg_B_stride, 64);
 
         auto const_A_steps = 64;
@@ -252,29 +282,22 @@ public:
             cur_PFB++;
         }
 
-        if (SWPFA)
-            prefetcht2(ptr[reg_prefetch_A]);
-
         tileloadd(tmmA1, ptr[reg_A1_addr + reg_A_stride]);
         tdpbf16ps(tmmC10, tmmA1, tmmB0);
         if (cur_PFB < num_PFB) {
             prefetcht2(ptr[reg_prefetch + cur_PFB * 64]);
             cur_PFB++;
         }
-        if (SWPFA)
-            prefetcht2(ptr[reg_prefetch_A + reg_A_stride]);
 
         tileloadd(tmmB1, ptr[reg_B_addr + reg_B_stride]);
 
-        // prefetch [num_Ktiles X 256] bytes
+        // prefetch [K_tiles X 256] bytes
 
         tdpbf16ps(tmmC01, tmmA0, tmmB1);
         if (cur_PFB < num_PFB) {
             prefetcht2(ptr[reg_prefetch + cur_PFB * 64]);
             cur_PFB++;
         }
-        if (SWPFA)
-            prefetcht2(ptr[reg_prefetch_A1]);
 
         tdpbf16ps(tmmC11, tmmA1, tmmB1);
         // prefetch next sub-block B matrix
@@ -283,15 +306,8 @@ public:
                 prefetcht2(ptr[reg_prefetch + pi * 64]);
             }
         }
-        if (SWPFA)
-            prefetcht2(ptr[reg_prefetch_A1 + reg_A_stride]);
 
         lea(reg_prefetch, ptr[reg_prefetch + 64 * num_PFB]);
-
-        if (SWPFA)
-            lea(reg_prefetch_A, ptr[reg_prefetch_A + 64]);
-        if (SWPFA)
-            lea(reg_prefetch_A1, ptr[reg_prefetch_A1 + 64]);
 
         //}
         lea(reg_A_addr, ptr[reg_A_addr + const_A_steps]);
@@ -313,8 +329,7 @@ public:
         tilestored(ptr[reg_C_addr + reg_C_stride], tmmC10);
         tilestored(ptr[reg_C_addr + reg_C_stride + 64], tmmC11);
 #endif
-        if (SWPFA)
-            pop(reg_prefetch_A1);
+        pop(reg_prefetch);
         ret();
     }
 
@@ -329,27 +344,36 @@ public:
              uint8_t* pA, int strideA,           // A [M, K]
              tensor2D<ov::bfloat16>& repacked_B, // B [N/32, K*32]
              uint8_t* pC, int strideC,           // C [M, N]
-             uint8_t* prefetch_B                 // prefetch B
-    ) {
+             uint8_t* prefetch_B,                // prefetch B
+             bool do_accumulation) {
+        call_args args;
         // number of blocks in N dimension (in unit of 32 columns)
         auto num_blkN = repacked_B.dims[0];
         auto K = repacked_B.dims[1] / 32;
         auto* pB = reinterpret_cast<uint8_t*>(&repacked_B[0]);
         auto strideB = repacked_B.stride;
-        m_ktiles = K / 32;
 
+        args.do_accumulation = do_accumulation;
+        args.k_tiles = K / 32;
+        args.strideA = strideA;
+        args.strideC = strideC;
+        args.prefetch = prefetch_B;
         assert((K % 32) == 0);
 
-        auto prefetch_step = m_prefetch_Blines * 64 * m_ktiles;
+        auto prefetch_step = m_prefetch_Blines * 64 * args.k_tiles;
 
         // if (BM != m_BM_hint) it only effect prefetch of B which is not vital to function
         for (int m = 0; m < M; m += 32, pA += 32 * strideA, pC += 32 * strideC) {
-            auto* pB1 = pB;
+            args.pB = pB;
             // prefetch_next_A_addr = pA + 32 * strideA;
             // if (m + 32 >= BM)
             //     prefetch_next_A_addr = pA;
-            for (int ni = 0; ni < num_blkN; ni++, pB1 += strideB, prefetch_B += prefetch_step) {
-                (*this)(pA, strideA, pB1, pC + ni * 32 * sizeof(float), strideC, prefetch_B);
+            args.M = std::min(M - m, 32);
+            args.pA = pA;
+            for (int ni = 0; ni < num_blkN; ni++, args.pB += strideB, args.prefetch += prefetch_step) {
+                args.pC = pC + ni * 32 * sizeof(float);
+                (*this)(&args);
+                //(*this)(pA, strideA, pB1, pC + ni * 32 * sizeof(float), strideC, prefetch_B);
                 // prefetch_next_A_addr += 4 * strideA;
             }
         }
@@ -435,7 +459,7 @@ class Linear {
 public:
     struct Work {
         MKernel* p_jit_amx0 = nullptr;
-        MKernel* p_jit_amx1 = nullptr;
+
         std::vector<tensor2D<ov::bfloat16>> weights;
         tensor2D<float> C;
         std::shared_ptr<std::atomic_int> sync_flag;
@@ -460,19 +484,50 @@ public:
 
         void run(int M, uint8_t* pA, int strideA) {
             int num_blk_K = weights.size();
-            C.resize(M, BN);
+
+            TileConfig tile_cfg0;
+            TileConfig tile_cfg1;
+
+            auto Mtails = M % 32;
+            auto Mbody = M - Mtails;
+            p_jit_amx0->tile_config_M(tile_cfg0, 32);
+            if (Mtails) {
+                p_jit_amx0->tile_config_M(tile_cfg1, Mtails);
+            }
+
+            bool cur_tile_config = false;
+            TileConfigScope tcfg(tile_cfg0);
+            auto set_tile_config = [&](bool to_tail) {
+                if (cur_tile_config != to_tail) {
+                    if (to_tail)
+                        tcfg.update(tile_cfg1);
+                    else
+                        tcfg.update(tile_cfg0);
+                    cur_tile_config = to_tail;
+                }
+            };
+
+            C.resize(Mbody + (Mtails? 32:0), BN);
 
             pA += k0 * sizeof(ov::bfloat16);
-
-            TileConfigScope tcfg(p_jit_amx0->m_tile_cfg);
-            MKernel* pkernel = p_jit_amx0;
+            auto pC = reinterpret_cast<uint8_t*>(&C[0]);
+            bool do_accumulation = false;
             for (int ki = 0; ki < num_blk_K; ki++) {
                 tensor2D<ov::bfloat16>& blockB = weights[ki];
                 tensor2D<ov::bfloat16>& blockB1 = weights[(ki + 1) < num_blk_K ? (ki + 1) : ki];
 
-                pkernel->run(M, pA + ki * blk_K_size * sizeof(ov::bfloat16), strideA, blockB, reinterpret_cast<uint8_t*>(&C[0]), C.stride,
-                             reinterpret_cast<uint8_t*>(&blockB1[0]));
-                pkernel = p_jit_amx1;
+                if (Mbody) {
+                    set_tile_config(false);
+                    p_jit_amx0->run(Mbody, pA + ki * blk_K_size * sizeof(ov::bfloat16), strideA, blockB, pC, C.stride,
+                                    reinterpret_cast<uint8_t*>(&blockB1[0]), do_accumulation);
+                }
+                
+                if (Mtails) {
+                    set_tile_config(true);
+                    p_jit_amx0->run(Mtails, pA + ki * blk_K_size * sizeof(ov::bfloat16) + Mbody*strideA, strideA, blockB, pC + Mbody*C.stride, C.stride,
+                                reinterpret_cast<uint8_t*>(&blockB1[0]), do_accumulation);
+                }
+                do_accumulation = true;
             }
         }
     };
@@ -489,8 +544,7 @@ public:
     // and store out as bfloat16.
     template <typename T, int BM = 256>
     void setup(T* p_weight, int stride, int N, int K, bool _do_splitK = false) {
-        static MKernel jit_amx0(BM, false);
-        static MKernel jit_amx1(BM, true);
+        static MKernel jit_amx0(BM);
 
         const int blk_K_size = 256;
         // prepare weights, split N among threads
@@ -509,20 +563,19 @@ public:
         auto blkN_per_thread = (num_blk_N + valid_nthr - 1) / valid_nthr;
         auto start_blkN = 0;
         used_nthr = 0;
-        auto blkK_per_thread = (num_blk_K + K_splits - 1)/ K_splits;
-        for (int ithr = 0; ithr < nthr; ithr+=K_splits) {
+        auto blkK_per_thread = (num_blk_K + K_splits - 1) / K_splits;
+        for (int ithr = 0; ithr < nthr; ithr += K_splits) {
             auto blkN = std::min(num_blk_N - start_blkN, blkN_per_thread);
 
             if (blkN) {
                 auto shared_atomic = std::make_shared<std::atomic_int>(0);
                 auto start_blkK = 0;
-                for (int ik = 0; ik < K_splits; ik ++) {
+                for (int ik = 0; ik < K_splits; ik++) {
                     auto blk_K = std::min(num_blk_K - start_blkK, blkK_per_thread);
 
                     auto& work = works[ithr + ik];
 
                     work.p_jit_amx0 = &jit_amx0;
-                    work.p_jit_amx1 = &jit_amx1;
                     work.sync_flag = shared_atomic;
                     work.blk_K_size = blk_K_size;
 
@@ -562,35 +615,35 @@ public:
             }
         }
     }
-/*
-    void run(uint8_t* pA, int strideA, int M, float* dstC, int strideC) {
-#pragma omp parallel
-        {
-            int ithr = omp_get_thread_num();
-            auto& work = works[ithr];
-            if (work) {
-                work.run(M, pA, strideA);
-                auto* src = &work.C[0];
-                auto* dst = dstC + work.n0;
-                auto strideS = work.C.stride / sizeof(*src);
-                auto strideD = strideC / sizeof(*dst);
-                for (int m = 0; m < M; m++, src += strideS, dst += strideD) {
-                    // the prefetch distance is increased to ensure by the time store happens
-                    // prefetch has done and no HW prefetcher is triggered
-                    auto* prefetch_dst = (m + 2 < M) ? (dst + 2 * strideD) : (dst);
-                    for (int n = 0; n < work.BN; n += 32) {
-                        auto d0 = _mm512_loadu_ps(src + n);
-                        auto d1 = _mm512_loadu_ps(src + n + 16);
-                        _mm_prefetch(prefetch_dst + n, _MM_HINT_ET1);
-                        _mm_prefetch(prefetch_dst + n + 16, _MM_HINT_ET1);
-                        _mm512_storeu_ps(dst + n, d0);
-                        _mm512_storeu_ps(dst + n + 16, d1);
+    /*
+        void run(uint8_t* pA, int strideA, int M, float* dstC, int strideC) {
+    #pragma omp parallel
+            {
+                int ithr = omp_get_thread_num();
+                auto& work = works[ithr];
+                if (work) {
+                    work.run(M, pA, strideA);
+                    auto* src = &work.C[0];
+                    auto* dst = dstC + work.n0;
+                    auto strideS = work.C.stride / sizeof(*src);
+                    auto strideD = strideC / sizeof(*dst);
+                    for (int m = 0; m < M; m++, src += strideS, dst += strideD) {
+                        // the prefetch distance is increased to ensure by the time store happens
+                        // prefetch has done and no HW prefetcher is triggered
+                        auto* prefetch_dst = (m + 2 < M) ? (dst + 2 * strideD) : (dst);
+                        for (int n = 0; n < work.BN; n += 32) {
+                            auto d0 = _mm512_loadu_ps(src + n);
+                            auto d1 = _mm512_loadu_ps(src + n + 16);
+                            _mm_prefetch(prefetch_dst + n, _MM_HINT_ET1);
+                            _mm_prefetch(prefetch_dst + n + 16, _MM_HINT_ET1);
+                            _mm512_storeu_ps(dst + n, d0);
+                            _mm512_storeu_ps(dst + n + 16, d1);
+                        }
                     }
                 }
             }
         }
-    }
-*/
+    */
 
     void run(uint8_t* pA, int strideA, int M, ov::bfloat16* dstC, int strideC) {
 #pragma omp parallel
@@ -775,7 +828,7 @@ void mlp_ref(tensor2D<ov::bfloat16>& A, tensor2D<ov::bfloat16>& gate, tensor2D<o
                 // f_reference
                 float f_reference = silu(gate) * up;
                 if (f_reference != f) {
-                    std::cout << "\t  SiLU_diff @(" << m << ", " << n << ") gate,up=" << gate << "," << up << "  ref:" << f_reference << "!=" << f << std::endl;
+                    ECOUT("\t  SiLU_diff @(", m, ", ", n, ") gate,up=", std::fixed, std::setprecision(3), gate, ",", up, "  ref:", f_reference, "!=", f);
                     num_error++;
                 }
             }

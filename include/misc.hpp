@@ -560,7 +560,7 @@ void easy_cout(const char* file, const char* func, int line, Ts... args) {
 
     std::stringstream ss;
     int dummy[sizeof...(Ts)] = {(ss << args, 0)...};
-    std::cout << " \033[30;44m+" << std::fixed << std::setprecision(3) << get_delta_ms() << " ms \033[30;46m " << tag << " \033[30;42m " << ss.str() << "\033[0m" << std::endl;
+    std::cout << " \033[37;100m+" << std::fixed << std::setprecision(3) << get_delta_ms() << " ms\033[36;40m " << tag << " \033[0m " << ss.str() << "" << std::endl;
 }
 
 #define ECOUT(...) easy_cout(__FILE__, __func__, __LINE__, __VA_ARGS__)

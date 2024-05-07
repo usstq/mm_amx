@@ -309,6 +309,40 @@ we can see:
  - prefetch of A actually not working well. we disable it by default.
 
 
+## Llama MLP optimization [amx-mlp](./tests/amx-mlp.cpp)
+
+```python
+class LlamaMLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.act_fn = nn.SiLU() #ACT2FN[config.hidden_act]
+
+    def forward(self, x):
+        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        return down_proj
+```
+
+|     model         | hidden_size     | intermediate_size |
+| :---------------- | :-------------: | ----------------: |
+|     Llama-7b      | 4096 = 16x256   |  11008 = 43x256   |
+|     Llama-13b     | 5120 = 20x256   |  13824 = 54x256   |
+
+ - we combine `gate_proj + up_proj` into a single Linear, with IC=4096, OC=11008x2, and output channels from
+   `gate_proj` and `up_proj` are interleaved in unit of 16-elements
+ - we evenly split along OC(11008x2=344x32) dimension among all available cores (each core calculate output matrix sub-block of shape `[M,BN]` while `BN%32==0`),
+   and each core share same input actiavtion `x` while has independent weights & output, after each MxBN output block generated and is cache-hot (MxBN fits L2),
+   we run `Convert_F32_to_BF16(SiLU(gate_proj)*up_proj)` as post process and concat results into final destination output: `[M, 11008]`
+ - for `down_proj`, 4096 output channels are not enough to split among all available cores (4096/56 ~= 74 which is too small for `compute:memory` ratio).
+   but IC dimension is quite big (11008) thus we split along K dimension into 2 and do reduce-sum after a pair of worker are finished. this can increase
+   BN to make higher compute:memory ratio.
+
+### MTail handling
 
 
 ## Multicore parallelism
